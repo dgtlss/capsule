@@ -69,16 +69,22 @@ class ConcurrentUploadManager
             'completed' => false,
             'success' => false,
             'error' => null,
+            'pid' => null,
+            'error_log' => $tempScript . '.error.log', // Add an error log file
         ];
 
-        // Start the background process
+        // Start the background process and redirect stderr
         $command = sprintf(
-            'php %s > /dev/null 2>&1 & echo $!',
-            escapeshellarg($tempScript)
+            '(php %s > /dev/null 2> %s) & echo $!',
+            escapeshellarg($tempScript),
+            escapeshellarg($process['error_log'])
         );
         
         $process['handle'] = popen($command, 'r');
-        $process['pid'] = trim(fgets($process['handle']));
+        $pid = trim(fgets($process['handle']));
+        if (!empty($pid)) {
+            $process['pid'] = $pid;
+        }
         pclose($process['handle']);
 
         return $process;
@@ -87,6 +93,8 @@ class ConcurrentUploadManager
     protected function createTempUploadScript(array $chunk): string
     {
         $tempFile = tempnam(sys_get_temp_dir(), 'capsule_upload_');
+        $dataFile = $tempFile . '.data';
+        file_put_contents($dataFile, $chunk['data']);
         
         $script = '<?php
 require_once "' . base_path('vendor/autoload.php') . '";
@@ -97,7 +105,7 @@ try {
     
     $storageManager = app(\Dgtlss\Capsule\Storage\StorageManager::class);
     
-    $chunkData = base64_decode("' . base64_encode($chunk['data']) . '");
+    $chunkData = file_get_contents("' . $dataFile . '");
     $chunkName = "' . $chunk['name'] . '";
     
     $tempStream = fopen("php://temp", "r+");
@@ -110,6 +118,9 @@ try {
     file_put_contents("' . $tempFile . '.success", "SUCCESS");
 } catch (Exception $e) {
     file_put_contents("' . $tempFile . '.error", $e->getMessage());
+} finally {
+    // Clean up data file
+    @unlink("' . $dataFile . '");
 }
 ';
 
@@ -132,21 +143,31 @@ try {
         }
     }
 
-    protected function checkUploadComplete(array $upload): bool
+    protected function checkUploadComplete(array &$upload): bool
     {
         $script = $upload['process']['script'];
+        $errorLog = $upload['process']['error_log'];
         
-        // Check if success or error file exists
+        // Check if success file exists
         if (file_exists($script . '.success')) {
             $upload['process']['completed'] = true;
             $upload['process']['success'] = true;
             return true;
         }
         
+        // Check if an error was logged by the script
         if (file_exists($script . '.error')) {
             $upload['process']['completed'] = true;
             $upload['process']['success'] = false;
             $upload['process']['error'] = file_get_contents($script . '.error');
+            return true;
+        }
+        
+        // Check if the stderr log has content
+        if (file_exists($errorLog) && filesize($errorLog) > 0) {
+            $upload['process']['completed'] = true;
+            $upload['process']['success'] = false;
+            $upload['process']['error'] = file_get_contents($errorLog);
             return true;
         }
 
@@ -170,6 +191,7 @@ try {
         @unlink($process['script']);
         @unlink($process['script'] . '.success');
         @unlink($process['script'] . '.error');
+        @unlink($process['error_log']);
         
         $this->results[$uploadId] = [
             'chunk' => $chunk,

@@ -158,8 +158,14 @@ class ChunkedBackupService
 
     protected function createChunkedDatabaseBackup(string $timestamp): void
     {
-        $connections = config('capsule.database.connections', 'default');
-        $connections = is_string($connections) ? [$connections] : $connections;
+        $connections = config('capsule.database.connections');
+        
+        // Auto-detect current database if not specified
+        if ($connections === null) {
+            $connections = [config('database.default')];
+        } else {
+            $connections = is_string($connections) ? [$connections] : $connections;
+        }
 
         foreach ($connections as $connection) {
             $this->log("Streaming database '{$connection}' to chunks...");
@@ -192,16 +198,28 @@ class ChunkedBackupService
 
     protected function streamMysqlToChunks(array $config, string $connection, string $timestamp, int $chunkSize, string $tempPrefix): void
     {
+        // Create a temporary config file for secure password handling
+        $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
+        $configContent = sprintf(
+            "[mysqldump]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n",
+            $config['username'],
+            $config['password'],
+            $config['host'],
+            $config['port'] ?? 3306
+        );
+        file_put_contents($configFile, $configContent);
+        chmod($configFile, 0600);
+
         $command = sprintf(
-            'mysqldump --host=%s --port=%s --user=%s --password=%s --single-transaction --routines --triggers %s',
-            escapeshellarg($config['host']),
-            escapeshellarg($config['port'] ?? 3306),
-            escapeshellarg($config['username']),
-            escapeshellarg($config['password']),
+            'mysqldump --defaults-extra-file=%s --single-transaction --routines --triggers %s',
+            escapeshellarg($configFile),
             escapeshellarg($config['database'])
         );
 
         $this->streamCommandToChunks($command, "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
+
+        // Clean up the temporary config file
+        @unlink($configFile);
     }
 
     protected function streamPostgresToChunks(array $config, string $connection, string $timestamp, int $chunkSize, string $tempPrefix): void
@@ -399,7 +417,7 @@ class ChunkedBackupService
             'stats' => $stats,
             'backup_id' => $this->backupId,
         ]);
-        $this->log("Concurrent upload complete. Time taken: {$stats['total_time']}s");
+        $this->log("Concurrent upload complete. Total: {$stats['total']}, Successful: {$stats['successful']}, Failed: {$stats['failed']}");
 
         // Check if any uploads failed
         $failedUploads = $this->uploadManager->getFailedUploads();
@@ -481,32 +499,29 @@ class ChunkedBackupService
             $retentionDays = config('capsule.retention.days', 30);
             $retentionCount = config('capsule.retention.count', 10);
 
-            BackupLog::where('status', 'success')
-                ->where('created_at', '<', now()->subDays($retentionDays))
-                ->orWhere(function ($query) use ($retentionCount) {
-                    $query->where('status', 'success')
-                        ->whereNotIn('id', function ($subQuery) use ($retentionCount) {
-                            $subQuery->select('id')
-                                ->from('backup_logs')
-                                ->where('status', 'success')
-                                ->orderBy('created_at', 'desc')
-                                ->limit($retentionCount);
-                        });
-                })
-                ->each(function (BackupLog $backup) {
-                    if ($backup->file_path) {
-                        if (isset($backup->metadata['chunked']) && $backup->metadata['chunked']) {
-                            // For chunked backups, delete from remote storage
-                            $fileName = basename($backup->file_path);
-                            $this->storageManager->delete($fileName);
-                        } else {
-                            // For regular backups, use storage manager for consistent handling
-                            $fileName = basename($backup->file_path);
-                            $this->storageManager->delete($fileName);
-                        }
-                    }
-                    $backup->delete();
-                });
+            // Get IDs of backups to keep (latest N successful backups)
+            $keepIds = BackupLog::where('status', 'success')
+                ->orderBy('created_at', 'desc')
+                ->limit($retentionCount)
+                ->pluck('id')
+                ->toArray();
+
+            // Find backups to delete
+            $query = BackupLog::where('status', 'success')
+                ->where('created_at', '<', now()->subDays($retentionDays));
+
+            if (!empty($keepIds)) {
+                $query->whereNotIn('id', $keepIds);
+            }
+
+            // Use eachById to avoid memory issues with large result sets
+            $query->eachById(function (BackupLog $backup) {
+                if ($backup->file_path) {
+                    $fileName = basename($backup->file_path);
+                    $this->storageManager->delete($fileName);
+                }
+                $backup->delete();
+            });
         }
     }
 }

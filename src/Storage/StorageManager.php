@@ -22,7 +22,7 @@ class StorageManager
     public function store(string $filePath): string
     {
         $fileName = basename($filePath);
-        $remotePath = $this->backupPath . '/' . $fileName;
+        $remotePath = $this->getPrefixedPath($fileName);
         
         $this->disk->putFileAs($this->backupPath, $filePath, $fileName);
         
@@ -31,7 +31,7 @@ class StorageManager
 
     public function storeStream($stream, string $fileName): string
     {
-        $remotePath = $this->backupPath . '/' . $fileName;
+        $remotePath = $this->getPrefixedPath($fileName);
         
         $this->disk->put($remotePath, $stream);
         
@@ -40,21 +40,25 @@ class StorageManager
 
     public function delete(string $fileName): bool
     {
-        $remotePath = $this->backupPath . '/' . $fileName;
+        $remotePath = $this->getPrefixedPath($fileName);
         
         return $this->disk->delete($remotePath);
     }
 
     public function exists(string $fileName): bool
     {
-        $remotePath = $this->backupPath . '/' . $fileName;
+        $remotePath = $this->getPrefixedPath($fileName);
         
         return $this->disk->exists($remotePath);
     }
 
     public function getFileSize(string $fileName): int
     {
-        $remotePath = $this->backupPath . '/' . $fileName;
+        $remotePath = $this->getPrefixedPath($fileName);
+
+        if (!$this->disk->exists($remotePath)) {
+            throw new Exception("Unable to retrieve the file_size for file at location: {$remotePath}.");
+        }
         
         return $this->disk->size($remotePath) ?? 0;
     }
@@ -76,14 +80,14 @@ class StorageManager
 
     public function size(string $fileName): int
     {
-        $remotePath = $this->backupPath . '/' . $fileName;
+        $remotePath = $this->getPrefixedPath($fileName);
         
         return $this->disk->size($remotePath) ?? 0;
     }
 
     public function collateChunks(array $chunkGroups, string $finalFileName): string
     {
-        $finalPath = $this->backupPath . '/' . $finalFileName;
+        $finalPath = $this->getPrefixedPath($finalFileName);
         
         // Create a temporary zip file
         $tempZip = tmpfile();
@@ -99,7 +103,7 @@ class StorageManager
             $combinedData = '';
             
             foreach ($chunks as $chunk) {
-                $chunkPath = $this->backupPath . '/' . $chunk['name'];
+                $chunkPath = $this->getPrefixedPath($chunk['name']);
                 
                 if ($this->disk->exists($chunkPath)) {
                     $combinedData .= $this->disk->get($chunkPath);
@@ -128,5 +132,19 @@ class StorageManager
     public function getBackupPath(): string
     {
         return $this->backupPath;
+    }
+
+    protected function getPrefixedPath(string $fileName): string
+    {
+        // Normalize slashes and remove leading/trailing slashes
+        $backupPath = trim($this->backupPath, '/');
+        $fileName = trim($fileName, '/');
+        
+        // Check if the filename already starts with the backup path
+        if (strpos($fileName, $backupPath) === 0) {
+            return $fileName;
+        }
+
+        return $backupPath . '/' . $fileName;
     }
 }
