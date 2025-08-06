@@ -19,6 +19,13 @@ class ChunkedBackupService
     protected array $chunks = [];
     protected array $chunkData = [];
     protected string $backupId;
+    protected bool $verbose = false;
+    protected bool $parallel = false;
+    protected int $compressionLevel = 1;
+    protected bool $encryption = false;
+    protected bool $verification = false;
+    protected ?string $lastError = null;
+    protected $outputCallback = null;
 
     public function __construct(Application $app)
     {
@@ -31,8 +38,51 @@ class ChunkedBackupService
         $this->uploadManager = new ConcurrentUploadManager($this->storageManager, $maxConcurrent);
     }
 
+    public function setVerbose(bool $verbose): void
+    {
+        $this->verbose = $verbose;
+    }
+
+    public function setParallel(bool $parallel): void
+    {
+        $this->parallel = $parallel;
+    }
+
+    public function setCompressionLevel(int $level): void
+    {
+        $this->compressionLevel = max(1, min(9, $level));
+    }
+
+    public function setEncryption(bool $encryption): void
+    {
+        $this->encryption = $encryption;
+    }
+
+    public function setVerification(bool $verification): void
+    {
+        $this->verification = $verification;
+    }
+
+    public function setOutputCallback(callable $callback): void
+    {
+        $this->outputCallback = $callback;
+    }
+
+    public function getLastError(): ?string
+    {
+        return $this->lastError;
+    }
+
+    protected function log(string $message): void
+    {
+        if ($this->verbose && $this->outputCallback) {
+            call_user_func($this->outputCallback, $message);
+        }
+    }
+
     public function run(): bool
     {
+        $this->log('Chunked backup process started.');
         $backupLog = BackupLog::create([
             'started_at' => now(),
             'status' => 'running',
@@ -42,12 +92,14 @@ class ChunkedBackupService
         try {
             $this->createChunkedBackup();
             
-            // Upload chunks concurrently
+            $this->log('Uploading chunks concurrently...');
             $uploadResults = $this->uploadChunksConcurrently();
             $uploadStats = $this->uploadManager->getUploadStats();
             
+            $this->log('Collating chunks into final backup...');
             $finalBackupPath = $this->collateChunks();
             
+            $this->log('Updating backup log...');
             $backupLog->update([
                 'completed_at' => now(),
                 'status' => 'success',
@@ -61,11 +113,13 @@ class ChunkedBackupService
                 ]),
             ]);
 
+            $this->log('Cleaning up remote chunks...');
             $this->cleanup();
             $this->notificationManager->sendSuccessNotification($backupLog);
 
             return true;
         } catch (Exception $e) {
+            $this->lastError = $e->getMessage();
             $backupLog->update([
                 'completed_at' => now(),
                 'status' => 'failed',
@@ -92,10 +146,12 @@ class ChunkedBackupService
         $timestamp = now()->format('Y-m-d_H-i-s');
         
         if (config('capsule.database.enabled')) {
+            $this->log('Creating chunked database backup...');
             $this->createChunkedDatabaseBackup($timestamp);
         }
 
         if (config('capsule.files.enabled')) {
+            $this->log('Creating chunked file backup...');
             $this->createChunkedFileBackup($timestamp);
         }
     }
@@ -106,6 +162,7 @@ class ChunkedBackupService
         $connections = is_string($connections) ? [$connections] : $connections;
 
         foreach ($connections as $connection) {
+            $this->log("Streaming database '{$connection}' to chunks...");
             $this->streamDatabaseToChunks($connection, $timestamp);
         }
     }
@@ -215,8 +272,10 @@ class ChunkedBackupService
 
         foreach ($paths as $path) {
             if (is_dir($path)) {
+                $this->log("Streaming directory '{$path}' to chunks...");
                 $this->streamDirectoryToChunks($path, $excludePaths, $timestamp, $chunkSize, $tempPrefix);
             } elseif (is_file($path)) {
+                $this->log("Streaming file '{$path}' to chunks...");
                 $this->streamFileToChunks($path, $timestamp, $chunkSize, $tempPrefix);
             }
         }
@@ -301,6 +360,8 @@ class ChunkedBackupService
     {
         $chunkName = "{$tempPrefix}{$baseName}.part{$chunkIndex}";
         
+        $this->log("Preparing chunk {$chunkIndex} for {$baseName}...");
+        
         // Store chunk data for concurrent upload
         $this->chunkData[] = [
             'name' => $chunkName,
@@ -325,6 +386,7 @@ class ChunkedBackupService
             return [];
         }
 
+        $this->log("Starting concurrent upload of " . count($this->chunkData) . " chunks.");
         Log::info("Starting concurrent upload of " . count($this->chunkData) . " chunks", [
             'max_concurrent' => config('capsule.chunked_backup.max_concurrent_uploads', 3),
             'backup_id' => $this->backupId,
@@ -337,6 +399,7 @@ class ChunkedBackupService
             'stats' => $stats,
             'backup_id' => $this->backupId,
         ]);
+        $this->log("Concurrent upload complete. Time taken: {$stats['total_time']}s");
 
         // Check if any uploads failed
         $failedUploads = $this->uploadManager->getFailedUploads();
@@ -376,6 +439,7 @@ class ChunkedBackupService
         }
         
         // Create the final backup by combining all chunks
+        $this->log("Collating chunks into '{$finalBackupName}'...");
         return $this->storageManager->collateChunks($chunkGroups, $finalBackupName);
     }
 
@@ -396,6 +460,7 @@ class ChunkedBackupService
 
     protected function cleanupChunks(): void
     {
+        $this->log('Cleaning up remote chunks...');
         foreach ($this->chunks as $chunk) {
             try {
                 $this->storageManager->delete($chunk['name']);
@@ -412,6 +477,7 @@ class ChunkedBackupService
         
         // Run regular cleanup if enabled
         if (config('capsule.retention.cleanup_enabled', true)) {
+            $this->log('Running retention cleanup...');
             $retentionDays = config('capsule.retention.days', 30);
             $retentionCount = config('capsule.retention.count', 10);
 
