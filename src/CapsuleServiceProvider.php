@@ -5,6 +5,10 @@ namespace Dgtlss\Capsule;
 use Dgtlss\Capsule\Commands\BackupCommand;
 use Dgtlss\Capsule\Commands\CleanupCommand;
 use Dgtlss\Capsule\Commands\DiagnoseCommand;
+use Dgtlss\Capsule\Commands\VerifyCommand;
+use Dgtlss\Capsule\Commands\ListCommand;
+use Dgtlss\Capsule\Commands\InspectCommand;
+use Dgtlss\Capsule\Commands\HealthCommand;
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
 use Illuminate\Support\ServiceProvider;
@@ -31,6 +35,9 @@ class CapsuleServiceProvider extends ServiceProvider
             __DIR__ . '/../config/capsule.php' => config_path('capsule.php'),
         ], 'capsule-config');
 
+        // Views for Filament panel (optional in host app)
+        $this->loadViewsFrom(__DIR__ . '/../resources/views', 'capsule');
+
         $this->loadMigrationsFrom(__DIR__ . '/../database/migrations');
 
         if ($this->app->runningInConsole()) {
@@ -38,6 +45,10 @@ class CapsuleServiceProvider extends ServiceProvider
                 BackupCommand::class,
                 CleanupCommand::class,
                 DiagnoseCommand::class,
+                VerifyCommand::class,
+                ListCommand::class,
+                InspectCommand::class,
+                HealthCommand::class,
             ]);
         }
 

@@ -31,6 +31,19 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Storage Upload Reliability
+    |--------------------------------------------------------------------------
+    | Configure retry/backoff for storage operations (upload/delete). Useful
+    | for transient network issues with cloud providers.
+    */
+    'storage' => [
+        'retries' => env('CAPSULE_STORAGE_RETRIES', 3),
+        'backoff_ms' => env('CAPSULE_STORAGE_BACKOFF_MS', 500),
+        'max_backoff_ms' => env('CAPSULE_STORAGE_MAX_BACKOFF_MS', 5000),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Database Backup
     |--------------------------------------------------------------------------
     |
@@ -144,6 +157,14 @@ return [
 
         // Maximum number of successful backups to keep (newest are preserved)
         'count' => 10,
+
+        // Optional: total storage budget for backups on the target disk (in MB)
+        // When exceeded, oldest backups will be pruned until within budget, while
+        // still respecting the 'count' minimum to keep.
+        'max_storage_mb' => env('CAPSULE_RETENTION_MAX_STORAGE_MB', null),
+
+        // Minimum number of backups to always keep, even when over budget
+        'min_keep' => env('CAPSULE_RETENTION_MIN_KEEP', 3),
 
         // Enable automatic cleanup of old backups
         'cleanup_enabled' => true,
@@ -324,6 +345,61 @@ return [
 
         // Chunk size for file processing (bytes)
         'file_chunk_size' => 8192,
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Locking
+    |--------------------------------------------------------------------------
+    |
+    | Prevent overlapping runs of backup/cleanup/verify using cache locks.
+    | Configure the lock store (null = default) and timeouts.
+    |
+    */
+
+    'lock' => [
+        'store' => env('CAPSULE_LOCK_STORE', null),
+        'timeout_seconds' => env('CAPSULE_LOCK_TIMEOUT', 900), // 15 minutes
+        'wait_seconds' => env('CAPSULE_LOCK_WAIT', 0),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Extensibility: Custom Filters and Steps
+    |--------------------------------------------------------------------------
+    |
+    | Register fully-qualified class names that implement
+    | - Dgtlss\Capsule\Contracts\FileFilterInterface for file inclusion
+    | - Dgtlss\Capsule\Contracts\StepInterface for pipeline steps
+    |
+    */
+
+    'extensibility' => [
+        'file_filters' => [
+            // Example: App\Backup\Filters\ExcludeLargeFiles::class
+        ],
+        'pre_steps' => [
+            // Example: App\Backup\Steps\EnterMaintenanceMode::class
+        ],
+        'post_steps' => [
+            // Example: App\Backup\Steps\ExitMaintenanceMode::class
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Health Integration (Spatie Laravel Health)
+    |--------------------------------------------------------------------------
+    */
+
+    'health' => [
+        'enabled' => env('CAPSULE_HEALTH_ENABLED', true),
+        // Warn when last success older than N days
+        'max_last_success_age_days' => env('CAPSULE_HEALTH_MAX_LAST_SUCCESS_DAYS', 2),
+        // Fail when recent failures exceed N in the last 7 days
+        'max_recent_failures' => env('CAPSULE_HEALTH_MAX_RECENT_FAILURES', 0),
+        // Warn when storage usage exceeds this percent of budget (if budget set)
+        'warn_storage_percent' => env('CAPSULE_HEALTH_WARN_STORAGE_PERCENT', 90),
     ],
 
 ];

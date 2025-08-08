@@ -15,7 +15,8 @@ class BackupCommand extends Command
     {--parallel : Enable parallel processing for multiple databases}
     {--compress=1 : Compression level 1-9 (1=fastest, 9=smallest)}
     {--encrypt : Encrypt backup archive}
-    {--verify : Verify backup integrity after creation}';
+    {--verify : Verify backup integrity after creation}
+    {--format=table : Output format (table|json)}';
     
     protected $description = 'Create a backup of the database and files';
 
@@ -55,29 +56,55 @@ class BackupCommand extends Command
         $startTime = microtime(true);
         
         try {
+            // Lock to prevent overlaps unless --force
+            if (!$this->option('force')) {
+                $lockName = 'capsule:backup';
+                $lock = \Dgtlss\Capsule\Support\Lock::acquire($lockName);
+                if (!$lock) {
+                    $this->warn('Another backup is currently running. Use --force to override.');
+                    return self::FAILURE;
+                }
+            }
             $success = $service->run();
             $endTime = microtime(true);
             $duration = round($endTime - $startTime, 2);
 
+            $format = $this->option('format');
             if ($success) {
-                $message = $useChunkedBackup 
-                    ? "Chunked backup completed successfully in {$duration} seconds."
-                    : "Backup completed successfully in {$duration} seconds.";
-                $this->info($message);
+                if ($format === 'json') {
+                    $payload = [
+                        'status' => 'success',
+                        'duration_seconds' => $duration,
+                    ];
+                    $this->line(json_encode($payload, JSON_PRETTY_PRINT));
+                } else {
+                    $message = $useChunkedBackup 
+                        ? "Chunked backup completed successfully in {$duration} seconds."
+                        : "Backup completed successfully in {$duration} seconds.";
+                    $this->info($message);
+                }
                 return self::SUCCESS;
             } else {
-                $message = $useChunkedBackup 
-                    ? "Chunked backup failed after {$duration} seconds."
-                    : "Backup failed after {$duration} seconds.";
-                $this->error($message);
-                
-                // Get the last error from the service for verbose output
-                $lastError = $service->getLastError();
-                if ($verbose && $lastError) {
-                    $this->error('Detailed error information:');
-                    $this->error($lastError);
+                if ($format === 'json') {
+                    $payload = [
+                        'status' => 'failed',
+                        'duration_seconds' => $duration,
+                        'error' => $service->getLastError(),
+                    ];
+                    $this->line(json_encode($payload, JSON_PRETTY_PRINT));
                 } else {
-                    $this->error('Check the logs for more details or run with -v for verbose output.');
+                    $message = $useChunkedBackup 
+                        ? "Chunked backup failed after {$duration} seconds."
+                        : "Backup failed after {$duration} seconds.";
+                    $this->error($message);
+                    // Get the last error from the service for verbose output
+                    $lastError = $service->getLastError();
+                    if ($verbose && $lastError) {
+                        $this->error('Detailed error information:');
+                        $this->error($lastError);
+                    } else {
+                        $this->error('Check the logs for more details or run with --v for verbose output.');
+                    }
                 }
                 return self::FAILURE;
             }
@@ -93,7 +120,7 @@ class BackupCommand extends Command
                 $this->error("Stack trace:");
                 $this->line($e->getTraceAsString());
             } else {
-                $this->error('Run with -v flag for more detailed error information.');
+                $this->error('Run with --v flag for more detailed error information.');
             }
             
             return self::FAILURE;

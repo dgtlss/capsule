@@ -95,15 +95,32 @@ class NotificationManager
 
     protected function buildFailureMessage(BackupLog $backupLog, Exception $exception): array
     {
+        $isPreflightDb = str_contains(strtolower($exception->getMessage()), 'database unreachable')
+            || (is_array($backupLog->metadata ?? null) && ($backupLog->metadata['failure_stage'] ?? '') === 'preflight');
+
+        $title = $isPreflightDb ? 'Backup Failed – Database Unreachable' : 'Backup Failed';
+        $message = $isPreflightDb
+            ? 'Capsule could not reach the configured database connection(s). No backup was performed.'
+            : 'The backup process has failed.';
+
+        $details = [
+            'Started at' => $backupLog->started_at ? $backupLog->started_at->format('Y-m-d H:i:s') : 'Unknown',
+            'Failed at' => $backupLog->completed_at ? $backupLog->completed_at->format('Y-m-d H:i:s') : 'Unknown',
+            'Error' => $exception->getMessage(),
+        ];
+
+        if ($isPreflightDb && is_array($backupLog->metadata ?? null) && !empty($backupLog->metadata['failed_connections'] ?? [])) {
+            $failed = collect($backupLog->metadata['failed_connections'])->pluck('connection')->implode(', ');
+            $details['Affected connections'] = $failed;
+            $details['Action'] = 'Verify DB host/port/credentials and that the database service is reachable from the application environment.';
+        }
+
+        $details['Status'] = 'Failed';
+
         return [
-            'title' => 'Backup Failed',
-            'message' => 'The backup process has failed.',
-            'details' => [
-                'Started at' => $backupLog->started_at->format('Y-m-d H:i:s'),
-                'Failed at' => $backupLog->completed_at ? $backupLog->completed_at->format('Y-m-d H:i:s') : 'Unknown',
-                'Error' => $exception->getMessage(),
-                'Status' => 'Failed',
-            ],
+            'title' => $title,
+            'message' => $message,
+            'details' => $details,
             'color' => 'danger',
             'emoji' => '❌',
         ];

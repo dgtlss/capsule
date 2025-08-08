@@ -51,19 +51,27 @@ class SlackNotifier implements NotifierInterface
             ];
         }
 
+        $actions = [];
+        if (!empty($message['details']['File size'] ?? null)) {
+            $actions[] = [
+                'type' => 'button',
+                'text' => [ 'type' => 'plain_text', 'text' => 'Open Storage' ],
+                'url' => config('app.url') ?? ''
+            ];
+        }
+
         return [
             'channel' => config('capsule.notifications.webhooks.slack.channel', '#general'),
             'username' => config('capsule.notifications.webhooks.slack.username', 'Capsule'),
-            'attachments' => [
-                [
-                    'color' => $color,
-                    'title' => $message['emoji'] . ' ' . $message['title'],
-                    'text' => $message['message'],
-                    'fields' => $fields,
-                    'footer' => 'Capsule Backup',
-                    'ts' => time(),
-                ],
-            ],
+            'attachments' => [[
+                'color' => $color,
+                'title' => $message['emoji'] . ' ' . $message['title'],
+                'text' => $message['message'],
+                'fields' => $fields,
+                'footer' => 'Capsule Backup',
+                'ts' => time(),
+                'actions' => $actions,
+            ]],
         ];
     }
 

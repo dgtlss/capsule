@@ -26,6 +26,8 @@ class ChunkedBackupService
     protected bool $verification = false;
     protected ?string $lastError = null;
     protected $outputCallback = null;
+    /** @var array<int, array<string, mixed>> */
+    protected array $manifestEntries = [];
 
     public function __construct(Application $app)
     {
@@ -36,6 +38,7 @@ class ChunkedBackupService
         
         $maxConcurrent = config('capsule.chunked_backup.max_concurrent_uploads', 3);
         $this->uploadManager = new ConcurrentUploadManager($this->storageManager, $maxConcurrent);
+        $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
     public function setVerbose(bool $verbose): void
@@ -154,6 +157,7 @@ class ChunkedBackupService
             $this->log('Creating chunked file backup...');
             $this->createChunkedFileBackup($timestamp);
         }
+        // Manifest will be embedded during collation
     }
 
     protected function createChunkedDatabaseBackup(string $timestamp): void
@@ -210,11 +214,36 @@ class ChunkedBackupService
         file_put_contents($configFile, $configContent);
         chmod($configFile, 0600);
 
-        $command = sprintf(
-            'mysqldump --defaults-extra-file=%s --single-transaction --routines --triggers %s',
-            escapeshellarg($configFile),
-            escapeshellarg($config['database'])
-        );
+        $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
+        $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
+
+        $safeFlags = '--single-transaction --routines --triggers --hex-blob';
+        $dbName = $config['database'];
+        $ignoreFlags = '';
+        if (empty($includeTables) && !empty($excludeTables)) {
+            foreach ($excludeTables as $table) {
+                $ignoreFlags .= ' --ignore-table=' . escapeshellarg($dbName . '.' . $table);
+            }
+        }
+
+        if (!empty($includeTables)) {
+            $tables = implode(' ', array_map('escapeshellarg', $includeTables));
+            $command = sprintf(
+                'mysqldump --defaults-extra-file=%s %s %s %s',
+                escapeshellarg($configFile),
+                $safeFlags,
+                escapeshellarg($dbName),
+                $tables
+            );
+        } else {
+            $command = sprintf(
+                'mysqldump --defaults-extra-file=%s %s %s %s',
+                escapeshellarg($configFile),
+                $safeFlags,
+                $ignoreFlags,
+                escapeshellarg($dbName)
+            );
+        }
 
         $this->streamCommandToChunks($command, "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
 
@@ -224,13 +253,30 @@ class ChunkedBackupService
 
     protected function streamPostgresToChunks(array $config, string $connection, string $timestamp, int $chunkSize, string $tempPrefix): void
     {
+        $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
+        $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
+
+        $safeFlags = '--no-owner --no-privileges --format=plain --no-password';
+        $tableFlags = '';
+        if (!empty($includeTables)) {
+            foreach ($includeTables as $table) {
+                $tableFlags .= ' -t ' . escapeshellarg($table);
+            }
+        } elseif (!empty($excludeTables)) {
+            foreach ($excludeTables as $table) {
+                $tableFlags .= ' --exclude-table=' . escapeshellarg($table);
+            }
+        }
+
         $command = sprintf(
-            'PGPASSWORD=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s --no-password',
+            'PGPASSWORD=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s %s %s',
             escapeshellarg($config['password']),
             escapeshellarg($config['host']),
             escapeshellarg($config['port'] ?? 5432),
             escapeshellarg($config['username']),
-            escapeshellarg($config['database'])
+            escapeshellarg($config['database']),
+            $safeFlags,
+            $tableFlags
         );
 
         $this->streamCommandToChunks($command, "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
@@ -362,10 +408,65 @@ class ChunkedBackupService
         fclose($handle);
     }
 
+    protected function appendManifestEntry(string $zipPath, string $sourceFilePath): void
+    {
+        $size = @filesize($sourceFilePath) ?: 0;
+        $hash = @hash_file('sha256', $sourceFilePath) ?: '';
+        $this->manifestEntries[] = [
+            'path' => $zipPath,
+            'size' => $size,
+            'sha256' => $hash,
+        ];
+    }
+
+    protected function buildManifest(bool $isChunked): array
+    {
+        $now = now()->toISOString();
+        $appName = config('app.name');
+        $appEnv = app()->environment();
+        $laravelVersion = app()->version();
+        $disk = config('capsule.default_disk');
+        $backupPath = config('capsule.backup_path');
+        $dbConns = config('capsule.database.connections');
+        $dbConns = $dbConns === null ? [config('database.default')] : (is_string($dbConns) ? [$dbConns] : $dbConns);
+
+        return [
+            'schema_version' => 1,
+            'generated_at' => $now,
+            'app' => [
+                'name' => $appName,
+                'env' => $appEnv,
+                'laravel_version' => $laravelVersion,
+                'host' => gethostname() ?: null,
+            ],
+            'capsule' => [
+                'version' => null,
+                'chunked' => $isChunked,
+                'compression_level' => $this->compressionLevel,
+                'encryption_enabled' => $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
+            ],
+            'storage' => [
+                'disk' => $disk,
+                'backup_path' => $backupPath,
+            ],
+            'database' => [
+                'connections' => $dbConns,
+                'include_tables' => (array) (config('capsule.database.include_tables', []) ?? []),
+                'exclude_tables' => (array) (config('capsule.database.exclude_tables', []) ?? []),
+            ],
+            'files' => [
+                'paths' => (array) config('capsule.files.paths', []),
+                'exclude_paths' => (array) config('capsule.files.exclude_paths', []),
+            ],
+            'entries' => $this->manifestEntries,
+        ];
+    }
+
     protected function prepareFileForChunk(string $filePath, string $baseDir): string
     {
         $relativePath = substr($filePath, strlen($baseDir) + 1);
         $fileContent = file_get_contents($filePath);
+        $this->appendManifestEntry('files/' . $relativePath, $filePath);
         
         // Create a simple format: [PATH_LENGTH][PATH][CONTENT_LENGTH][CONTENT]
         $pathLength = strlen($relativePath);
@@ -444,21 +545,35 @@ class ChunkedBackupService
     {
         $timestamp = now()->format('Y-m-d_H-i-s');
         $finalBackupName = "backup_{$timestamp}.zip";
-        
-        // Group chunks by base name
-        $chunkGroups = [];
-        foreach ($this->chunks as $chunk) {
-            $chunkGroups[$chunk['base_name']][] = $chunk;
-        }
-        
-        // Sort chunks within each group by index
-        foreach ($chunkGroups as &$group) {
-            usort($group, fn($a, $b) => $a['index'] <=> $b['index']);
-        }
-        
-        // Create the final backup by combining all chunks
+
+        // Build manifest pseudo-chunk to include checksums/metadata in final ZIP
+        $manifest = $this->buildManifest(true);
+        $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        $this->chunkData[] = [
+            'name' => 'manifest.json.inline',
+            'data' => $manifestJson,
+            'index' => 0,
+            'base_name' => 'manifest.json',
+            'size' => strlen($manifestJson),
+        ];
+        $this->chunks[] = [
+            'name' => 'manifest.json.inline',
+            'index' => 0,
+            'base_name' => 'manifest.json',
+            'size' => strlen($manifestJson),
+        ];
+
+        // Upload all pending chunks (includes manifest)
+        $this->uploadChunksConcurrently();
+
         $this->log("Collating chunks into '{$finalBackupName}'...");
-        return $this->storageManager->collateChunks($chunkGroups, $finalBackupName);
+        return $this->storageManager->collateChunksAdvanced(
+            $this->chunks,
+            $finalBackupName,
+            $this->compressionLevel,
+            $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
+            (string) (config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD'))
+        );
     }
 
     protected function getRemoteFileSize(string $fileName): int

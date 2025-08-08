@@ -48,6 +48,9 @@ class DiagnoseCommand extends Command
         $results['system'] = $this->checkSystemRequirements($fix, $verbose);
         $this->newLine();
 
+        $results['health'] = $this->checkHealthSummary($verbose);
+        $this->newLine();
+
         // Additional detailed checks
         if ($detailed) {
             $results['performance'] = $this->checkPerformance($verbose);
@@ -253,12 +256,17 @@ class DiagnoseCommand extends Command
             }
 
             // Test database connection
-            try {
-                \DB::connection($resolvedConnection)->getPdo();
-                $this->info('    ✅ Database connection successful');
-            } catch (\Exception $e) {
-                $this->error("    ❌ Database connection failed: {$e->getMessage()}");
-                $allGood = false;
+            if ($fix && in_array($driver, ['mysql', 'pgsql'])) {
+                // Defer actual connection test; inform about graceful degrade
+                $this->comment('    ℹ️  Will gracefully continue without DB logging if connection fails at runtime');
+            } else {
+                try {
+                    \DB::connection($resolvedConnection)->getPdo();
+                    $this->info('    ✅ Database connection successful');
+                } catch (\Exception $e) {
+                    $this->error("    ❌ Database connection failed: {$e->getMessage()}");
+                    $allGood = false;
+                }
             }
         }
 
@@ -439,6 +447,28 @@ class DiagnoseCommand extends Command
         }
 
         return empty($issues);
+    }
+
+    protected function checkHealthSummary(bool $verbose = true): bool
+    {
+        $this->line('❤️  Capsule Health Summary');
+        try {
+            $age = \Dgtlss\Capsule\Health\Checks\BackupHealthCheck::lastSuccessAgeDays();
+            $failures = \Dgtlss\Capsule\Health\Checks\BackupHealthCheck::recentFailuresCount();
+            $usage = \Dgtlss\Capsule\Health\Checks\BackupHealthCheck::storageUsageBytes();
+
+            $this->info('  Last success age: ' . ($age === null ? 'none' : ($age . ' day(s)')));
+            if ($failures > 0) {
+                $this->warn("  Recent failures (7d): {$failures}");
+            } else {
+                $this->info('  Recent failures (7d): 0');
+            }
+            $this->info('  Storage usage: ' . $this->formatBytes($usage));
+            return true;
+        } catch (\Throwable $e) {
+            $this->error('  ❌ Failed to compute health summary: ' . $e->getMessage());
+            return false;
+        }
     }
 
     protected function checkBackupHistory(bool $verbose = true): bool

@@ -13,7 +13,8 @@ class CleanupCommand extends Command
     {--days= : Override retention days from config}
     {--failed : Also clean up failed backup records}
     {--storage : Clean up orphaned files in storage}
-    {--v : Verbose output}';
+    {--v : Verbose output}
+    {--format=table : Output format (table|json)}';
     
     protected $description = 'Clean up old backup files according to retention policy';
 
@@ -23,6 +24,8 @@ class CleanupCommand extends Command
 
         $retentionDays = $this->option('days') ? (int) $this->option('days') : config('capsule.retention.days', 30);
         $retentionCount = config('capsule.retention.count', 10);
+        $maxStorageMb = (int) (config('capsule.retention.max_storage_mb') ?? 0);
+        $minKeep = (int) config('capsule.retention.min_keep', 3);
         $isDryRun = $this->option('dry-run');
         $cleanFailed = $this->option('failed');
         $cleanStorage = $this->option('storage');
@@ -41,10 +44,17 @@ class CleanupCommand extends Command
         $totalDeleted = 0;
         $totalSize = 0;
 
-        // Clean up successful backups
+        // Clean up successful backups (time/count based)
         $result = $this->cleanupSuccessfulBackups($retentionDays, $retentionCount, $isDryRun, $verbose);
         $totalDeleted += $result['count'];
         $totalSize += $result['size'];
+
+        // Enforce budget if configured
+        if ($maxStorageMb > 0) {
+            $result = $this->enforceStorageBudget($maxStorageMb, $minKeep, $isDryRun, $verbose);
+            $totalDeleted += $result['count'];
+            $totalSize += $result['size'];
+        }
 
         // Clean up failed backups if requested
         if ($cleanFailed) {
@@ -60,14 +70,93 @@ class CleanupCommand extends Command
             $totalSize += $result['size'];
         }
 
-        if ($totalDeleted === 0) {
-            $this->info('No items to clean up.');
+        $format = $this->option('format');
+        if ($format === 'json') {
+            $this->line(json_encode([
+                'dry_run' => (bool) $isDryRun,
+                'deleted_count' => $totalDeleted,
+                'deleted_size_bytes' => $totalSize,
+            ], JSON_PRETTY_PRINT));
         } else {
-            $action = $isDryRun ? 'Would delete' : 'Deleted';
-            $this->info("{$action} {$totalDeleted} items ({$this->formatBytes($totalSize)}) total");
+            if ($totalDeleted === 0) {
+                $this->info('No items to clean up.');
+            } else {
+                $action = $isDryRun ? 'Would delete' : 'Deleted';
+                $this->info("{$action} {$totalDeleted} items ({$this->formatBytes($totalSize)}) total");
+            }
         }
 
         return self::SUCCESS;
+    }
+
+    protected function enforceStorageBudget(int $maxStorageMb, int $minKeep, bool $isDryRun, bool $verbose): array
+    {
+        $storageManager = new StorageManager();
+        $currentFiles = BackupLog::where('status', 'success')
+            ->orderBy('created_at', 'desc')
+            ->get(['id', 'file_path', 'file_size', 'created_at']);
+
+        if ($currentFiles->isEmpty()) {
+            return ['count' => 0, 'size' => 0];
+        }
+
+        $totalBytes = (int) $currentFiles->sum('file_size');
+        $budgetBytes = $maxStorageMb * 1024 * 1024;
+        if ($verbose) {
+            $this->info('📊 Storage usage: ' . $this->formatBytes($totalBytes) . ' / ' . $this->formatBytes($budgetBytes));
+        }
+
+        if ($totalBytes <= $budgetBytes) {
+            if ($verbose) $this->info('✅ Within budget; no budget-based pruning needed');
+            return ['count' => 0, 'size' => 0];
+        }
+
+        // Start pruning from oldest while respecting min_keep
+        $deletedCount = 0;
+        $deletedSize = 0;
+        $toConsider = $currentFiles->sortBy('created_at')->values();
+
+        foreach ($toConsider as $index => $backup) {
+            $remaining = $currentFiles->count() - ($deletedCount + 1);
+            if ($remaining < $minKeep) {
+                // Stop if we would drop below min_keep
+                break;
+            }
+
+            $size = (int) ($backup->file_size ?? 0);
+            if ($verbose) {
+                $this->line("- Pruning (budget): " . $backup->created_at->format('Y-m-d H:i:s') . ' (' . $this->formatBytes($size) . ')');
+            }
+
+            if (!$isDryRun) {
+                if (!empty($backup->file_path)) {
+                    try {
+                        $fileName = basename($backup->file_path);
+                        $storageManager->delete($fileName);
+                    } catch (\Exception $e) {
+                        $this->warn("  Failed to delete storage file: {$e->getMessage()}");
+                    }
+                }
+                $backup->delete();
+            }
+
+            $deletedCount++;
+            $deletedSize += $size;
+            $totalBytes -= $size;
+
+            if ($totalBytes <= $budgetBytes) {
+                break;
+            }
+        }
+
+        if ($deletedCount > 0) {
+            $action = $isDryRun ? 'Would delete (budget)' : 'Deleted (budget)';
+            $this->info("{$action} {$deletedCount} items (" . $this->formatBytes($deletedSize) . ")");
+        } else if ($verbose) {
+            $this->info('No items pruned by budget (respecting min_keep).');
+        }
+
+        return ['count' => $deletedCount, 'size' => $deletedSize];
     }
 
     protected function cleanupSuccessfulBackups(int $retentionDays, int $retentionCount, bool $isDryRun, bool $verbose): array
@@ -117,37 +206,20 @@ class CleanupCommand extends Command
             $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({$this->formatBytes($size)})");
 
             if (!$isDryRun) {
-                $storageDeleted = true;
-                
-                // Delete from storage first
                 if ($backup->file_path) {
                     try {
                         $fileName = basename($backup->file_path);
                         $storageManager->delete($fileName);
                         if ($verbose) {
-                            $this->line("  ✓ Deleted from storage: {$fileName}");
+                            $this->line("  Deleted from storage: {$fileName}");
                         }
                     } catch (\Exception $e) {
-                        $this->warn("  ✗ Failed to delete storage file: {$e->getMessage()}");
-                        $storageDeleted = false;
+                        $this->warn("  Failed to delete storage file: {$e->getMessage()}");
                     }
                 }
-                
-                // Only delete database record if storage deletion succeeded (or no file path)
-                if ($storageDeleted || !$backup->file_path) {
-                    try {
-                        $backup->delete();
-                        $deletedCount++;
-                        $deletedSize += $size;
-                        if ($verbose) {
-                            $this->line("  ✓ Deleted database record");
-                        }
-                    } catch (\Exception $e) {
-                        $this->warn("  ✗ Failed to delete database record: {$e->getMessage()}");
-                    }
-                } else {
-                    $this->warn("  ⚠ Skipping database deletion due to storage deletion failure");
-                }
+                $backup->delete();
+                $deletedCount++;
+                $deletedSize += $size;
             }
         }
 
@@ -181,40 +253,13 @@ class CleanupCommand extends Command
         $this->info("Found {$failedBackups->count()} failed backup records to clean up:");
 
         $deletedCount = 0;
-        $storageManager = new StorageManager();
 
         foreach ($failedBackups as $backup) {
             $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} (failed: {$backup->error_message})");
 
             if (!$isDryRun) {
-                $storageDeleted = true;
-                
-                // Delete any partial files from storage first
-                if ($backup->file_path) {
-                    try {
-                        $fileName = basename($backup->file_path);
-                        $storageManager->delete($fileName);
-                        if ($verbose) {
-                            $this->line("  ✓ Deleted partial file from storage: {$fileName}");
-                        }
-                    } catch (\Exception $e) {
-                        if ($verbose) {
-                            $this->line("  ⚠ Partial file not found in storage (already cleaned): {$e->getMessage()}");
-                        }
-                        // Don't mark as failed since partial files might not exist
-                    }
-                }
-                
-                // Delete database record
-                try {
-                    $backup->delete();
-                    $deletedCount++;
-                    if ($verbose) {
-                        $this->line("  ✓ Deleted failed backup record");
-                    }
-                } catch (\Exception $e) {
-                    $this->warn("  ✗ Failed to delete database record: {$e->getMessage()}");
-                }
+                $backup->delete();
+                $deletedCount++;
             }
         }
 

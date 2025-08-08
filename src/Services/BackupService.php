@@ -5,6 +5,10 @@ namespace Dgtlss\Capsule\Services;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Support\BackupContext;
+use Dgtlss\Capsule\Contracts\FileFilterInterface;
+use Dgtlss\Capsule\Contracts\StepInterface;
+use Dgtlss\Capsule\Events\{BackupStarting, DatabaseDumpStarting, DatabaseDumpCompleted, FilesCollectStarting, FilesCollectCompleted, ArchiveFinalizing, BackupUploaded, BackupSucceeded, BackupFailed};
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -23,12 +27,18 @@ class BackupService
     protected bool $verification = false;
     protected ?string $lastError = null;
     protected $outputCallback = null;
+    protected bool $backupLogPersisted = false;
+    protected ?string $lastRemotePath = null;
+    protected ?int $lastFileSize = null;
+    /** @var array<int, array<string, mixed>> */
+    protected array $manifestEntries = [];
 
     public function __construct(Application $app)
     {
         $this->app = $app;
         $this->storageManager = new StorageManager();
         $this->notificationManager = new NotificationManager();
+        $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
     public function setVerbose(bool $verbose): void
@@ -79,15 +89,60 @@ class BackupService
         // Validate configuration before starting
         $this->validateConfiguration();
         
+        // Preflight: ensure DB is reachable if DB backup is enabled
+        if (config('capsule.database.enabled', true)) {
+            $failedConnections = $this->probeDatabaseConnections();
+            if (!empty($failedConnections)) {
+                $reason = 'Database unreachable for connection(s): ' . implode(', ', array_map(fn($f) => $f['connection'], $failedConnections));
+                $this->lastError = $reason;
+                $this->log('❌ ' . $reason);
+
+                $pseudoLog = new BackupLog([
+                    'started_at' => now(),
+                    'completed_at' => now(),
+                    'status' => 'failed',
+                    'error_message' => $reason,
+                    'metadata' => [
+                        'failure_stage' => 'preflight',
+                        'failed_connections' => $failedConnections,
+                    ],
+                ]);
+
+                $this->notificationManager->sendFailureNotification($pseudoLog, new Exception($reason));
+                return false;
+            }
+        }
+        
         $this->log('📝 Creating backup log entry...');
-        $backupLog = BackupLog::create([
-            'started_at' => now(),
-            'status' => 'running',
-        ]);
+        $context = new BackupContext('normal');
+        $context->verbose = $this->verbose;
+        $context->compressionLevel = $this->compressionLevel;
+        $context->encryption = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
+        $context->verification = $this->verification;
+        event(new BackupStarting($context));
+
+        // Execute pre-steps
+        $this->executeSteps((array) config('capsule.extensibility.pre_steps', []), $context, 'pre');
+        // Try to persist backup log, but degrade gracefully if DB is unavailable
+        try {
+            $backupLog = BackupLog::create([
+                'started_at' => now(),
+                'status' => 'running',
+            ]);
+            $this->backupLogPersisted = true;
+        } catch (\Throwable $e) {
+            Log::warning('BackupLog could not be persisted; continuing without DB logging', ['exception' => $e]);
+            $backupLog = new BackupLog([
+                'started_at' => now(),
+                'status' => 'running',
+            ]);
+            $this->backupLogPersisted = false;
+        }
 
         try {
             $this->log('📦 Creating backup archive...');
             $localBackupPath = $this->createBackup();
+            $context->localArchivePath = $localBackupPath;
             
             $fileSize = filesize($localBackupPath);
             
@@ -99,14 +154,23 @@ class BackupService
 
             $this->log("📤 Uploading backup to storage ({$this->formatBytes($fileSize)})...");
             $remotePath = $this->storageManager->store($localBackupPath);
+            $context->remotePath = $remotePath;
+            $this->lastRemotePath = $remotePath;
+            event(new BackupUploaded($context, $remotePath));
             
             $this->log('✅ Updating backup log...');
-            $backupLog->update([
-                'completed_at' => now(),
-                'status' => 'success',
-                'file_path' => $remotePath,
-                'file_size' => $fileSize,
-            ]);
+            $backupLog->completed_at = now();
+            $backupLog->status = 'success';
+            $backupLog->file_path = $remotePath;
+            $backupLog->file_size = $fileSize;
+            $this->lastFileSize = $fileSize;
+            if ($this->backupLogPersisted) {
+                try {
+                    $backupLog->save();
+                } catch (\Throwable $e) {
+                    Log::warning('Failed to persist success BackupLog update', ['exception' => $e]);
+                }
+            }
 
             // Clean up local file if not using local disk
             if (config('capsule.default_disk') !== 'local') {
@@ -114,25 +178,69 @@ class BackupService
                 unlink($localBackupPath);
             }
 
-            $this->log('🧹 Running retention cleanup...');
-            $this->cleanup();
+            // Run retention cleanup only if DB available
+            if ($this->backupLogPersisted) {
+                $this->log('🧹 Running retention cleanup...');
+                $this->cleanup();
+            }
             
             $this->log('📧 Sending success notification...');
             $this->notificationManager->sendSuccessNotification($backupLog);
+            event(new BackupSucceeded($context));
+
+            // Execute post-steps (success)
+            $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
 
             return true;
         } catch (Exception $e) {
-            $backupLog->update([
-                'completed_at' => now(),
-                'status' => 'failed',
-                'error_message' => $e->getMessage(),
-            ]);
+            $backupLog->completed_at = now();
+            $backupLog->status = 'failed';
+            $backupLog->error_message = $e->getMessage();
+            if ($this->backupLogPersisted) {
+                try {
+                    $backupLog->save();
+                } catch (\Throwable $ex) {
+                    Log::warning('Failed to persist failed BackupLog update', ['exception' => $ex]);
+                }
+            }
 
             Log::error('Backup failed: ' . $e->getMessage(), ['exception' => $e]);
             $this->notificationManager->sendFailureNotification($backupLog, $e);
+            event(new BackupFailed($context, $e));
+
+            // Execute post-steps (failure) – still run to allow cleanup steps
+            $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
 
             return false;
         }
+    }
+
+    /**
+     * Attempt to open PDO for all configured DB connections that should be backed up.
+     * Returns an array of failures: [ ['connection' => name, 'error' => message], ... ]
+     */
+    protected function probeDatabaseConnections(): array
+    {
+        $connections = config('capsule.database.connections');
+        if ($connections === null) {
+            $connections = [config('database.default')];
+        } else {
+            $connections = is_string($connections) ? [$connections] : $connections;
+        }
+
+        $failures = [];
+        foreach ($connections as $connection) {
+            $resolved = $connection === 'default' ? config('database.default') : $connection;
+            try {
+                \DB::connection($resolved)->getPdo();
+            } catch (\Throwable $e) {
+                $failures[] = [
+                    'connection' => $resolved,
+                    'error' => $e->getMessage(),
+                ];
+            }
+        }
+        return $failures;
     }
 
     protected function createBackup(): string
@@ -157,34 +265,27 @@ class BackupService
 
         if (config('capsule.database.enabled')) {
             $this->log('🗄️  Adding database to backup...');
+            event(new DatabaseDumpStarting(new BackupContext('normal')));
             $tempFiles = array_merge($tempFiles, $this->addDatabaseToBackup($zip, $timestamp));
+            event(new DatabaseDumpCompleted(new BackupContext('normal')));
         }
 
         if (config('capsule.files.enabled')) {
             $this->log('📁 Adding files to backup...');
+            event(new FilesCollectStarting(new BackupContext('normal')));
             $this->addFilesToBackup($zip);
+            event(new FilesCollectCompleted(new BackupContext('normal')));
         }
+
+        // Add manifest before closing
+        $this->log('🧾 Writing manifest...');
+        $manifest = $this->buildManifest(false);
+        $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        $zip->addFromString('manifest.json', $manifestJson);
+        $this->applyCompressionAndEncryption($zip, 'manifest.json');
 
         $this->log('🔄 Finalizing ZIP archive...');
-        
-        // Set compression level - prioritize speed by default
-        $compressionLevel = $this->compressionLevel;
-        if (method_exists($zip, 'setCompressionName')) {
-            $zip->setCompressionIndex(0, ZipArchive::CM_DEFLATE, $compressionLevel);
-        }
-
-        // Set encryption if requested or configured
-        $encryptionEnabled = $this->encryption || config('capsule.security.encrypt_backups', false);
-        if ($encryptionEnabled) {
-            $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-            if ($password) {
-                $zip->setPassword($password);
-                $zip->setEncryptionName('', ZipArchive::EM_AES_256);
-                $this->log('🔒 Encryption enabled for backup archive');
-            } else {
-                $this->log('⚠️  Encryption requested but no password configured');
-            }
-        }
+        event(new ArchiveFinalizing(new BackupContext('normal')));
         
         // Use a callback to show progress during closing
         $startTime = microtime(true);
@@ -241,9 +342,11 @@ class BackupService
             
             $dumpPath = $this->createDatabaseDump($resolvedConnection, $timestamp);
             $dumpSize = filesize($dumpPath);
-            $this->log("   💾 Adding {$resolvedConnection}.sql ({$this->formatBytes($dumpSize)}) to archive");
-            
-            $zip->addFile($dumpPath, "database/{$resolvedConnection}.sql");
+            $entryName = "database/{$resolvedConnection}.sql";
+            $this->log("   💾 Adding {$entryName} ({$this->formatBytes($dumpSize)}) to archive");
+            $zip->addFile($dumpPath, $entryName);
+            $this->applyCompressionAndEncryption($zip, $entryName);
+            $this->appendManifestEntry($entryName, $dumpPath);
             $tempFiles[] = $dumpPath;
         }
 
@@ -279,8 +382,11 @@ class BackupService
             }
 
             $dumpSize = filesize($processInfo['path']);
-            $this->log("   💾 Adding {$connectionName}.sql ({$this->formatBytes($dumpSize)}) to archive");
-            $zip->addFile($processInfo['path'], "database/{$connectionName}.sql");
+            $entryName = "database/{$connectionName}.sql";
+            $this->log("   💾 Adding {$entryName} ({$this->formatBytes($dumpSize)}) to archive");
+            $zip->addFile($processInfo['path'], $entryName);
+            $this->applyCompressionAndEncryption($zip, $entryName);
+            $this->appendManifestEntry($entryName, $processInfo['path']);
         }
 
         return $tempFiles;
@@ -400,12 +506,39 @@ class BackupService
         chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
 
         try {
-            $command = sprintf(
-                'mysqldump --defaults-extra-file=%s %s > %s 2>&1',
-                escapeshellarg($configFile),
-                escapeshellarg($config['database']),
-                escapeshellarg($dumpPath)
-            );
+            $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
+            $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
+
+            $safeFlags = '--single-transaction --routines --triggers --hex-blob';
+
+            $dbName = $config['database'];
+            $ignoreFlags = '';
+            if (empty($includeTables) && !empty($excludeTables)) {
+                foreach ($excludeTables as $table) {
+                    $ignoreFlags .= ' --ignore-table=' . escapeshellarg($dbName . '.' . $table);
+                }
+            }
+
+            if (!empty($includeTables)) {
+                $tables = implode(' ', array_map('escapeshellarg', $includeTables));
+                $command = sprintf(
+                    'mysqldump --defaults-extra-file=%s %s %s %s > %s 2>&1',
+                    escapeshellarg($configFile),
+                    $safeFlags,
+                    escapeshellarg($dbName),
+                    $tables,
+                    escapeshellarg($dumpPath)
+                );
+            } else {
+                $command = sprintf(
+                    'mysqldump --defaults-extra-file=%s %s %s %s > %s 2>&1',
+                    escapeshellarg($configFile),
+                    $safeFlags,
+                    $ignoreFlags,
+                    escapeshellarg($dbName),
+                    escapeshellarg($dumpPath)
+                );
+            }
 
             exec($command, $output, $returnCode);
 
@@ -441,13 +574,31 @@ class BackupService
         chmod($pgpassFile, config('capsule.security.temp_file_permissions', 0600));
 
         try {
+            $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
+            $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
+
+            $safeFlags = '--no-owner --no-privileges --format=plain';
+
+            $tableFlags = '';
+            if (!empty($includeTables)) {
+                foreach ($includeTables as $table) {
+                    $tableFlags .= ' -t ' . escapeshellarg($table);
+                }
+            } elseif (!empty($excludeTables)) {
+                foreach ($excludeTables as $table) {
+                    $tableFlags .= ' --exclude-table=' . escapeshellarg($table);
+                }
+            }
+
             $command = sprintf(
-                'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s > %s 2>&1',
+                'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s %s %s > %s 2>&1',
                 escapeshellarg($pgpassFile),
                 escapeshellarg($config['host']),
                 escapeshellarg($config['port'] ?? 5432),
                 escapeshellarg($config['username']),
                 escapeshellarg($config['database']),
+                $safeFlags,
+                $tableFlags,
                 escapeshellarg($dumpPath)
             );
 
@@ -488,6 +639,7 @@ class BackupService
     {
         $paths = config('capsule.files.paths', []);
         $excludePaths = config('capsule.files.exclude_paths', []);
+        $filters = $this->resolveFileFilters();
 
         $this->log("   📁 Processing " . count($paths) . " file path(s)...");
         $this->log("   🚫 Excluding " . count($excludePaths) . " path(s)...");
@@ -495,16 +647,22 @@ class BackupService
         foreach ($paths as $path) {
             if (is_dir($path)) {
                 $this->log("   📂 Scanning directory: " . basename($path));
-                $this->addDirectoryToZip($zip, $path, $excludePaths);
+                $this->addDirectoryToZip($zip, $path, $excludePaths, 'files/', $filters);
             } elseif (is_file($path)) {
                 $fileSize = filesize($path);
+                $relative = 'files/' . basename($path);
+                if (!$this->passesFilters($path, $filters)) {
+                    continue;
+                }
                 $this->log("   📄 Adding file: " . basename($path) . " ({$this->formatBytes($fileSize)})");
-                $zip->addFile($path, 'files/' . basename($path));
+                $zip->addFile($path, $relative);
+                $this->applyCompressionAndEncryption($zip, $relative);
+                $this->appendManifestEntry($relative, $path);
             }
         }
     }
 
-    protected function addDirectoryToZip(ZipArchive $zip, string $dir, array $excludePaths, string $zipPath = 'files/'): void
+    protected function addDirectoryToZip(ZipArchive $zip, string $dir, array $excludePaths, string $zipPath = 'files/', array $filters = []): void
     {
         $iterator = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
@@ -525,6 +683,9 @@ class BackupService
             if ($this->shouldExcludePath($filePath, $excludePaths)) {
                 continue;
             }
+            if ($file->isFile() && !$this->passesFilters($filePath, $filters)) {
+                continue;
+            }
 
             // Calculate relative path correctly
             $normalizedDir = rtrim($dir, '/');
@@ -536,6 +697,8 @@ class BackupService
             } else {
                 // Add file with immediate compression to reduce memory usage
                 $zip->addFile($filePath, $relativePath);
+                $this->applyCompressionAndEncryption($zip, $relativePath);
+                $this->appendManifestEntry($relativePath, $filePath);
                 
                 $fileSize = $file->getSize();
                 $totalSize += $fileSize;
@@ -551,6 +714,128 @@ class BackupService
         if ($fileCount > 0) {
             $this->log("   ✅ Completed: {$fileCount} files ({$this->formatBytes($totalSize)}) from " . basename($dir));
         }
+    }
+
+    protected function resolveFileFilters(): array
+    {
+        $filters = [];
+        foreach ((array) config('capsule.extensibility.file_filters', []) as $class) {
+            try {
+                $instance = app($class);
+                if ($instance instanceof FileFilterInterface) {
+                    $filters[] = $instance;
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Failed to resolve file filter: ' . $class, ['exception' => $e]);
+            }
+        }
+        return $filters;
+    }
+
+    protected function passesFilters(string $absolutePath, array $filters): bool
+    {
+        foreach ($filters as $filter) {
+            if (!$filter->shouldInclude($absolutePath, new BackupContext('normal'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    protected function executeSteps(array $classes, BackupContext $context, string $phase): void
+    {
+        foreach ($classes as $class) {
+            try {
+                $instance = app($class);
+                if ($instance instanceof StepInterface) {
+                    $this->log("   ▶ Executing {$phase}-step: {$class}");
+                    $instance->handle($context);
+                } else {
+                    Log::warning('Configured step does not implement StepInterface: ' . $class);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Step execution failed: ' . $class, ['exception' => $e]);
+                throw new Exception('Step failed: ' . $class . ' – ' . $e->getMessage(), 0, $e);
+            }
+        }
+    }
+
+    protected function applyCompressionAndEncryption(ZipArchive $zip, string $entryName): void
+    {
+        // Compression per-entry
+        if (method_exists($zip, 'setCompressionName')) {
+            // CM_DEFLATE with specified level
+            @$zip->setCompressionName($entryName, ZipArchive::CM_DEFLATE, $this->compressionLevel);
+        }
+
+        // Encryption per-entry if enabled
+        $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
+        if ($encryptionEnabled) {
+            $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
+            if (!empty($password)) {
+                // Set archive password once
+                @$zip->setPassword($password);
+                // Encrypt this entry
+                if (method_exists($zip, 'setEncryptionName')) {
+                    // Suppress warnings if not supported by libzip
+                    @$zip->setEncryptionName($entryName, ZipArchive::EM_AES_256);
+                }
+            }
+        }
+    }
+
+    protected function appendManifestEntry(string $zipPath, string $sourceFilePath): void
+    {
+        $size = @filesize($sourceFilePath) ?: 0;
+        $hash = @hash_file('sha256', $sourceFilePath) ?: '';
+        $this->manifestEntries[] = [
+            'path' => $zipPath,
+            'size' => $size,
+            'sha256' => $hash,
+        ];
+    }
+
+    protected function buildManifest(bool $isChunked): array
+    {
+        $now = now()->toISOString();
+        $appName = config('app.name');
+        $appEnv = app()->environment();
+        $laravelVersion = app()->version();
+        $disk = config('capsule.default_disk');
+        $backupPath = config('capsule.backup_path');
+        $dbConns = config('capsule.database.connections');
+        $dbConns = $dbConns === null ? [config('database.default')] : (is_string($dbConns) ? [$dbConns] : $dbConns);
+
+        return [
+            'schema_version' => 1,
+            'generated_at' => $now,
+            'app' => [
+                'name' => $appName,
+                'env' => $appEnv,
+                'laravel_version' => $laravelVersion,
+                'host' => gethostname() ?: null,
+            ],
+            'capsule' => [
+                'version' => null,
+                'chunked' => $isChunked,
+                'compression_level' => $this->compressionLevel,
+                'encryption_enabled' => $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
+            ],
+            'storage' => [
+                'disk' => $disk,
+                'backup_path' => $backupPath,
+            ],
+            'database' => [
+                'connections' => $dbConns,
+                'include_tables' => (array) (config('capsule.database.include_tables', []) ?? []),
+                'exclude_tables' => (array) (config('capsule.database.exclude_tables', []) ?? []),
+            ],
+            'files' => [
+                'paths' => (array) config('capsule.files.paths', []),
+                'exclude_paths' => (array) config('capsule.files.exclude_paths', []),
+            ],
+            'entries' => $this->manifestEntries,
+        ];
     }
 
     protected function shouldExcludePath(string $path, array $excludePaths): bool
