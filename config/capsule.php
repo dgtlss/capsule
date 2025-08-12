@@ -74,6 +74,13 @@ return [
             // 'posts',
         ],
 
+        // Include triggers and stored routines in MySQL dumps
+        'include_triggers' => env('CAPSULE_INCLUDE_TRIGGERS', true),
+        'include_routines' => env('CAPSULE_INCLUDE_ROUTINES', false),
+
+        // Extra flags to pass to mysqldump/pg_dump. Example: '--set-gtid-purged=OFF'
+        'mysqldump_flags' => env('CAPSULE_MYSQLDUMP_FLAGS', ''),
+
         // Compress database dumps using gzip
         'compress' => true,
     ],
@@ -137,7 +144,7 @@ return [
 
     'backup' => [
         // ZIP compression level (1-9): 1 = fastest, 9 = best compression
-        'compression_level' => env('CAPSULE_COMPRESSION_LEVEL', 1),
+        'compression_level' => env('CAPSULE_COMPRESSION_LEVEL', 6),
     ],
 
     /*

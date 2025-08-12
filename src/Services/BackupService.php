@@ -415,20 +415,64 @@ class BackupService
     protected function startMysqlDumpProcess(array $config, string $dumpPath)
     {
         $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
+        $escape = function ($value) {
+            $value = (string) $value;
+            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
+            return '"' . $value . '"';
+        };
         $configContent = sprintf(
-            "[mysqldump]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n",
-            $config['username'],
-            $config['password'],
-            $config['host'],
-            $config['port'] ?? 3306
+            "[mysqldump]\nuser=%s\npassword=%s\n",
+            $escape($config['username'] ?? ''),
+            $escape($config['password'] ?? '')
         );
+        if (!empty($config['unix_socket'])) {
+            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
+        } else {
+            $configContent .= sprintf(
+                "host=%s\nport=%s\n",
+                $escape($config['host'] ?? 'localhost'),
+                $escape($config['port'] ?? 3306)
+            );
+        }
+
+        // Optional SSL configuration
+        $sslMode = config("database.connections." . ($config['name'] ?? 'mysql') . ".sslmode") ?? env('DB_SSL_MODE');
+        $sslCa = env('MYSQL_ATTR_SSL_CA');
+        $sslCert = env('MYSQL_ATTR_SSL_CERT');
+        $sslKey = env('MYSQL_ATTR_SSL_KEY');
+        if (!empty($sslMode)) {
+            $configContent .= 'ssl-mode=' . $escape($sslMode) . "\n";
+        }
+        if (!empty($sslCa)) {
+            $configContent .= 'ssl-ca=' . $escape($sslCa) . "\n";
+        }
+        if (!empty($sslCert)) {
+            $configContent .= 'ssl-cert=' . $escape($sslCert) . "\n";
+        }
+        if (!empty($sslKey)) {
+            $configContent .= 'ssl-key=' . $escape($sslKey) . "\n";
+        }
         
         file_put_contents($configFile, $configContent);
         chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
 
+        $includeTriggers = (bool) (config('capsule.database.include_triggers', true));
+        $includeRoutines = (bool) (config('capsule.database.include_routines', false));
+        $safeFlags = ['--single-transaction', '--hex-blob'];
+        if ($includeTriggers) {
+            $safeFlags[] = '--triggers';
+        } else {
+            $safeFlags[] = '--skip-triggers';
+        }
+        if ($includeRoutines) {
+            $safeFlags[] = '--routines';
+        }
+        $extraFlags = trim((string) (config('capsule.database.mysqldump_flags') ?? env('CAPSULE_MYSQLDUMP_FLAGS', '')));
+        $allFlags = trim(implode(' ', $safeFlags) . ' ' . $extraFlags);
         $command = sprintf(
-            'mysqldump --defaults-extra-file=%s %s > %s 2>&1; rm %s',
+            'mysqldump --defaults-extra-file=%s %s %s > %s 2>&1; rm %s',
             escapeshellarg($configFile),
+            $allFlags,
             escapeshellarg($config['database']),
             escapeshellarg($dumpPath),
             escapeshellarg($configFile)
@@ -475,6 +519,7 @@ class BackupService
 
         switch ($driver) {
             case 'mysql':
+            case 'mariadb':
                 $this->createMysqlDump($config, $dumpPath);
                 break;
             case 'pgsql':
@@ -494,13 +539,43 @@ class BackupService
     {
         // Create temporary MySQL config file for secure password handling
         $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
+        $escape = function ($value) {
+            $value = (string) $value;
+            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
+            return '"' . $value . '"';
+        };
         $configContent = sprintf(
-            "[mysqldump]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n",
-            $config['username'],
-            $config['password'],
-            $config['host'],
-            $config['port'] ?? 3306
+            "[mysqldump]\nuser=%s\npassword=%s\n",
+            $escape($config['username'] ?? ''),
+            $escape($config['password'] ?? '')
         );
+        if (!empty($config['unix_socket'])) {
+            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
+        } else {
+            $configContent .= sprintf(
+                "host=%s\nport=%s\n",
+                $escape($config['host'] ?? 'localhost'),
+                $escape($config['port'] ?? 3306)
+            );
+        }
+
+        // Optional SSL configuration
+        $sslMode = config("database.connections." . ($config['name'] ?? 'mysql') . ".sslmode") ?? env('DB_SSL_MODE');
+        $sslCa = env('MYSQL_ATTR_SSL_CA');
+        $sslCert = env('MYSQL_ATTR_SSL_CERT');
+        $sslKey = env('MYSQL_ATTR_SSL_KEY');
+        if (!empty($sslMode)) {
+            $configContent .= 'ssl-mode=' . $escape($sslMode) . "\n";
+        }
+        if (!empty($sslCa)) {
+            $configContent .= 'ssl-ca=' . $escape($sslCa) . "\n";
+        }
+        if (!empty($sslCert)) {
+            $configContent .= 'ssl-cert=' . $escape($sslCert) . "\n";
+        }
+        if (!empty($sslKey)) {
+            $configContent .= 'ssl-key=' . $escape($sslKey) . "\n";
+        }
         
         file_put_contents($configFile, $configContent);
         chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
@@ -509,7 +584,15 @@ class BackupService
             $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
             $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
 
-            $safeFlags = '--single-transaction --routines --triggers --hex-blob';
+            $includeTriggers = (bool) (config('capsule.database.include_triggers', true));
+            $includeRoutines = (bool) (config('capsule.database.include_routines', false));
+            $safeParts = ['--single-transaction', '--hex-blob'];
+            $safeParts[] = $includeTriggers ? '--triggers' : '--skip-triggers';
+            if ($includeRoutines) {
+                $safeParts[] = '--routines';
+            }
+            $safeFlags = implode(' ', $safeParts);
+            $extraFlags = trim((string) (config('capsule.database.mysqldump_flags') ?? env('CAPSULE_MYSQLDUMP_FLAGS', '')));
 
             $dbName = $config['database'];
             $ignoreFlags = '';
@@ -522,32 +605,83 @@ class BackupService
             if (!empty($includeTables)) {
                 $tables = implode(' ', array_map('escapeshellarg', $includeTables));
                 $command = sprintf(
-                    'mysqldump --defaults-extra-file=%s %s %s %s > %s 2>&1',
+                    'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
                     escapeshellarg($configFile),
                     $safeFlags,
+                    $extraFlags,
                     escapeshellarg($dbName),
                     $tables,
                     escapeshellarg($dumpPath)
                 );
             } else {
                 $command = sprintf(
-                    'mysqldump --defaults-extra-file=%s %s %s %s > %s 2>&1',
+                    'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
                     escapeshellarg($configFile),
                     $safeFlags,
+                    $extraFlags,
                     $ignoreFlags,
                     escapeshellarg($dbName),
                     escapeshellarg($dumpPath)
                 );
             }
 
+            $output = [];
+            $returnCode = 0;
             exec($command, $output, $returnCode);
 
             if ($returnCode !== 0) {
-                $this->lastError = "MySQL dump failed with return code: {$returnCode}";
-                if ($this->verbose && !empty($output)) {
-                    $this->lastError .= "\nCommand output: " . implode("\n", $output);
+                $outputText = trim(implode("\n", $output));
+                // Automatic fallback: retry without routines/triggers if enabled
+                $retried = false;
+                if ($includeRoutines || $includeTriggers) {
+                    $safeParts = ['--single-transaction', '--hex-blob', '--skip-triggers'];
+                    // Do NOT include routines in fallback
+                    $fallbackFlags = implode(' ', $safeParts);
+                    if (!empty($includeTables)) {
+                        $tables = implode(' ', array_map('escapeshellarg', $includeTables));
+                        $retryCommand = sprintf(
+                            'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                            escapeshellarg($configFile),
+                            $fallbackFlags,
+                            $extraFlags,
+                            escapeshellarg($dbName),
+                            $tables,
+                            escapeshellarg($dumpPath)
+                        );
+                    } else {
+                        $retryCommand = sprintf(
+                            'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                            escapeshellarg($configFile),
+                            $fallbackFlags,
+                            $extraFlags,
+                            $ignoreFlags,
+                            escapeshellarg($dbName),
+                            escapeshellarg($dumpPath)
+                        );
+                    }
+                    $retryOutput = [];
+                    $retryCode = 0;
+                    exec($retryCommand, $retryOutput, $retryCode);
+                    if ($retryCode === 0) {
+                        \Log::warning('MySQL dump succeeded after disabling routines/triggers', [
+                            'database' => $config['database'] ?? null,
+                        ]);
+                        $retried = true;
+                    } else {
+                        $outputText .= "\n[Retry output]\n" . trim(implode("\n", $retryOutput));
+                        $returnCode = $retryCode;
+                    }
                 }
-                throw new Exception($this->lastError);
+
+                if (!$retried) {
+                    $this->lastError = "MySQL dump failed with return code: {$returnCode}" . (!empty($outputText) ? "\nCommand output:\n{$outputText}" : '');
+                    \Log::error('MySQL dump failed', [
+                        'code' => $returnCode,
+                        'output' => $outputText,
+                        'database' => $config['database'] ?? null,
+                    ]);
+                    throw new Exception($this->lastError);
+                }
             }
         } finally {
             // Always clean up the temporary config file
