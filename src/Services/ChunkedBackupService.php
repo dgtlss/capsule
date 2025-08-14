@@ -204,13 +204,25 @@ class ChunkedBackupService
     {
         // Create a temporary config file for secure password handling
         $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
+        $escape = function ($value) {
+            $value = (string) $value;
+            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
+            return '"' . $value . '"';
+        };
         $configContent = sprintf(
-            "[mysqldump]\nuser=%s\npassword=%s\nhost=%s\nport=%s\n",
-            $config['username'],
-            $config['password'],
-            $config['host'],
-            $config['port'] ?? 3306
+            "[mysqldump]\nuser=%s\npassword=%s\n",
+            $escape($config['username'] ?? ''),
+            $escape($config['password'] ?? '')
         );
+        if (!empty($config['unix_socket'])) {
+            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
+        } else {
+            $configContent .= sprintf(
+                "host=%s\nport=%s\n",
+                $escape($config['host'] ?? 'localhost'),
+                $escape($config['port'] ?? 3306)
+            );
+        }
         file_put_contents($configFile, $configContent);
         chmod($configFile, 0600);
 

@@ -484,13 +484,18 @@ class BackupService
     protected function startPostgresDumpProcess(array $config, string $dumpPath)
     {
         $pgpassFile = tempnam(sys_get_temp_dir(), 'pgpass_');
+        $escape = function ($value) {
+            $value = (string) $value;
+            // Escape backslashes and colons for .pgpass format
+            return str_replace(['\\', ':'], ['\\\\', '\\:'], $value);
+        };
         $pgpassContent = sprintf(
             "%s:%s:%s:%s:%s\n",
-            $config['host'],
-            $config['port'] ?? 5432,
-            $config['database'],
-            $config['username'],
-            $config['password']
+            $escape($config['host']),
+            $escape($config['port'] ?? 5432),
+            $escape($config['database']),
+            $escape($config['username']),
+            $escape($config['password'])
         );
         
         file_put_contents($pgpassFile, $pgpassContent);
@@ -695,13 +700,18 @@ class BackupService
     {
         // Create temporary .pgpass file for secure password handling
         $pgpassFile = tempnam(sys_get_temp_dir(), 'pgpass_');
+        $escape = function ($value) {
+            $value = (string) $value;
+            // Escape backslashes and colons for .pgpass format
+            return str_replace(['\\', ':'], ['\\\\', '\\:'], $value);
+        };
         $pgpassContent = sprintf(
             "%s:%s:%s:%s:%s\n",
-            $config['host'],
-            $config['port'] ?? 5432,
-            $config['database'],
-            $config['username'],
-            $config['password']
+            $escape($config['host']),
+            $escape($config['port'] ?? 5432),
+            $escape($config['database']),
+            $escape($config['username']),
+            $escape($config['password'])
         );
         
         file_put_contents($pgpassFile, $pgpassContent);
