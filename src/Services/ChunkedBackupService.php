@@ -187,6 +187,7 @@ class ChunkedBackupService
         
         switch ($driver) {
             case 'mysql':
+            case 'mariadb':
                 $this->streamMysqlToChunks($config, $connection, $timestamp, $chunkSize, $tempPrefix);
                 break;
             case 'pgsql':
