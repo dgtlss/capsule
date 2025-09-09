@@ -40,6 +40,18 @@ class GoogleChatNotifier implements NotifierInterface
         $this->sendWebhook($webhookUrl, $payload);
     }
 
+    public function sendCleanup(array $message, int $deletedCount, int $deletedSize): void
+    {
+        $webhookUrl = config('capsule.notifications.webhooks.google_chat.webhook_url');
+
+        if (!$webhookUrl) {
+            return;
+        }
+
+        $payload = $this->buildGoogleChatPayload($message);
+        $this->sendWebhook($webhookUrl, $payload);
+    }
+
     protected function buildGoogleChatPayload(array $message): array
     {
         $text = $message['emoji'] . ' *' . $message['title'] . '*' . "\n\n";

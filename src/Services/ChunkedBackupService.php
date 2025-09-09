@@ -5,6 +5,7 @@ namespace Dgtlss\Capsule\Services;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Support\MemoryMonitor;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Log;
 use Exception;
@@ -15,9 +16,9 @@ class ChunkedBackupService
     protected Application $app;
     protected StorageManager $storageManager;
     protected NotificationManager $notificationManager;
-    protected ConcurrentUploadManager $uploadManager;
     protected array $chunks = [];
-    protected array $chunkData = [];
+    protected array $chunkMetadata = []; // Store minimal metadata for collation
+    protected array $manifestEntries = []; // Store manifest entries
     protected string $backupId;
     protected bool $verbose = false;
     protected bool $parallel = false;
@@ -26,8 +27,6 @@ class ChunkedBackupService
     protected bool $verification = false;
     protected ?string $lastError = null;
     protected $outputCallback = null;
-    /** @var array<int, array<string, mixed>> */
-    protected array $manifestEntries = [];
 
     public function __construct(Application $app)
     {
@@ -35,9 +34,6 @@ class ChunkedBackupService
         $this->storageManager = new StorageManager();
         $this->notificationManager = new NotificationManager();
         $this->backupId = uniqid('backup_', true);
-        
-        $maxConcurrent = config('capsule.chunked_backup.max_concurrent_uploads', 3);
-        $this->uploadManager = new ConcurrentUploadManager($this->storageManager, $maxConcurrent);
         $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
@@ -85,6 +81,9 @@ class ChunkedBackupService
 
     public function run(): bool
     {
+        MemoryMonitor::checkpoint('backup_start');
+        MemoryMonitor::logMemoryUsage('Backup started');
+        
         $this->log('Chunked backup process started.');
         $backupLog = BackupLog::create([
             'started_at' => now(),
@@ -93,26 +92,31 @@ class ChunkedBackupService
         ]);
 
         try {
+            MemoryMonitor::checkpoint('before_backup');
             $this->createChunkedBackup();
-            
-            $this->log('Uploading chunks concurrently...');
-            $uploadResults = $this->uploadChunksConcurrently();
-            $uploadStats = $this->uploadManager->getUploadStats();
+            MemoryMonitor::checkpoint('after_backup');
+            MemoryMonitor::logMemoryUsage('After backup creation');
             
             $this->log('Collating chunks into final backup...');
+            MemoryMonitor::checkpoint('before_collation');
             $finalBackupPath = $this->collateChunks();
+            MemoryMonitor::checkpoint('after_collation');
+            MemoryMonitor::logMemoryUsage('After collation');
             
             $this->log('Updating backup log...');
+            
+            // Get memory statistics
+            $memoryStats = MemoryMonitor::compareCheckpoints('backup_start', 'after_collation');
+            
             $backupLog->update([
                 'completed_at' => now(),
                 'status' => 'success',
                 'file_path' => $finalBackupPath,
                 'file_size' => $this->getRemoteFileSize($finalBackupPath),
                 'metadata' => array_merge($backupLog->metadata ?? [], [
-                    'chunks_count' => count($this->chunks),
-                    'chunked_method' => 'concurrent_streaming',
-                    'concurrent_uploads' => $uploadStats,
-                    'max_concurrent' => config('capsule.chunked_backup.max_concurrent_uploads', 3),
+                    'chunks_count' => count($this->chunkMetadata),
+                    'chunked_method' => 'direct_streaming',
+                    'memory_stats' => $memoryStats['formatted'] ?? null,
                 ]),
             ]);
 
@@ -128,7 +132,7 @@ class ChunkedBackupService
                 'status' => 'failed',
                 'error_message' => $e->getMessage(),
                 'metadata' => array_merge($backupLog->metadata ?? [], [
-                    'chunks_attempted' => count($this->chunks),
+                    'chunks_attempted' => count($this->chunkMetadata),
                 ]),
             ]);
 
@@ -210,8 +214,13 @@ class ChunkedBackupService
             $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
             return '"' . $value . '"';
         };
+        
+        // Determine which dump command to use
+        $dumpCommand = $this->getMysqlDumpCommand();
+        
         $configContent = sprintf(
-            "[mysqldump]\nuser=%s\npassword=%s\n",
+            "[%s]\nuser=%s\npassword=%s\n",
+            $dumpCommand,
             $escape($config['username'] ?? ''),
             $escape($config['password'] ?? '')
         );
@@ -242,7 +251,8 @@ class ChunkedBackupService
         if (!empty($includeTables)) {
             $tables = implode(' ', array_map('escapeshellarg', $includeTables));
             $command = sprintf(
-                'mysqldump --defaults-extra-file=%s %s %s %s',
+                '%s --defaults-extra-file=%s %s %s %s',
+                $dumpCommand,
                 escapeshellarg($configFile),
                 $safeFlags,
                 escapeshellarg($dbName),
@@ -250,7 +260,8 @@ class ChunkedBackupService
             );
         } else {
             $command = sprintf(
-                'mysqldump --defaults-extra-file=%s %s %s %s',
+                '%s --defaults-extra-file=%s %s %s %s',
+                $dumpCommand,
                 escapeshellarg($configFile),
                 $safeFlags,
                 $ignoreFlags,
@@ -314,30 +325,36 @@ class ChunkedBackupService
 
         $chunkIndex = 0;
         $currentChunkSize = 0;
-        $currentChunkData = '';
+        $chunkBuffer = '';
 
         while (!feof($process)) {
             $data = fread($process, 8192); // Read in 8KB blocks
             if ($data === false) break;
 
-            $currentChunkData .= $data;
+            $chunkBuffer .= $data;
             $currentChunkSize += strlen($data);
 
             if ($currentChunkSize >= $chunkSize) {
-                $this->uploadChunk($currentChunkData, $baseName, $chunkIndex, $tempPrefix);
-                $currentChunkData = '';
+                $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
+                $chunkBuffer = '';
                 $currentChunkSize = 0;
                 $chunkIndex++;
+                
+                // Force garbage collection every 10 chunks
+                if ($chunkIndex % 10 === 0) {
+                    gc_collect_cycles();
+                }
             }
         }
 
         // Upload the last chunk if there's remaining data
         if ($currentChunkSize > 0) {
-            $this->uploadChunk($currentChunkData, $baseName, $chunkIndex, $tempPrefix);
+            $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
             $chunkIndex++;
         }
 
         pclose($process);
+        unset($chunkBuffer); // Free buffer memory
     }
 
     protected function createChunkedFileBackup(string $timestamp): void
@@ -367,8 +384,9 @@ class ChunkedBackupService
 
         $chunkIndex = 0;
         $currentChunkSize = 0;
-        $currentChunkData = '';
+        $chunkBuffer = '';
         $baseName = "files_" . basename($dir) . "_{$timestamp}";
+        $fileCount = 0;
 
         foreach ($iterator as $file) {
             $filePath = $file->getRealPath();
@@ -378,26 +396,56 @@ class ChunkedBackupService
             }
 
             if ($file->isFile()) {
-                $fileData = $this->prepareFileForChunk($filePath, $dir);
-                $fileSize = strlen($fileData);
+                $fileSize = $file->getSize();
+                
+                // If single file is larger than chunk size, handle it separately
+                if ($fileSize > $chunkSize) {
+                    // Upload current chunk if it has data
+                    if ($currentChunkSize > 0) {
+                        $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
+                        $chunkBuffer = '';
+                        $currentChunkSize = 0;
+                        $chunkIndex++;
+                    }
+                    
+                    // Stream large file directly
+                    $this->streamLargeFileToChunks($filePath, $dir, $baseName, $chunkSize, $tempPrefix, $chunkIndex);
+                    $chunkIndex += ceil($fileSize / $chunkSize);
+                    continue;
+                }
 
-                if ($currentChunkSize + $fileSize > $chunkSize && $currentChunkSize > 0) {
+                // Add file to current chunk buffer
+                $fileData = $this->prepareFileForChunk($filePath, $dir);
+                $fileDataSize = strlen($fileData);
+
+                if ($currentChunkSize + $fileDataSize > $chunkSize && $currentChunkSize > 0) {
                     // Upload current chunk and start a new one
-                    $this->uploadChunk($currentChunkData, $baseName, $chunkIndex, $tempPrefix);
-                    $currentChunkData = '';
+                    $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
+                    $chunkBuffer = '';
                     $currentChunkSize = 0;
                     $chunkIndex++;
                 }
 
-                $currentChunkData .= $fileData;
-                $currentChunkSize += $fileSize;
+                $chunkBuffer .= $fileData;
+                $currentChunkSize += $fileDataSize;
+                
+                // Free file data immediately
+                unset($fileData);
+                $fileCount++;
+                
+                // Force garbage collection every 50 files
+                if ($fileCount % 50 === 0) {
+                    gc_collect_cycles();
+                }
             }
         }
 
         // Upload the last chunk if there's remaining data
         if ($currentChunkSize > 0) {
-            $this->uploadChunk($currentChunkData, $baseName, $chunkIndex, $tempPrefix);
+            $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
         }
+        
+        unset($chunkBuffer); // Free buffer memory
     }
 
     protected function streamFileToChunks(string $filePath, string $timestamp, int $chunkSize, string $tempPrefix): void
@@ -410,12 +458,24 @@ class ChunkedBackupService
         }
 
         $chunkIndex = 0;
+        $chunkBuffer = '';
+        
         while (!feof($handle)) {
-            $chunkData = fread($handle, $chunkSize);
-            if ($chunkData !== false && strlen($chunkData) > 0) {
-                $this->uploadChunk($chunkData, $baseName, $chunkIndex, $tempPrefix);
+            $data = fread($handle, min(8192, $chunkSize - strlen($chunkBuffer)));
+            if ($data === false) break;
+            
+            $chunkBuffer .= $data;
+            
+            if (strlen($chunkBuffer) >= $chunkSize) {
+                $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
+                $chunkBuffer = '';
                 $chunkIndex++;
             }
+        }
+        
+        // Upload the last chunk if there's remaining data
+        if (strlen($chunkBuffer) > 0) {
+            $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
         }
 
         fclose($handle);
@@ -423,12 +483,11 @@ class ChunkedBackupService
 
     protected function appendManifestEntry(string $zipPath, string $sourceFilePath): void
     {
-        $size = @filesize($sourceFilePath) ?: 0;
-        $hash = @hash_file('sha256', $sourceFilePath) ?: '';
+        // For memory efficiency, we'll calculate hash and size during manifest building
+        // instead of storing all entries in memory
         $this->manifestEntries[] = [
             'path' => $zipPath,
-            'size' => $size,
-            'sha256' => $hash,
+            'source_file' => $sourceFilePath,
         ];
     }
 
@@ -442,6 +501,18 @@ class ChunkedBackupService
         $backupPath = config('capsule.backup_path');
         $dbConns = config('capsule.database.connections');
         $dbConns = $dbConns === null ? [config('database.default')] : (is_string($dbConns) ? [$dbConns] : $dbConns);
+
+        // Process manifest entries to calculate size and hash
+        $processedEntries = [];
+        foreach ($this->manifestEntries as $entry) {
+            $size = @filesize($entry['source_file']) ?: 0;
+            $hash = @hash_file('sha256', $entry['source_file']) ?: '';
+            $processedEntries[] = [
+                'path' => $entry['path'],
+                'size' => $size,
+                'sha256' => $hash,
+            ];
+        }
 
         return [
             'schema_version' => 1,
@@ -471,122 +542,161 @@ class ChunkedBackupService
                 'paths' => (array) config('capsule.files.paths', []),
                 'exclude_paths' => (array) config('capsule.files.exclude_paths', []),
             ],
-            'entries' => $this->manifestEntries,
+            'entries' => $processedEntries,
         ];
     }
 
     protected function prepareFileForChunk(string $filePath, string $baseDir): string
     {
         $relativePath = substr($filePath, strlen($baseDir) + 1);
-        $fileContent = file_get_contents($filePath);
+        
+        // Add to manifest without loading file content yet
         $this->appendManifestEntry('files/' . $relativePath, $filePath);
         
-        // Create a simple format: [PATH_LENGTH][PATH][CONTENT_LENGTH][CONTENT]
+        // Stream file content instead of loading all at once
+        $fileHandle = fopen($filePath, 'r');
+        if (!$fileHandle) {
+            throw new Exception("Cannot open file: {$filePath}");
+        }
+        
         $pathLength = strlen($relativePath);
-        $contentLength = strlen($fileContent);
+        $contentLength = filesize($filePath);
         
-        return pack('N', $pathLength) . $relativePath . pack('N', $contentLength) . $fileContent;
+        // Create header
+        $result = pack('N', $pathLength) . $relativePath . pack('N', $contentLength);
+        
+        // Stream file content
+        while (!feof($fileHandle)) {
+            $data = fread($fileHandle, 8192);
+            if ($data !== false) {
+                $result .= $data;
+            }
+        }
+        
+        fclose($fileHandle);
+        return $result;
     }
 
-    protected function uploadChunk(string $data, string $baseName, int $chunkIndex, string $tempPrefix): void
-    {
-        $chunkName = "{$tempPrefix}{$baseName}.part{$chunkIndex}";
-        
-        $this->log("Preparing chunk {$chunkIndex} for {$baseName}...");
-        
-        // Store chunk data for concurrent upload
-        $this->chunkData[] = [
-            'name' => $chunkName,
-            'data' => $data,
-            'index' => $chunkIndex,
-            'base_name' => $baseName,
-            'size' => strlen($data),
-        ];
-        
-        // Keep chunk metadata for collation
-        $this->chunks[] = [
-            'name' => $chunkName,
-            'index' => $chunkIndex,
-            'base_name' => $baseName,
-            'size' => strlen($data),
-        ];
-    }
 
-    protected function uploadChunksConcurrently(): array
+    protected function streamLargeFileToChunks(string $filePath, string $baseDir, string $baseName, int $chunkSize, string $tempPrefix, int &$chunkIndex): void
     {
-        if (empty($this->chunkData)) {
-            return [];
+        $relativePath = substr($filePath, strlen($baseDir) + 1);
+        $this->appendManifestEntry('files/' . $relativePath, $filePath);
+        
+        $fileHandle = fopen($filePath, 'r');
+        if (!$fileHandle) {
+            throw new Exception("Cannot open large file for streaming: {$filePath}");
         }
 
-        $this->log("Starting concurrent upload of " . count($this->chunkData) . " chunks.");
-        Log::info("Starting concurrent upload of " . count($this->chunkData) . " chunks", [
-            'max_concurrent' => config('capsule.chunked_backup.max_concurrent_uploads', 3),
-            'backup_id' => $this->backupId,
-        ]);
-
-        $results = $this->uploadManager->uploadChunks($this->chunkData);
+        $pathLength = strlen($relativePath);
+        $pathData = pack('N', $pathLength) . $relativePath;
+        $pathDataSize = strlen($pathData);
         
-        $stats = $this->uploadManager->getUploadStats();
-        Log::info("Concurrent upload completed", [
-            'stats' => $stats,
-            'backup_id' => $this->backupId,
-        ]);
-        $this->log("Concurrent upload complete. Total: {$stats['total']}, Successful: {$stats['successful']}, Failed: {$stats['failed']}");
-
-        // Check if any uploads failed
-        $failedUploads = $this->uploadManager->getFailedUploads();
-        if (!empty($failedUploads)) {
-            $failedCount = count($failedUploads);
-            $totalCount = count($this->chunkData);
+        $chunkBuffer = '';
+        
+        while (!feof($fileHandle)) {
+            // Start new chunk with path data
+            if (empty($chunkBuffer)) {
+                $chunkBuffer = $pathData;
+            }
             
-            Log::warning("Some chunks failed to upload", [
-                'failed_count' => $failedCount,
-                'total_count' => $totalCount,
-                'backup_id' => $this->backupId,
-            ]);
-
-            // If more than 50% failed, throw an exception
-            if ($failedCount > ($totalCount / 2)) {
-                throw new Exception("Too many chunk uploads failed ({$failedCount}/{$totalCount})");
+            // Read file content until chunk size reached
+            while (strlen($chunkBuffer) < $chunkSize && !feof($fileHandle)) {
+                $data = fread($fileHandle, min(8192, $chunkSize - strlen($chunkBuffer)));
+                if ($data === false) break;
+                $chunkBuffer .= $data;
+            }
+            
+            if (strlen($chunkBuffer) > $pathDataSize) {
+                // Calculate content length and insert it after path data
+                $contentLength = strlen($chunkBuffer) - $pathDataSize;
+                $chunkBuffer = $pathData . pack('N', $contentLength) . substr($chunkBuffer, $pathDataSize);
+                
+                $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
+                $chunkIndex++;
+                $chunkBuffer = '';
             }
         }
 
-        return $results;
+        fclose($fileHandle);
     }
+
+
+    protected function uploadChunkDirectly(string $data, string $baseName, int $chunkIndex, string $tempPrefix): void
+    {
+        $chunkName = "{$tempPrefix}{$baseName}.part{$chunkIndex}";
+        $dataSize = strlen($data);
+        
+        $this->log("Uploading chunk {$chunkIndex} for {$baseName} directly...");
+        
+        // Upload chunk directly to storage using stream
+        $stream = fopen('php://temp', 'r+');
+        fwrite($stream, $data);
+        rewind($stream);
+        
+        try {
+            $this->storageManager->storeStream($stream, $chunkName);
+            
+            // Store minimal metadata for collation
+            $this->chunkMetadata[] = [
+                'name' => $chunkName,
+                'index' => $chunkIndex,
+                'base_name' => $baseName,
+                'size' => $dataSize,
+            ];
+            
+            $this->log("Chunk {$chunkIndex} uploaded successfully");
+            
+            // Free memory immediately after upload
+            unset($data);
+        } catch (Exception $e) {
+            fclose($stream);
+            throw new Exception("Failed to upload chunk {$chunkIndex}: " . $e->getMessage());
+        }
+        
+        fclose($stream);
+    }
+
 
     protected function collateChunks(): string
     {
         $timestamp = now()->format('Y-m-d_H-i-s');
         $finalBackupName = "backup_{$timestamp}.zip";
 
-        // Build manifest pseudo-chunk to include checksums/metadata in final ZIP
+        // Build manifest and upload it as a chunk
         $manifest = $this->buildManifest(true);
         $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        $this->chunkData[] = [
-            'name' => 'manifest.json.inline',
-            'data' => $manifestJson,
+        
+        // Upload manifest chunk directly
+        $manifestChunkName = "capsule_chunk_manifest.json.part0";
+        $stream = fopen('php://temp', 'r+');
+        fwrite($stream, $manifestJson);
+        rewind($stream);
+        $this->storageManager->storeStream($stream, $manifestChunkName);
+        fclose($stream);
+        
+        // Add manifest to metadata
+        $this->chunkMetadata[] = [
+            'name' => $manifestChunkName,
             'index' => 0,
             'base_name' => 'manifest.json',
             'size' => strlen($manifestJson),
         ];
-        $this->chunks[] = [
-            'name' => 'manifest.json.inline',
-            'index' => 0,
-            'base_name' => 'manifest.json',
-            'size' => strlen($manifestJson),
-        ];
-
-        // Upload all pending chunks (includes manifest)
-        $this->uploadChunksConcurrently();
+        
+        // Free manifest data immediately
+        unset($manifest, $manifestJson);
 
         $this->log("Collating chunks into '{$finalBackupName}'...");
-        return $this->storageManager->collateChunksAdvanced(
-            $this->chunks,
+        $finalPath = $this->storageManager->collateChunksAdvanced(
+            $this->chunkMetadata,
             $finalBackupName,
             $this->compressionLevel,
             $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
             (string) (config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD'))
         );
+        
+        $this->log("Final backup file created at: {$finalPath}");
+        return $finalPath;
     }
 
     protected function getRemoteFileSize(string $fileName): int
@@ -607,7 +717,7 @@ class ChunkedBackupService
     protected function cleanupChunks(): void
     {
         $this->log('Cleaning up remote chunks...');
-        foreach ($this->chunks as $chunk) {
+        foreach ($this->chunkMetadata as $chunk) {
             try {
                 $this->storageManager->delete($chunk['name']);
             } catch (Exception $e) {
@@ -651,5 +761,54 @@ class ChunkedBackupService
                 $backup->delete();
             });
         }
+    }
+
+    /**
+     * Determine the appropriate MySQL/MariaDB dump command to use.
+     * Tries mysqldump first, then falls back to mariadb-dump.
+     * 
+     * @return string The dump command to use
+     * @throws Exception If neither command is available
+     */
+    protected function getMysqlDumpCommand(): string
+    {
+        // Try mysqldump first (preferred for compatibility)
+        if ($this->commandExists('mysqldump')) {
+            $this->log('Using mysqldump command');
+            return 'mysqldump';
+        }
+        
+        // Fall back to mariadb-dump for newer MariaDB versions
+        if ($this->commandExists('mariadb-dump')) {
+            $this->log('mysqldump not found, using mariadb-dump command');
+            return 'mariadb-dump';
+        }
+        
+        // Neither command is available
+        $errorMessage = 'Neither mysqldump nor mariadb-dump command found. Please install MySQL or MariaDB client tools.';
+        
+        // Send notification if enabled
+        if (config('capsule.notifications.enabled', false)) {
+            $this->notificationManager->sendFailureNotification(
+                null, 
+                new Exception($errorMessage)
+            );
+        }
+        
+        throw new Exception($errorMessage);
+    }
+
+    /**
+     * Check if a command exists in the system PATH
+     * 
+     * @param string $command The command to check
+     * @return bool True if command exists, false otherwise
+     */
+    protected function commandExists(string $command): bool
+    {
+        $returnCode = 0;
+        $output = [];
+        exec("which {$command} 2>/dev/null", $output, $returnCode);
+        return $returnCode === 0;
     }
 }

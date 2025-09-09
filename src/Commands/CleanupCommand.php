@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Notifications\NotificationManager;
 use Illuminate\Console\Command;
 
 class CleanupCommand extends Command
@@ -22,7 +23,8 @@ class CleanupCommand extends Command
     {
         $this->info('Starting cleanup process...');
 
-        $retentionDays = $this->option('days') ? (int) $this->option('days') : config('capsule.retention.days', 30);
+        $daysOption = $this->option('days');
+        $retentionDays = $daysOption !== null ? (int) $daysOption : config('capsule.retention.days', 30);
         $retentionCount = config('capsule.retention.count', 10);
         $maxStorageMb = (int) (config('capsule.retention.max_storage_mb') ?? 0);
         $minKeep = (int) config('capsule.retention.min_keep', 3);
@@ -31,7 +33,7 @@ class CleanupCommand extends Command
         $cleanStorage = $this->option('storage');
         $verbose = $this->option('v');
 
-        if ($this->option('days')) {
+        if ($daysOption !== null) {
             $this->info("Using command override: {$retentionDays} days (ignoring config and count-based retention)");
         } else {
             $this->info("Retention policy: {$retentionDays} days, maximum {$retentionCount} backups");
@@ -84,6 +86,12 @@ class CleanupCommand extends Command
                 $action = $isDryRun ? 'Would delete' : 'Deleted';
                 $this->info("{$action} {$totalDeleted} items ({$this->formatBytes($totalSize)}) total");
             }
+        }
+
+        // Send notification if items were actually cleaned (not dry-run and count > 0)
+        if (!$isDryRun && $totalDeleted > 0) {
+            $notificationManager = new NotificationManager();
+            $notificationManager->sendCleanupNotification($totalDeleted, $totalSize);
         }
 
         return self::SUCCESS;
@@ -165,7 +173,7 @@ class CleanupCommand extends Command
             $this->info('🔍 Scanning successful backups...');
         }
 
-        if ($this->option('days')) {
+        if ($this->option('days') !== null) {
             $oldBackups = BackupLog::where('status', 'success')
                 ->where('created_at', '<', now()->subDays($retentionDays))
                 ->get();

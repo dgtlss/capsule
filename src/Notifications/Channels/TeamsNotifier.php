@@ -40,6 +40,18 @@ class TeamsNotifier implements NotifierInterface
         $this->sendWebhook($webhookUrl, $payload);
     }
 
+    public function sendCleanup(array $message, int $deletedCount, int $deletedSize): void
+    {
+        $webhookUrl = config('capsule.notifications.webhooks.teams.webhook_url');
+
+        if (!$webhookUrl) {
+            return;
+        }
+
+        $payload = $this->buildTeamsPayload($message, '00ff00');
+        $this->sendWebhook($webhookUrl, $payload);
+    }
+
     protected function buildTeamsPayload(array $message, string $themeColor): array
     {
         $facts = [];

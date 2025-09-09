@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Storage;
 
 use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Log;
 use Exception;
 use ZipArchive;
 
@@ -195,40 +196,8 @@ class StorageManager
                     }
                 }
             } elseif (str_starts_with($baseName, 'files_') || str_starts_with($baseName, 'file_')) {
-                // Files: our framing format [N][path][N][content] repeated
-                $buffer = '';
-                foreach ($group as $chunk) {
-                    $path = $this->getPrefixedPath($chunk['name']);
-                    if ($this->disk->exists($path)) {
-                        $buffer .= $this->disk->get($path);
-                    }
-                }
-
-                $offset = 0;
-                $len = strlen($buffer);
-                while ($offset + 4 <= $len) {
-                    $pathLen = unpack('N', substr($buffer, $offset, 4))[1] ?? 0;
-                    $offset += 4;
-                    if ($pathLen <= 0 || $offset + $pathLen > $len) break;
-                    $relativePath = substr($buffer, $offset, $pathLen);
-                    $offset += $pathLen;
-                    if ($offset + 4 > $len) break;
-                    $contentLen = unpack('N', substr($buffer, $offset, 4))[1] ?? 0;
-                    $offset += 4;
-                    if ($contentLen < 0 || $offset + $contentLen > $len) break;
-                    $content = substr($buffer, $offset, $contentLen);
-                    $offset += $contentLen;
-
-                    // Normalize entry path under files/
-                    $entryName = 'files/' . ltrim($relativePath, '/');
-                    $zip->addFromString($entryName, $content);
-                    if (method_exists($zip, 'setCompressionName')) {
-                        @$zip->setCompressionName($entryName, ZipArchive::CM_DEFLATE, $compressionLevel);
-                    }
-                    if ($encrypt && method_exists($zip, 'setEncryptionName') && !empty($password)) {
-                        @$zip->setEncryptionName($entryName, ZipArchive::EM_AES_256);
-                    }
-                }
+                // Files: stream chunks and parse framing format
+                $this->streamFilesToZip($zip, $group, $compressionLevel, $encrypt, $password);
             } elseif ($baseName === 'manifest.json') {
                 // Manifest provided inline (single chunk expected)
                 $buffer = '';
@@ -236,9 +205,6 @@ class StorageManager
                     $path = $this->getPrefixedPath($chunk['name']);
                     if ($this->disk->exists($path)) {
                         $buffer .= $this->disk->get($path);
-                    } else {
-                        // Some implementations may send inline data; try reading from memory path is not possible here.
-                        // Skip if not found; manifest is optional.
                     }
                 }
                 if ($buffer !== '') {
@@ -255,9 +221,99 @@ class StorageManager
 
         $zip->close();
 
-        $this->disk->put($finalPath, file_get_contents($tempZipPath));
-        @unlink($tempZipPath);
+        // Verify the zip file was created successfully
+        if (!file_exists($tempZipPath) || filesize($tempZipPath) === 0) {
+            @unlink($tempZipPath);
+            throw new Exception('Failed to create zip file or zip file is empty');
+        }
+
+        // Upload the final zip file to storage
+        try {
+            $zipContent = file_get_contents($tempZipPath);
+            if ($zipContent === false) {
+                throw new Exception('Failed to read zip file content');
+            }
+            
+            $this->disk->put($finalPath, $zipContent);
+            
+            // Verify the file was uploaded successfully
+            if (!$this->disk->exists($finalPath)) {
+                throw new Exception("Failed to upload final backup file to: {$finalPath}");
+            }
+            
+            Log::info("Successfully uploaded final backup file", [
+                'final_path' => $finalPath,
+                'file_size' => strlen($zipContent),
+                'disk' => config('capsule.default_disk')
+            ]);
+            
+        } catch (Exception $e) {
+            Log::error("Failed to upload final backup file", [
+                'final_path' => $finalPath,
+                'error' => $e->getMessage(),
+                'disk' => config('capsule.default_disk')
+            ]);
+            throw $e;
+        } finally {
+            @unlink($tempZipPath);
+        }
+        
         return $finalPath;
+    }
+
+    protected function streamFilesToZip(ZipArchive $zip, array $chunks, int $compressionLevel, bool $encrypt, string $password): void
+    {
+        // For files, we need to parse the framing format [N][path][N][content]
+        // Since we can't easily stream this format, we'll process in smaller batches
+        $batchSize = 5; // Process 5 chunks at a time to limit memory usage
+        $chunkBatches = array_chunk($chunks, $batchSize);
+        
+        foreach ($chunkBatches as $batch) {
+            $buffer = '';
+            foreach ($batch as $chunk) {
+                $path = $this->getPrefixedPath($chunk['name']);
+                if ($this->disk->exists($path)) {
+                    $buffer .= $this->disk->get($path);
+                }
+            }
+            
+            $this->parseFileBufferToZip($zip, $buffer, $compressionLevel, $encrypt, $password);
+            unset($buffer); // Free memory immediately
+        }
+    }
+    
+    protected function parseFileBufferToZip(ZipArchive $zip, string $buffer, int $compressionLevel, bool $encrypt, string $password): void
+    {
+        $offset = 0;
+        $len = strlen($buffer);
+        
+        while ($offset + 4 <= $len) {
+            $pathLen = unpack('N', substr($buffer, $offset, 4))[1] ?? 0;
+            $offset += 4;
+            if ($pathLen <= 0 || $offset + $pathLen > $len) break;
+            
+            $relativePath = substr($buffer, $offset, $pathLen);
+            $offset += $pathLen;
+            
+            if ($offset + 4 > $len) break;
+            $contentLen = unpack('N', substr($buffer, $offset, 4))[1] ?? 0;
+            $offset += 4;
+            
+            if ($contentLen < 0 || $offset + $contentLen > $len) break;
+            $content = substr($buffer, $offset, $contentLen);
+            $offset += $contentLen;
+
+            // Normalize entry path under files/
+            $entryName = 'files/' . ltrim($relativePath, '/');
+            $zip->addFromString($entryName, $content);
+            
+            if (method_exists($zip, 'setCompressionName')) {
+                @$zip->setCompressionName($entryName, ZipArchive::CM_DEFLATE, $compressionLevel);
+            }
+            if ($encrypt && method_exists($zip, 'setEncryptionName') && !empty($password)) {
+                @$zip->setEncryptionName($entryName, ZipArchive::EM_AES_256);
+            }
+        }
     }
 
     public function getDisk(): Filesystem

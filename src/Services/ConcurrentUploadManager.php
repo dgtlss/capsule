@@ -93,8 +93,16 @@ class ConcurrentUploadManager
     protected function createTempUploadScript(array $chunk): string
     {
         $tempFile = tempnam(sys_get_temp_dir(), 'capsule_upload_');
-        $dataFile = $tempFile . '.data';
-        file_put_contents($dataFile, $chunk['data']);
+        
+        // Check if chunk has temp_file (memory-efficient) or data (legacy)
+        if (isset($chunk['temp_file']) && file_exists($chunk['temp_file'])) {
+            $dataFile = $chunk['temp_file'];
+            $useTempFile = true;
+        } else {
+            $dataFile = $tempFile . '.data';
+            file_put_contents($dataFile, $chunk['data']);
+            $useTempFile = false;
+        }
         
         $script = '<?php
 require_once "' . base_path('vendor/autoload.php') . '";
@@ -105,22 +113,25 @@ try {
     
     $storageManager = app(\Dgtlss\Capsule\Storage\StorageManager::class);
     
-    $chunkData = file_get_contents("' . $dataFile . '");
     $chunkName = "' . $chunk['name'] . '";
     
-    $tempStream = fopen("php://temp", "r+");
-    fwrite($tempStream, $chunkData);
-    rewind($tempStream);
+    // Use file stream for better memory efficiency
+    $fileStream = fopen("' . $dataFile . '", 'r');
+    if (!$fileStream) {
+        throw new Exception("Cannot open chunk file");
+    }
     
-    $storageManager->storeStream($tempStream, $chunkName);
-    fclose($tempStream);
+    $storageManager->storeStream($fileStream, $chunkName);
+    fclose($fileStream);
     
     file_put_contents("' . $tempFile . '.success", "SUCCESS");
 } catch (Exception $e) {
     file_put_contents("' . $tempFile . '.error", $e->getMessage());
 } finally {
-    // Clean up data file
-    @unlink("' . $dataFile . '");
+    // Clean up data file only if we created it
+    if (!' . ($useTempFile ? 'true' : 'false') . ') {
+        @unlink("' . $dataFile . '");
+    }
 }
 ';
 
@@ -192,6 +203,11 @@ try {
         @unlink($process['script'] . '.success');
         @unlink($process['script'] . '.error');
         @unlink($process['error_log']);
+        
+        // Clean up temp file if it was used
+        if (isset($chunk['temp_file']) && file_exists($chunk['temp_file'])) {
+            @unlink($chunk['temp_file']);
+        }
         
         $this->results[$uploadId] = [
             'chunk' => $chunk,

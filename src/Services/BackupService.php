@@ -420,8 +420,13 @@ class BackupService
             $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
             return '"' . $value . '"';
         };
+        
+        // Determine which dump command to use
+        $dumpCommand = $this->getMysqlDumpCommand();
+        
         $configContent = sprintf(
-            "[mysqldump]\nuser=%s\npassword=%s\n",
+            "[%s]\nuser=%s\npassword=%s\n",
+            $dumpCommand,
             $escape($config['username'] ?? ''),
             $escape($config['password'] ?? '')
         );
@@ -470,7 +475,8 @@ class BackupService
         $extraFlags = trim((string) (config('capsule.database.mysqldump_flags') ?? env('CAPSULE_MYSQLDUMP_FLAGS', '')));
         $allFlags = trim(implode(' ', $safeFlags) . ' ' . $extraFlags);
         $command = sprintf(
-            'mysqldump --defaults-extra-file=%s %s %s > %s 2>&1; rm %s',
+            '%s --defaults-extra-file=%s %s %s > %s 2>&1; rm %s',
+            $dumpCommand,
             escapeshellarg($configFile),
             $allFlags,
             escapeshellarg($config['database']),
@@ -549,8 +555,13 @@ class BackupService
             $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
             return '"' . $value . '"';
         };
+        
+        // Determine which dump command to use
+        $dumpCommand = $this->getMysqlDumpCommand();
+        
         $configContent = sprintf(
-            "[mysqldump]\nuser=%s\npassword=%s\n",
+            "[%s]\nuser=%s\npassword=%s\n",
+            $dumpCommand,
             $escape($config['username'] ?? ''),
             $escape($config['password'] ?? '')
         );
@@ -610,7 +621,8 @@ class BackupService
             if (!empty($includeTables)) {
                 $tables = implode(' ', array_map('escapeshellarg', $includeTables));
                 $command = sprintf(
-                    'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                    '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                    $dumpCommand,
                     escapeshellarg($configFile),
                     $safeFlags,
                     $extraFlags,
@@ -620,7 +632,8 @@ class BackupService
                 );
             } else {
                 $command = sprintf(
-                    'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                    '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                    $dumpCommand,
                     escapeshellarg($configFile),
                     $safeFlags,
                     $extraFlags,
@@ -645,7 +658,8 @@ class BackupService
                     if (!empty($includeTables)) {
                         $tables = implode(' ', array_map('escapeshellarg', $includeTables));
                         $retryCommand = sprintf(
-                            'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                            '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                            $dumpCommand,
                             escapeshellarg($configFile),
                             $fallbackFlags,
                             $extraFlags,
@@ -655,7 +669,8 @@ class BackupService
                         );
                     } else {
                         $retryCommand = sprintf(
-                            'mysqldump --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                            '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
+                            $dumpCommand,
                             escapeshellarg($configFile),
                             $fallbackFlags,
                             $extraFlags,
@@ -1104,13 +1119,10 @@ class BackupService
                 $driver = $dbConfig['driver'] ?? 'unknown';
                 switch ($driver) {
                     case 'mysql':
-                        if (!$this->commandExists('mysqldump')) {
-                            throw new Exception('mysqldump command not found. Install MySQL client tools.');
-                        }
-                        break;
                     case 'mariadb':
-                        if (!$this->commandExists('mysqldump')) {
-                            throw new Exception('mysqldump command not found. Install MySQL client tools.');
+                        // Check if either mysqldump or mariadb-dump is available
+                        if (!$this->commandExists('mysqldump') && !$this->commandExists('mariadb-dump')) {
+                            throw new Exception('Neither mysqldump nor mariadb-dump command found. Install MySQL or MariaDB client tools.');
                         }
                         break;
                     case 'pgsql':
@@ -1179,4 +1191,40 @@ class BackupService
         $verifyTime = round(microtime(true) - $startTime, 2);
         $this->log("   ✅ Backup verified: {$numFiles} files, integrity check passed ({$verifyTime}s)");
     }
+
+    /**
+     * Determine the appropriate MySQL/MariaDB dump command to use.
+     * Tries mysqldump first, then falls back to mariadb-dump.
+     * 
+     * @return string The dump command to use
+     * @throws Exception If neither command is available
+     */
+    protected function getMysqlDumpCommand(): string
+    {
+        // Try mysqldump first (preferred for compatibility)
+        if ($this->commandExists('mysqldump')) {
+            $this->log('Using mysqldump command');
+            return 'mysqldump';
+        }
+        
+        // Fall back to mariadb-dump for newer MariaDB versions
+        if ($this->commandExists('mariadb-dump')) {
+            $this->log('mysqldump not found, using mariadb-dump command');
+            return 'mariadb-dump';
+        }
+        
+        // Neither command is available
+        $errorMessage = 'Neither mysqldump nor mariadb-dump command found. Please install MySQL or MariaDB client tools.';
+        
+        // Send notification if enabled
+        if (config('capsule.notifications.enabled', false)) {
+            $this->notificationManager->sendFailureNotification(
+                null, 
+                new Exception($errorMessage)
+            );
+        }
+        
+        throw new Exception($errorMessage);
+    }
+
 }

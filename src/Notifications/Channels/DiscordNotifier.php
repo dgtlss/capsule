@@ -40,6 +40,18 @@ class DiscordNotifier implements NotifierInterface
         $this->sendWebhook($webhookUrl, $payload);
     }
 
+    public function sendCleanup(array $message, int $deletedCount, int $deletedSize): void
+    {
+        $webhookUrl = config('capsule.notifications.webhooks.discord.webhook_url');
+
+        if (!$webhookUrl) {
+            return;
+        }
+
+        $payload = $this->buildDiscordPayload($message, 0x00ff00); // Green
+        $this->sendWebhook($webhookUrl, $payload);
+    }
+
     protected function buildDiscordPayload(array $message, int $color): array
     {
         $fields = [];

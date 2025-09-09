@@ -40,6 +40,18 @@ class SlackNotifier implements NotifierInterface
         $this->sendWebhook($webhookUrl, $payload);
     }
 
+    public function sendCleanup(array $message, int $deletedCount, int $deletedSize): void
+    {
+        $webhookUrl = config('capsule.notifications.webhooks.slack.webhook_url');
+
+        if (!$webhookUrl) {
+            return;
+        }
+
+        $payload = $this->buildSlackPayload($message, 'good');
+        $this->sendWebhook($webhookUrl, $payload);
+    }
+
     protected function buildSlackPayload(array $message, string $color): array
     {
         $fields = [];

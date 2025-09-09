@@ -53,6 +53,23 @@ class NotificationManager
         }
     }
 
+    public function sendCleanupNotification(int $deletedCount, int $deletedSize): void
+    {
+        if (!config('capsule.notifications.enabled', true)) {
+            return;
+        }
+
+        $message = $this->buildCleanupMessage($deletedCount, $deletedSize);
+
+        foreach ($this->notifiers as $notifier) {
+            try {
+                $notifier->sendCleanup($message, $deletedCount, $deletedSize);
+            } catch (Exception $e) {
+                logger()->error("Failed to send cleanup notification via " . get_class($notifier) . ": " . $e->getMessage());
+            }
+        }
+    }
+
     protected function initializeNotifiers(): void
     {
         if (config('capsule.notifications.email.enabled', false)) {
@@ -123,6 +140,22 @@ class NotificationManager
             'details' => $details,
             'color' => 'danger',
             'emoji' => '❌',
+        ];
+    }
+
+    protected function buildCleanupMessage(int $deletedCount, int $deletedSize): array
+    {
+        return [
+            'title' => 'Cleanup Completed',
+            'message' => "{$deletedCount} items were removed.",
+            'details' => [
+                'Items deleted' => $deletedCount,
+                'Space freed' => $this->formatBytes($deletedSize),
+                'Completed at' => now()->format('Y-m-d H:i:s'),
+                'Status' => 'Success',
+            ],
+            'color' => 'good',
+            'emoji' => '🧹',
         ];
     }
 
