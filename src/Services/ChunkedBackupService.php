@@ -6,6 +6,7 @@ use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Support\MemoryMonitor;
+use Dgtlss\Capsule\Support\Formatters;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Log;
 use Exception;
@@ -209,32 +210,12 @@ class ChunkedBackupService
     {
         // Create a temporary config file for secure password handling
         $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
-            return '"' . $value . '"';
-        };
-        
-        // Determine which dump command to use
-        $dumpCommand = $this->getMysqlDumpCommand();
-        
-        $configContent = sprintf(
-            "[%s]\nuser=%s\npassword=%s\n",
-            $dumpCommand,
-            $escape($config['username'] ?? ''),
-            $escape($config['password'] ?? '')
-        );
-        if (!empty($config['unix_socket'])) {
-            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
-        } else {
-            $configContent .= sprintf(
-                "host=%s\nport=%s\n",
-                $escape($config['host'] ?? 'localhost'),
-                $escape($config['port'] ?? 3306)
-            );
-        }
+        [$configContent, $escape] = $this->buildMysqlConfig($config);
+
         file_put_contents($configFile, $configContent);
         chmod($configFile, 0600);
+
+        $dumpCommand = $this->getMysqlDumpCommand();
 
         $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
         $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
@@ -798,17 +779,4 @@ class ChunkedBackupService
         throw new Exception($errorMessage);
     }
 
-    /**
-     * Check if a command exists in the system PATH
-     * 
-     * @param string $command The command to check
-     * @return bool True if command exists, false otherwise
-     */
-    protected function commandExists(string $command): bool
-    {
-        $returnCode = 0;
-        $output = [];
-        exec("which {$command} 2>/dev/null", $output, $returnCode);
-        return $returnCode === 0;
-    }
 }

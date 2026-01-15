@@ -81,6 +81,14 @@ return [
         // Extra flags to pass to mysqldump/pg_dump. Example: '--set-gtid-purged=OFF'
         'mysqldump_flags' => env('CAPSULE_MYSQLDUMP_FLAGS', ''),
 
+        // SSL/TLS configuration for MySQL connections
+        'ssl' => [
+            'mode' => env('MYSQL_SSL_MODE'),
+            'ca' => env('MYSQL_ATTR_SSL_CA'),
+            'cert' => env('MYSQL_ATTR_SSL_CERT'),
+            'key' => env('MYSQL_ATTR_SSL_KEY'),
+        ],
+
         // Compress database dumps using gzip
         'compress' => true,
     ],
@@ -319,6 +327,9 @@ return [
 
         // Enable integrity verification of backup files
         'verify_integrity' => env('CAPSULE_VERIFY_INTEGRITY', true),
+
+        // Automatically verify backup after creation (recommended)
+        'auto_verify' => env('CAPSULE_AUTO_VERIFY', false),
 
         // Secure temporary file permissions (octal)
         'temp_file_permissions' => 0600,

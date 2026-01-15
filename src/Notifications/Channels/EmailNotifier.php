@@ -3,9 +3,11 @@
 namespace Dgtlss\Capsule\Notifications\Channels;
 
 use Dgtlss\Capsule\Models\BackupLog;
+use Dgtlss\Capsule\Support\BackupContext;
 use Dgtlss\Capsule\Notifications\NotifierInterface;
 use Illuminate\Support\Facades\Mail;
 use Exception;
+use Throwable;
 
 class EmailNotifier implements NotifierInterface
 {
@@ -46,6 +48,34 @@ class EmailNotifier implements NotifierInterface
         }
 
         Mail::html($this->buildCleanupHtml($message, $deletedCount, $deletedSize), function ($mail) use ($to, $subject) {
+            $mail->to($to)->subject($subject);
+        });
+    }
+
+    public function sendRestoreSuccess(array $message, BackupLog $backupLog, BackupContext $context): void
+    {
+        $to = config('capsule.notifications.email.to');
+        $subject = 'Restore Completed Successfully';
+
+        if (!$to) {
+            return;
+        }
+
+        Mail::html($this->buildRestoreHtml($message, true), function ($mail) use ($to, $subject) {
+            $mail->to($to)->subject($subject);
+        });
+    }
+
+    public function sendRestoreFailure(array $message, BackupLog $backupLog, Throwable $exception): void
+    {
+        $to = config('capsule.notifications.email.to');
+        $subject = 'Restore Failed';
+
+        if (!$to) {
+            return;
+        }
+
+        Mail::html($this->buildRestoreHtml($message, false), function ($mail) use ($to, $subject) {
             $mail->to($to)->subject($subject);
         });
     }
@@ -118,6 +148,36 @@ class EmailNotifier implements NotifierInterface
             </table>
             <div style="padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px">
               Capsule Backup • <span style="color:' . $color . '">Cleanup Completed</span>
+            </div>
+          </div>
+        </body></html>';
+    }
+
+    protected function buildRestoreHtml(array $message, bool $success): string
+    {
+        $color = $success ? '#16a34a' : '#dc2626';
+        $emoji = $message['emoji'] ?? ($success ? '✅' : '❌');
+        $rows = '';
+        foreach ($message['details'] as $k => $v) {
+            $rows .= '<tr><td style="padding:6px 10px;color:#6b7280;font-size:12px">' . htmlspecialchars((string)$k) . '</td><td style="padding:6px 10px;color:#111827;font-size:12px">' . htmlspecialchars((string)$v) . '</td></tr>';
+        }
+
+        return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+        <title>Capsule Restore</title></head>
+        <body style="margin:0;background:#f9fafb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif">
+          <div style="max-width:640px;margin:24px auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+            <div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;gap:10px">
+              <div style="font-size:20px">' . $emoji . '</div>
+              <div>
+                <div style="font-weight:600;color:#111827">' . htmlspecialchars((string)($message['title'] ?? 'Restore')) . '</div>
+                <div style="color:#6b7280;font-size:13px">' . htmlspecialchars((string)($message['message'] ?? '')) . '</div>
+              </div>
+            </div>
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
+              <tbody>' . $rows . '</tbody>
+            </table>
+            <div style="padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px">
+              Capsule Restore • ' . ($success ? '<span style="color:' . $color . '">Success</span>' : '<span style="color:' . $color . '">Failed</span>') . '
             </div>
           </div>
         </body></html>';

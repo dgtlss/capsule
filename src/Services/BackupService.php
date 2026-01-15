@@ -6,9 +6,11 @@ use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Support\BackupContext;
+use Dgtlss\Capsule\Support\Formatters;
 use Dgtlss\Capsule\Contracts\FileFilterInterface;
 use Dgtlss\Capsule\Contracts\StepInterface;
 use Dgtlss\Capsule\Events\{BackupStarting, DatabaseDumpStarting, DatabaseDumpCompleted, FilesCollectStarting, FilesCollectCompleted, ArchiveFinalizing, BackupUploaded, BackupSucceeded, BackupFailed};
+use Dgtlss\Capsule\Services\Concerns\HasDatabaseBackup;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -17,6 +19,7 @@ use Exception;
 
 class BackupService
 {
+    use HasDatabaseBackup;
     protected Application $app;
     protected StorageManager $storageManager;
     protected NotificationManager $notificationManager;
@@ -146,13 +149,13 @@ class BackupService
             
             $fileSize = filesize($localBackupPath);
             
-            // Verify backup integrity if requested
-            if ($this->verification) {
+            // Verify backup integrity if requested or auto-verify is enabled
+            if ($this->verification || config('capsule.security.auto_verify', false)) {
                 $this->log('🔍 Verifying backup integrity...');
                 $this->verifyBackup($localBackupPath);
             }
 
-            $this->log("📤 Uploading backup to storage ({$this->formatBytes($fileSize)})...");
+            $this->log("📤 Uploading backup to storage (" . Formatters::bytes($fileSize) . ")...");
             $remotePath = $this->storageManager->store($localBackupPath);
             $context->remotePath = $remotePath;
             $this->lastRemotePath = $remotePath;
@@ -343,7 +346,7 @@ class BackupService
             $dumpPath = $this->createDatabaseDump($resolvedConnection, $timestamp);
             $dumpSize = filesize($dumpPath);
             $entryName = "database/{$resolvedConnection}.sql";
-            $this->log("   💾 Adding {$entryName} ({$this->formatBytes($dumpSize)}) to archive");
+            $this->log("   💾 Adding {$entryName} (" . Formatters::bytes($dumpSize) . ") to archive");
             $zip->addFile($dumpPath, $entryName);
             $this->applyCompressionAndEncryption($zip, $entryName);
             $this->appendManifestEntry($entryName, $dumpPath);
@@ -383,7 +386,7 @@ class BackupService
 
             $dumpSize = filesize($processInfo['path']);
             $entryName = "database/{$connectionName}.sql";
-            $this->log("   💾 Adding {$entryName} ({$this->formatBytes($dumpSize)}) to archive");
+            $this->log("   💾 Adding {$entryName} (" . Formatters::bytes($dumpSize) . ") to archive");
             $zip->addFile($processInfo['path'], $entryName);
             $this->applyCompressionAndEncryption($zip, $entryName);
             $this->appendManifestEntry($entryName, $processInfo['path']);
@@ -420,10 +423,10 @@ class BackupService
             $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
             return '"' . $value . '"';
         };
-        
+
         // Determine which dump command to use
         $dumpCommand = $this->getMysqlDumpCommand();
-        
+
         $configContent = sprintf(
             "[%s]\nuser=%s\npassword=%s\n",
             $dumpCommand,
@@ -441,10 +444,10 @@ class BackupService
         }
 
         // Optional SSL configuration
-        $sslMode = config("database.connections." . ($config['name'] ?? 'mysql') . ".sslmode") ?? env('DB_SSL_MODE');
-        $sslCa = env('MYSQL_ATTR_SSL_CA');
-        $sslCert = env('MYSQL_ATTR_SSL_CERT');
-        $sslKey = env('MYSQL_ATTR_SSL_KEY');
+        $sslMode = config('capsule.database.ssl.mode');
+        $sslCa = config('capsule.database.ssl.ca');
+        $sslCert = config('capsule.database.ssl.cert');
+        $sslKey = config('capsule.database.ssl.key');
         if (!empty($sslMode)) {
             $configContent .= 'ssl-mode=' . $escape($sslMode) . "\n";
         }
@@ -457,7 +460,7 @@ class BackupService
         if (!empty($sslKey)) {
             $configContent .= 'ssl-key=' . $escape($sslKey) . "\n";
         }
-        
+
         file_put_contents($configFile, $configContent);
         chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
 
@@ -537,7 +540,7 @@ class BackupService
                 $this->createPostgresDump($config, $dumpPath);
                 break;
             case 'sqlite':
-                $this->createSqliteDump($config, $dumpPath);
+                $this->copySqliteDatabase($config, $dumpPath);
                 break;
             default:
                 throw new Exception("Unsupported database driver: {$driver}");
@@ -550,51 +553,12 @@ class BackupService
     {
         // Create temporary MySQL config file for secure password handling
         $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
-            return '"' . $value . '"';
-        };
-        
-        // Determine which dump command to use
-        $dumpCommand = $this->getMysqlDumpCommand();
-        
-        $configContent = sprintf(
-            "[%s]\nuser=%s\npassword=%s\n",
-            $dumpCommand,
-            $escape($config['username'] ?? ''),
-            $escape($config['password'] ?? '')
-        );
-        if (!empty($config['unix_socket'])) {
-            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
-        } else {
-            $configContent .= sprintf(
-                "host=%s\nport=%s\n",
-                $escape($config['host'] ?? 'localhost'),
-                $escape($config['port'] ?? 3306)
-            );
-        }
+        [$configContent, $escape] = $this->buildMysqlConfig($config);
 
-        // Optional SSL configuration
-        $sslMode = config("database.connections." . ($config['name'] ?? 'mysql') . ".sslmode") ?? env('DB_SSL_MODE');
-        $sslCa = env('MYSQL_ATTR_SSL_CA');
-        $sslCert = env('MYSQL_ATTR_SSL_CERT');
-        $sslKey = env('MYSQL_ATTR_SSL_KEY');
-        if (!empty($sslMode)) {
-            $configContent .= 'ssl-mode=' . $escape($sslMode) . "\n";
-        }
-        if (!empty($sslCa)) {
-            $configContent .= 'ssl-ca=' . $escape($sslCa) . "\n";
-        }
-        if (!empty($sslCert)) {
-            $configContent .= 'ssl-cert=' . $escape($sslCert) . "\n";
-        }
-        if (!empty($sslKey)) {
-            $configContent .= 'ssl-key=' . $escape($sslKey) . "\n";
-        }
-        
         file_put_contents($configFile, $configContent);
         chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
+
+        $dumpCommand = $this->getMysqlDumpCommand();
 
         try {
             $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
@@ -715,20 +679,8 @@ class BackupService
     {
         // Create temporary .pgpass file for secure password handling
         $pgpassFile = tempnam(sys_get_temp_dir(), 'pgpass_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            // Escape backslashes and colons for .pgpass format
-            return str_replace(['\\', ':'], ['\\\\', '\\:'], $value);
-        };
-        $pgpassContent = sprintf(
-            "%s:%s:%s:%s:%s\n",
-            $escape($config['host']),
-            $escape($config['port'] ?? 5432),
-            $escape($config['database']),
-            $escape($config['username']),
-            $escape($config['password'])
-        );
-        
+        [$pgpassContent, $escape] = $this->buildPostgresConfig($config);
+
         file_put_contents($pgpassFile, $pgpassContent);
         chmod($pgpassFile, config('capsule.security.temp_file_permissions', 0600));
 
@@ -778,22 +730,6 @@ class BackupService
         }
     }
 
-    protected function createSqliteDump(array $config, string $dumpPath): void
-    {
-        if (!file_exists($config['database'])) {
-            $this->lastError = "SQLite database file not found: {$config['database']}";
-            throw new Exception($this->lastError);
-        }
-
-        if (!copy($config['database'], $dumpPath)) {
-            $this->lastError = "Failed to copy SQLite database from {$config['database']} to {$dumpPath}";
-            if ($this->verbose) {
-                $this->lastError .= "\nCheck file permissions and disk space.";
-            }
-            throw new Exception($this->lastError);
-        }
-    }
-
     protected function addFilesToBackup(ZipArchive $zip): void
     {
         $paths = config('capsule.files.paths', []);
@@ -813,7 +749,7 @@ class BackupService
                 if (!$this->passesFilters($path, $filters)) {
                     continue;
                 }
-                $this->log("   📄 Adding file: " . basename($path) . " ({$this->formatBytes($fileSize)})");
+                $this->log("   📄 Adding file: " . basename($path) . " (" . Formatters::bytes($fileSize) . ")");
                 $zip->addFile($path, $relative);
                 $this->applyCompressionAndEncryption($zip, $relative);
                 $this->appendManifestEntry($relative, $path);
@@ -865,13 +801,13 @@ class BackupService
                 
                 // Show progress every 100 files to avoid spam
                 if ($fileCount % 100 === 0) {
-                    $this->log("   📊 Added {$fileCount} files ({$this->formatBytes($totalSize)})...");
+                    $this->log("   📊 Added {$fileCount} files (" . Formatters::bytes($totalSize) . ")...");
                 }
             }
         }
         
         if ($fileCount > 0) {
-            $this->log("   ✅ Completed: {$fileCount} files ({$this->formatBytes($totalSize)}) from " . basename($dir));
+            $this->log("   ✅ Completed: {$fileCount} files (" . Formatters::bytes($totalSize) . ") from " . basename($dir));
         }
     }
 
@@ -1026,15 +962,6 @@ class BackupService
         return false;
     }
 
-    protected function formatBytes(int $bytes): string
-    {
-        if ($bytes === 0) return '0 B';
-        
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $power = floor(log($bytes, 1024));
-        return round($bytes / (1024 ** $power), 2) . ' ' . $units[$power];
-    }
-
     protected function cleanup(): void
     {
         if (!config('capsule.retention.cleanup_enabled', true)) {
@@ -1154,12 +1081,6 @@ class BackupService
         }
     }
 
-    protected function commandExists(string $command): bool
-    {
-        $result = shell_exec("which {$command}");
-        return !empty($result);
-    }
-
     protected function verifyBackup(string $backupPath): void
     {
         $startTime = microtime(true);
@@ -1195,7 +1116,7 @@ class BackupService
     /**
      * Determine the appropriate MySQL/MariaDB dump command to use.
      * Tries mysqldump first, then falls back to mariadb-dump.
-     * 
+     *
      * @return string The dump command to use
      * @throws Exception If neither command is available
      */
@@ -1206,25 +1127,24 @@ class BackupService
             $this->log('Using mysqldump command');
             return 'mysqldump';
         }
-        
+
         // Fall back to mariadb-dump for newer MariaDB versions
         if ($this->commandExists('mariadb-dump')) {
             $this->log('mysqldump not found, using mariadb-dump command');
             return 'mariadb-dump';
         }
-        
+
         // Neither command is available
         $errorMessage = 'Neither mysqldump nor mariadb-dump command found. Please install MySQL or MariaDB client tools.';
-        
+
         // Send notification if enabled
         if (config('capsule.notifications.enabled', false)) {
             $this->notificationManager->sendFailureNotification(
-                null, 
+                null,
                 new Exception($errorMessage)
             );
         }
-        
+
         throw new Exception($errorMessage);
     }
-
 }

@@ -5,6 +5,7 @@ namespace Dgtlss\Capsule\Commands;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Notifications\NotificationManager;
+use Dgtlss\Capsule\Support\Formatters;
 use Illuminate\Console\Command;
 
 class CleanupCommand extends Command
@@ -84,7 +85,7 @@ class CleanupCommand extends Command
                 $this->info('No items to clean up.');
             } else {
                 $action = $isDryRun ? 'Would delete' : 'Deleted';
-                $this->info("{$action} {$totalDeleted} items ({$this->formatBytes($totalSize)}) total");
+                $this->info("{$action} {$totalDeleted} items (" . Formatters::bytes($totalSize) . ") total");
             }
         }
 
@@ -111,7 +112,7 @@ class CleanupCommand extends Command
         $totalBytes = (int) $currentFiles->sum('file_size');
         $budgetBytes = $maxStorageMb * 1024 * 1024;
         if ($verbose) {
-            $this->info('📊 Storage usage: ' . $this->formatBytes($totalBytes) . ' / ' . $this->formatBytes($budgetBytes));
+            $this->info('📊 Storage usage: ' . Formatters::bytes($totalBytes) . ' / ' . Formatters::bytes($budgetBytes));
         }
 
         if ($totalBytes <= $budgetBytes) {
@@ -133,7 +134,7 @@ class CleanupCommand extends Command
 
             $size = (int) ($backup->file_size ?? 0);
             if ($verbose) {
-                $this->line("- Pruning (budget): " . $backup->created_at->format('Y-m-d H:i:s') . ' (' . $this->formatBytes($size) . ')');
+                $this->line("- Pruning (budget): " . $backup->created_at->format('Y-m-d H:i:s') . ' (' . Formatters::bytes($size) . ')');
             }
 
             if (!$isDryRun) {
@@ -159,7 +160,7 @@ class CleanupCommand extends Command
 
         if ($deletedCount > 0) {
             $action = $isDryRun ? 'Would delete (budget)' : 'Deleted (budget)';
-            $this->info("{$action} {$deletedCount} items (" . $this->formatBytes($deletedSize) . ")");
+            $this->info("{$action} {$deletedCount} items (" . Formatters::bytes($deletedSize) . ")");
         } else if ($verbose) {
             $this->info('No items pruned by budget (respecting min_keep).');
         }
@@ -211,7 +212,7 @@ class CleanupCommand extends Command
 
         foreach ($oldBackups as $backup) {
             $size = $backup->file_size ?? 0;
-            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({$this->formatBytes($size)})");
+            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} (" . Formatters::bytes($size) . ")");
 
             if (!$isDryRun) {
                 if ($backup->file_path) {
@@ -233,9 +234,9 @@ class CleanupCommand extends Command
 
         if ($isDryRun) {
             $totalSize = $oldBackups->sum('file_size');
-            $this->info("Would delete {$oldBackups->count()} successful backups ({$this->formatBytes($totalSize)})");
+            $this->info("Would delete {$oldBackups->count()} successful backups (" . Formatters::bytes($totalSize) . ")");
         } else {
-            $this->info("Deleted {$deletedCount} successful backups ({$this->formatBytes($deletedSize)})");
+            $this->info("Deleted {$deletedCount} successful backups (" . Formatters::bytes($deletedSize) . ")");
         }
 
         return ['count' => $deletedCount, 'size' => $deletedSize];
@@ -320,7 +321,7 @@ class CleanupCommand extends Command
         foreach ($orphanedFiles as $filename) {
             try {
                 $size = $storageManager->size($filename);
-                $this->line("- {$filename} ({$this->formatBytes($size)})");
+                $this->line("- {$filename} (" . Formatters::bytes($size) . ")");
 
                 if (!$isDryRun) {
                     $storageManager->delete($filename);
@@ -336,23 +337,11 @@ class CleanupCommand extends Command
         }
 
         if ($isDryRun) {
-            $this->info("Would delete " . count($orphanedFiles) . " orphaned files ({$this->formatBytes($deletedSize)})");
+            $this->info("Would delete " . count($orphanedFiles) . " orphaned files (" . Formatters::bytes($deletedSize) . ")");
         } else {
-            $this->info("Deleted {$deletedCount} orphaned files ({$this->formatBytes($deletedSize)})");
+            $this->info("Deleted {$deletedCount} orphaned files (" . Formatters::bytes($deletedSize) . ")");
         }
 
         return ['count' => $deletedCount, 'size' => $deletedSize];
-    }
-
-    protected function formatBytes(int $bytes): string
-    {
-        if ($bytes === 0) {
-            return '0 B';
-        }
-
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $pow = floor(log($bytes, 1024));
-
-        return round($bytes / (1024 ** $pow), 2) . ' ' . $units[$pow];
     }
 }

@@ -8,6 +8,7 @@ use Dgtlss\Capsule\Notifications\Channels\SlackNotifier;
 use Dgtlss\Capsule\Notifications\Channels\DiscordNotifier;
 use Dgtlss\Capsule\Notifications\Channels\TeamsNotifier;
 use Dgtlss\Capsule\Notifications\Channels\GoogleChatNotifier;
+use Dgtlss\Capsule\Support\Formatters;
 use Exception;
 
 class NotificationManager
@@ -70,6 +71,44 @@ class NotificationManager
         }
     }
 
+    public function sendRestoreSuccessNotification(BackupLog $backupLog, $context): void
+    {
+        if (!config('capsule.notifications.enabled', true)) {
+            return;
+        }
+
+        $message = $this->buildRestoreSuccessMessage($backupLog, $context);
+
+        foreach ($this->notifiers as $notifier) {
+            try {
+                if (method_exists($notifier, 'sendRestoreSuccess')) {
+                    $notifier->sendRestoreSuccess($message, $backupLog, $context);
+                }
+            } catch (Exception $e) {
+                logger()->error("Failed to send restore success notification via " . get_class($notifier) . ": " . $e->getMessage());
+            }
+        }
+    }
+
+    public function sendRestoreFailureNotification(BackupLog $backupLog, Throwable $exception): void
+    {
+        if (!config('capsule.notifications.enabled', true)) {
+            return;
+        }
+
+        $message = $this->buildRestoreFailureMessage($backupLog, $exception);
+
+        foreach ($this->notifiers as $notifier) {
+            try {
+                if (method_exists($notifier, 'sendRestoreFailure')) {
+                    $notifier->sendRestoreFailure($message, $backupLog, $exception);
+                }
+            } catch (Exception $e) {
+                logger()->error("Failed to send restore failure notification via " . get_class($notifier) . ": " . $e->getMessage());
+            }
+        }
+    }
+
     protected function initializeNotifiers(): void
     {
         if (config('capsule.notifications.email.enabled', false)) {
@@ -102,7 +141,7 @@ class NotificationManager
                 'Started at' => $backupLog->started_at->format('Y-m-d H:i:s'),
                 'Completed at' => $backupLog->completed_at->format('Y-m-d H:i:s'),
                 'Duration' => $backupLog->started_at->diffForHumans($backupLog->completed_at, true),
-                'File size' => $this->formatBytes($backupLog->file_size),
+                'File size' => Formatters::bytes($backupLog->file_size),
                 'Status' => 'Success',
             ],
             'color' => 'good',
@@ -150,7 +189,7 @@ class NotificationManager
             'message' => "{$deletedCount} items were removed.",
             'details' => [
                 'Items deleted' => $deletedCount,
-                'Space freed' => $this->formatBytes($deletedSize),
+                'Space freed' => Formatters::bytes($deletedSize),
                 'Completed at' => now()->format('Y-m-d H:i:s'),
                 'Status' => 'Success',
             ],
@@ -159,15 +198,37 @@ class NotificationManager
         ];
     }
 
-    protected function formatBytes(int $bytes): string
+    protected function buildRestoreSuccessMessage(BackupLog $backupLog, $context): array
     {
-        if ($bytes === 0) {
-            return '0 B';
-        }
+        return [
+            'title' => 'Restore Completed Successfully',
+            'message' => 'The restore operation has completed successfully.',
+            'details' => [
+                'Backup ID' => $backupLog->id,
+                'Backup file' => $backupLog->file_path,
+                'Original backup date' => $backupLog->created_at->format('Y-m-d H:i:s'),
+                'Restore completed at' => now()->format('Y-m-d H:i:s'),
+                'Status' => 'Success',
+            ],
+            'color' => 'good',
+            'emoji' => '✅',
+        ];
+    }
 
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $pow = floor(log($bytes, 1024));
-
-        return round($bytes / (1024 ** $pow), 2) . ' ' . $units[$pow];
+    protected function buildRestoreFailureMessage(BackupLog $backupLog, Throwable $exception): array
+    {
+        return [
+            'title' => 'Restore Failed',
+            'message' => 'The restore operation has failed.',
+            'details' => [
+                'Backup ID' => $backupLog->id,
+                'Backup file' => $backupLog->file_path,
+                'Failed at' => now()->format('Y-m-d H:i:s'),
+                'Error' => $exception->getMessage(),
+                'Status' => 'Failed',
+            ],
+            'color' => 'danger',
+            'emoji' => '❌',
+        ];
     }
 }

@@ -3,6 +3,7 @@
 namespace Dgtlss\Capsule;
 
 use Dgtlss\Capsule\Commands\BackupCommand;
+use Dgtlss\Capsule\Commands\RestoreCommand;
 use Dgtlss\Capsule\Commands\CleanupCommand;
 use Dgtlss\Capsule\Commands\DiagnoseCommand;
 use Dgtlss\Capsule\Commands\VerifyCommand;
@@ -11,6 +12,7 @@ use Dgtlss\Capsule\Commands\InspectCommand;
 use Dgtlss\Capsule\Commands\HealthCommand;
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
+use Dgtlss\Capsule\Services\RestoreService;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Console\Scheduling\Schedule;
 
@@ -27,6 +29,10 @@ class CapsuleServiceProvider extends ServiceProvider
         $this->app->singleton(ChunkedBackupService::class, function ($app) {
             return new ChunkedBackupService($app);
         });
+
+        $this->app->singleton(RestoreService::class, function ($app) {
+            return new RestoreService();
+        });
     }
 
     public function boot(): void
@@ -34,6 +40,9 @@ class CapsuleServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__ . '/../config/capsule.php' => config_path('capsule.php'),
         ], 'capsule-config');
+
+        // Register facade alias
+        $this->app->alias('Capsule', \Dgtlss\Capsule\Facades\Capsule::class);
 
         // Views for Filament panel (optional in host app)
         $this->loadViewsFrom(__DIR__ . '/../resources/views', 'capsule');
@@ -43,6 +52,7 @@ class CapsuleServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands([
                 BackupCommand::class,
+                RestoreCommand::class,
                 CleanupCommand::class,
                 DiagnoseCommand::class,
                 VerifyCommand::class,
