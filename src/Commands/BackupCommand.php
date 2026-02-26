@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
+use Dgtlss\Capsule\Support\Lock;
 use Illuminate\Console\Command;
 
 class BackupCommand extends Command
@@ -37,7 +38,6 @@ class BackupCommand extends Command
             $service = $backupService;
         }
 
-        // Configure service options
         $service->setVerbose($verbose);
         $service->setParallel($parallel);
         if ($compress >= 1 && $compress <= 9) {
@@ -46,71 +46,54 @@ class BackupCommand extends Command
         $service->setEncryption($encrypt);
         $service->setVerification($verify);
         
-        // Set output callback for real-time logging
         if ($verbose) {
-            $service->setOutputCallback(function($message) {
+            $service->setOutputCallback(function ($message) {
                 $this->info($message);
             });
         }
 
         $startTime = microtime(true);
+        $lock = null;
         
         try {
-            // Lock to prevent overlaps unless --force
             if (!$this->option('force')) {
-                $lockName = 'capsule:backup';
-                $lock = \Dgtlss\Capsule\Support\Lock::acquire($lockName);
+                $lock = Lock::acquire('capsule:backup');
                 if (!$lock) {
                     $this->warn('Another backup is currently running. Use --force to override.');
                     return self::FAILURE;
                 }
             }
-            $success = $service->run();
-            $endTime = microtime(true);
-            $duration = round($endTime - $startTime, 2);
 
+            $success = $service->run();
+            $duration = round(microtime(true) - $startTime, 2);
             $format = $this->option('format');
+
             if ($success) {
                 if ($format === 'json') {
-                    $payload = [
-                        'status' => 'success',
-                        'duration_seconds' => $duration,
-                    ];
-                    $this->line(json_encode($payload, JSON_PRETTY_PRINT));
+                    $this->line(json_encode(['status' => 'success', 'duration_seconds' => $duration], JSON_PRETTY_PRINT));
                 } else {
-                    $message = $useChunkedBackup 
-                        ? "Chunked backup completed successfully in {$duration} seconds."
-                        : "Backup completed successfully in {$duration} seconds.";
-                    $this->info($message);
+                    $label = $useChunkedBackup ? 'Chunked backup' : 'Backup';
+                    $this->info("{$label} completed successfully in {$duration} seconds.");
                 }
                 return self::SUCCESS;
-            } else {
-                if ($format === 'json') {
-                    $payload = [
-                        'status' => 'failed',
-                        'duration_seconds' => $duration,
-                        'error' => $service->getLastError(),
-                    ];
-                    $this->line(json_encode($payload, JSON_PRETTY_PRINT));
-                } else {
-                    $message = $useChunkedBackup 
-                        ? "Chunked backup failed after {$duration} seconds."
-                        : "Backup failed after {$duration} seconds.";
-                    $this->error($message);
-                    // Get the last error from the service for verbose output
-                    $lastError = $service->getLastError();
-                    if ($verbose && $lastError) {
-                        $this->error('Detailed error information:');
-                        $this->error($lastError);
-                    } else {
-                        $this->error('Check the logs for more details or run with --v for verbose output.');
-                    }
-                }
-                return self::FAILURE;
             }
+
+            if ($format === 'json') {
+                $this->line(json_encode(['status' => 'failed', 'duration_seconds' => $duration, 'error' => $service->getLastError()], JSON_PRETTY_PRINT));
+            } else {
+                $label = $useChunkedBackup ? 'Chunked backup' : 'Backup';
+                $this->error("{$label} failed after {$duration} seconds.");
+                $lastError = $service->getLastError();
+                if ($verbose && $lastError) {
+                    $this->error('Detailed error information:');
+                    $this->error($lastError);
+                } else {
+                    $this->error('Check the logs for more details or run with --v for verbose output.');
+                }
+            }
+            return self::FAILURE;
         } catch (\Exception $e) {
-            $endTime = microtime(true);
-            $duration = round($endTime - $startTime, 2);
+            $duration = round(microtime(true) - $startTime, 2);
             
             $this->error("Backup failed after {$duration} seconds with exception:");
             $this->error("Error: {$e->getMessage()}");
@@ -124,6 +107,10 @@ class BackupCommand extends Command
             }
             
             return self::FAILURE;
+        } finally {
+            if ($lock) {
+                $lock->release();
+            }
         }
     }
 }
