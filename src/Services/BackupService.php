@@ -208,6 +208,18 @@ class BackupService
             if ($this->backupLogPersisted) {
                 $this->metricsCollector->persist($backupLog);
 
+                $anomalyDetector = new AnomalyDetector();
+                $backupLog->load('metric');
+                $anomalies = $anomalyDetector->analyze($backupLog);
+                if (!empty($anomalies)) {
+                    $this->log('Anomalies detected:');
+                    foreach ($anomalies as $a) {
+                        $this->log("  [{$a['severity']}] {$a['message']}");
+                    }
+                    $backupLog->metadata = array_merge($backupLog->metadata ?? [], ['anomalies' => $anomalies]);
+                    try { $backupLog->save(); } catch (\Throwable $e) { }
+                }
+
                 if (config('capsule.files.enabled') && !empty($this->currentFileIndex)) {
                     try {
                         $this->incrementalService->saveSnapshot($backupLog, $this->currentFileIndex, $this->backupType, $this->baseSnapshotId);

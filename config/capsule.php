@@ -450,6 +450,22 @@ return [
     |
     */
 
+    /*
+    |--------------------------------------------------------------------------
+    | Anomaly Detection
+    |--------------------------------------------------------------------------
+    |
+    | Capsule automatically detects unusual backup sizes and durations by
+    | comparing each backup against the rolling average. Anomalies are
+    | logged and included in notifications.
+    |
+    */
+
+    'anomaly' => [
+        'size_deviation_percent' => 200,
+        'duration_deviation_percent' => 300,
+    ],
+
     'verification' => [
         'schedule_enabled' => env('CAPSULE_VERIFY_SCHEDULE_ENABLED', true),
         'frequency' => 'daily',

@@ -38,6 +38,11 @@ class BackupReport
                 : 'N/A';
         }
 
+        $anomalies = $backupLog->metadata['anomalies'] ?? [];
+        if (!empty($anomalies)) {
+            $report['anomalies'] = $anomalies;
+        }
+
         $schedule = config('capsule.schedule');
         if ($schedule && ($schedule['enabled'] ?? false)) {
             $freq = $schedule['frequency'] ?? 'daily';
@@ -104,6 +109,14 @@ class BackupReport
         }
 
         $lines[] = "\u{2514}{$border}\u{2518}";
+
+        if (!empty($report['anomalies'])) {
+            $lines[] = '';
+            foreach ($report['anomalies'] as $anomaly) {
+                $icon = ($anomaly['severity'] ?? 'warning') === 'critical' ? "\u{1F6A8}" : "\u{26A0}\u{FE0F}";
+                $lines[] = "  {$icon}  {$anomaly['message']}";
+            }
+        }
 
         return implode("\n", $lines);
     }
