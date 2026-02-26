@@ -2,10 +2,14 @@
 
 namespace Dgtlss\Capsule\Services;
 
+use Dgtlss\Capsule\Contracts\FileFilterInterface;
+use Dgtlss\Capsule\Contracts\StepInterface;
 use Dgtlss\Capsule\Database\DatabaseDumper;
+use Dgtlss\Capsule\Events\{BackupStarting, DatabaseDumpStarting, DatabaseDumpCompleted, FilesCollectStarting, FilesCollectCompleted, ArchiveFinalizing, BackupUploaded, BackupSucceeded, BackupFailed};
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Support\BackupContext;
 use Dgtlss\Capsule\Support\Helpers;
 use Dgtlss\Capsule\Support\ManifestBuilder;
 use Dgtlss\Capsule\Support\MemoryMonitor;
@@ -94,85 +98,184 @@ class ChunkedBackupService
     {
         MemoryMonitor::checkpoint('backup_start');
         MemoryMonitor::logMemoryUsage('Backup started');
-        
-        $this->log('Chunked backup process started.');
-        $backupLog = BackupLog::create([
-            'started_at' => now(),
-            'status' => 'running',
-            'metadata' => ['backup_id' => $this->backupId, 'chunked' => true],
-        ]);
+
+        $this->log('Validating configuration...');
+        $this->validateConfiguration();
+
+        if (config('capsule.database.enabled', true)) {
+            $failedConnections = $this->probeDatabaseConnections();
+            if (!empty($failedConnections)) {
+                $reason = 'Database unreachable for connection(s): ' . implode(', ', array_map(fn($f) => $f['connection'], $failedConnections));
+                $this->lastError = $reason;
+                $this->log($reason);
+
+                $pseudoLog = new BackupLog([
+                    'started_at' => now(),
+                    'completed_at' => now(),
+                    'status' => 'failed',
+                    'error_message' => $reason,
+                    'metadata' => ['failure_stage' => 'preflight', 'failed_connections' => $failedConnections],
+                ]);
+
+                $this->notificationManager->sendFailureNotification($pseudoLog, new Exception($reason));
+                return false;
+            }
+        }
+
+        $context = new BackupContext('chunked');
+        $context->verbose = $this->verbose;
+        $context->compressionLevel = $this->compressionLevel;
+        $context->encryption = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
+        $context->verification = $this->verification;
+        event(new BackupStarting($context));
+
+        $this->executeSteps((array) config('capsule.extensibility.pre_steps', []), $context, 'pre');
+
+        $backupLogPersisted = false;
+        try {
+            $backupLog = BackupLog::create([
+                'started_at' => now(),
+                'status' => 'running',
+                'metadata' => ['backup_id' => $this->backupId, 'chunked' => true],
+            ]);
+            $backupLogPersisted = true;
+        } catch (\Throwable $e) {
+            Log::warning('BackupLog could not be persisted; continuing without DB logging', ['exception' => $e]);
+            $backupLog = new BackupLog([
+                'started_at' => now(),
+                'status' => 'running',
+                'metadata' => ['backup_id' => $this->backupId, 'chunked' => true],
+            ]);
+        }
 
         try {
             MemoryMonitor::checkpoint('before_backup');
             $this->createChunkedBackup();
             MemoryMonitor::checkpoint('after_backup');
-            MemoryMonitor::logMemoryUsage('After backup creation');
-            
+
             $this->log('Collating chunks into final backup...');
             MemoryMonitor::checkpoint('before_collation');
+            event(new ArchiveFinalizing($context));
             $finalBackupPath = $this->collateChunks();
             MemoryMonitor::checkpoint('after_collation');
-            MemoryMonitor::logMemoryUsage('After collation');
-            
+
+            $context->remotePath = $finalBackupPath;
+            event(new BackupUploaded($context, $finalBackupPath));
+
             $this->log('Updating backup log...');
-            
-            // Get memory statistics
             $memoryStats = MemoryMonitor::compareCheckpoints('backup_start', 'after_collation');
-            
-            $backupLog->update([
-                'completed_at' => now(),
-                'status' => 'success',
-                'file_path' => $finalBackupPath,
-                'file_size' => $this->getRemoteFileSize($finalBackupPath),
-                'metadata' => array_merge($backupLog->metadata ?? [], [
-                    'chunks_count' => count($this->chunkMetadata),
-                    'chunked_method' => 'direct_streaming',
-                    'memory_stats' => $memoryStats['formatted'] ?? null,
-                ]),
+
+            $backupLog->completed_at = now();
+            $backupLog->status = 'success';
+            $backupLog->file_path = $finalBackupPath;
+            $backupLog->file_size = $this->getRemoteFileSize($finalBackupPath);
+            $backupLog->metadata = array_merge($backupLog->metadata ?? [], [
+                'chunks_count' => count($this->chunkMetadata),
+                'chunked_method' => 'direct_streaming',
+                'memory_stats' => $memoryStats['formatted'] ?? null,
             ]);
+
+            if ($backupLogPersisted) {
+                try { $backupLog->save(); } catch (\Throwable $e) { Log::warning('Failed to persist success BackupLog update', ['exception' => $e]); }
+            }
 
             $this->log('Cleaning up remote chunks...');
             $this->cleanup();
             $this->notificationManager->sendSuccessNotification($backupLog);
+            event(new BackupSucceeded($context));
+            $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
 
             return true;
         } catch (Exception $e) {
             $this->lastError = $e->getMessage();
-            $backupLog->update([
-                'completed_at' => now(),
-                'status' => 'failed',
-                'error_message' => $e->getMessage(),
-                'metadata' => array_merge($backupLog->metadata ?? [], [
-                    'chunks_attempted' => count($this->chunkMetadata),
-                ]),
-            ]);
 
-            Log::error('Chunked backup failed: ' . $e->getMessage(), [
-                'exception' => $e,
-                'backup_id' => $this->backupId
-            ]);
-            
+            $backupLog->completed_at = now();
+            $backupLog->status = 'failed';
+            $backupLog->error_message = $e->getMessage();
+            $backupLog->metadata = array_merge($backupLog->metadata ?? [], ['chunks_attempted' => count($this->chunkMetadata)]);
+
+            if ($backupLogPersisted) {
+                try { $backupLog->save(); } catch (\Throwable $ex) { Log::warning('Failed to persist failed BackupLog update', ['exception' => $ex]); }
+            }
+
+            Log::error('Chunked backup failed: ' . $e->getMessage(), ['exception' => $e, 'backup_id' => $this->backupId]);
             $this->cleanupChunks();
             $this->notificationManager->sendFailureNotification($backupLog, $e);
+            event(new BackupFailed($context, $e));
+            $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
 
             return false;
+        }
+    }
+
+    protected function probeDatabaseConnections(): array
+    {
+        $connections = $this->databaseDumper->resolveConnections();
+        $failures = [];
+
+        foreach ($connections as $connection) {
+            try {
+                \Illuminate\Support\Facades\DB::connection($connection)->getPdo();
+            } catch (\Throwable $e) {
+                $failures[] = ['connection' => $connection, 'error' => $e->getMessage()];
+            }
+        }
+
+        return $failures;
+    }
+
+    protected function validateConfiguration(): void
+    {
+        $dbEnabled = config('capsule.database.enabled', true);
+        $filesEnabled = config('capsule.files.enabled', true);
+
+        if (!$dbEnabled && !$filesEnabled) {
+            throw new Exception('Both database and file backups are disabled. Enable at least one in config/capsule.php');
+        }
+
+        $diskName = config('capsule.default_disk', 'local');
+        $filesystemDisks = config('filesystems.disks', []);
+        if (!isset($filesystemDisks[$diskName])) {
+            throw new Exception("Storage disk '{$diskName}' not found in config/filesystems.php. Available disks: " . implode(', ', array_keys($filesystemDisks)));
+        }
+    }
+
+    protected function executeSteps(array $classes, BackupContext $context, string $phase): void
+    {
+        foreach ($classes as $class) {
+            try {
+                $instance = app($class);
+                if ($instance instanceof StepInterface) {
+                    $this->log("Executing {$phase}-step: {$class}");
+                    $instance->handle($context);
+                } else {
+                    Log::warning('Configured step does not implement StepInterface: ' . $class);
+                }
+            } catch (\Throwable $e) {
+                Log::error('Step execution failed: ' . $class, ['exception' => $e]);
+                throw new Exception('Step failed: ' . $class . ' – ' . $e->getMessage(), 0, $e);
+            }
         }
     }
 
     protected function createChunkedBackup(): void
     {
         $timestamp = now()->format('Y-m-d_H-i-s');
-        
+        $context = new BackupContext('chunked');
+
         if (config('capsule.database.enabled')) {
             $this->log('Creating chunked database backup...');
+            event(new DatabaseDumpStarting($context));
             $this->createChunkedDatabaseBackup($timestamp);
+            event(new DatabaseDumpCompleted($context));
         }
 
         if (config('capsule.files.enabled')) {
             $this->log('Creating chunked file backup...');
+            event(new FilesCollectStarting($context));
             $this->createChunkedFileBackup($timestamp);
+            event(new FilesCollectCompleted($context));
         }
-        // Manifest will be embedded during collation
     }
 
     protected function createChunkedDatabaseBackup(string $timestamp): void
@@ -248,19 +351,50 @@ class ChunkedBackupService
         $excludePaths = config('capsule.files.exclude_paths', []);
         $chunkSize = config('capsule.chunked_backup.chunk_size', 10485760);
         $tempPrefix = config('capsule.chunked_backup.temp_prefix', 'capsule_chunk_');
+        $filters = $this->resolveFileFilters();
 
         foreach ($paths as $path) {
             if (is_dir($path)) {
                 $this->log("Streaming directory '{$path}' to chunks...");
-                $this->streamDirectoryToChunks($path, $excludePaths, $timestamp, $chunkSize, $tempPrefix);
+                $this->streamDirectoryToChunks($path, $excludePaths, $timestamp, $chunkSize, $tempPrefix, $filters);
             } elseif (is_file($path)) {
+                if (!$this->passesFilters($path, $filters)) {
+                    continue;
+                }
                 $this->log("Streaming file '{$path}' to chunks...");
                 $this->streamFileToChunks($path, $timestamp, $chunkSize, $tempPrefix);
             }
         }
     }
 
-    protected function streamDirectoryToChunks(string $dir, array $excludePaths, string $timestamp, int $chunkSize, string $tempPrefix): void
+    protected function resolveFileFilters(): array
+    {
+        $filters = [];
+        foreach ((array) config('capsule.extensibility.file_filters', []) as $class) {
+            try {
+                $instance = app($class);
+                if ($instance instanceof FileFilterInterface) {
+                    $filters[] = $instance;
+                }
+            } catch (\Throwable $e) {
+                Log::warning('Failed to resolve file filter: ' . $class, ['exception' => $e]);
+            }
+        }
+        return $filters;
+    }
+
+    protected function passesFilters(string $absolutePath, array $filters): bool
+    {
+        $context = new BackupContext('chunked');
+        foreach ($filters as $filter) {
+            if (!$filter->shouldInclude($absolutePath, $context)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    protected function streamDirectoryToChunks(string $dir, array $excludePaths, string $timestamp, int $chunkSize, string $tempPrefix, array $filters = []): void
     {
         $iterator = new \RecursiveIteratorIterator(
             new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
@@ -275,8 +409,16 @@ class ChunkedBackupService
 
         foreach ($iterator as $file) {
             $filePath = $file->getRealPath();
-            
+
+            if ($filePath === false || empty($filePath)) {
+                continue;
+            }
+
             if ($this->shouldExcludePath($filePath, $excludePaths)) {
+                continue;
+            }
+
+            if ($file->isFile() && !$this->passesFilters($filePath, $filters)) {
                 continue;
             }
 
