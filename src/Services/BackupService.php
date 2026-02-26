@@ -543,27 +543,26 @@ class BackupService
 
     protected function shouldExcludePath(string $path, array $excludePaths): bool
     {
-        // Normalize the path for consistent comparison
         $normalizedPath = rtrim($path, '/');
-        
+
         foreach ($excludePaths as $excludePath) {
             $normalizedExcludePath = rtrim($excludePath, '/');
-            
-            // Exact path match
+
             if ($normalizedPath === $normalizedExcludePath) {
                 return true;
             }
-            
-            // Path starts with exclude path (for subdirectories)
+
             if (strpos($normalizedPath, $normalizedExcludePath . '/') === 0) {
                 return true;
             }
-            
-            // Check filename patterns (like .DS_Store, Thumbs.db)
-            $filename = basename($path);
-            $excludeFilename = basename($excludePath);
-            if ($filename === $excludeFilename) {
-                return true;
+
+            // Only match on basename when the exclude entry itself has no
+            // directory separators (i.e., it's a filename-only pattern like
+            // ".DS_Store" or "Thumbs.db"), not a full path like "/var/www/vendor".
+            if (!str_contains($excludePath, '/')) {
+                if (basename($path) === $excludePath) {
+                    return true;
+                }
             }
         }
 
