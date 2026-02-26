@@ -116,8 +116,8 @@ class BackupService
 
     public function run(): bool
     {
-        $this->log('🔧 Validating configuration...');
-        // Validate configuration before starting
+        $this->applyPerformanceLimits();
+        $this->registerSignalHandlers();
         $this->validateConfiguration();
         
         // Preflight: ensure DB is reachable if DB backup is enabled
@@ -855,7 +855,35 @@ class BackupService
         $zip->close();
 
         $verifyTime = round(microtime(true) - $startTime, 2);
-        $this->log("   ✅ Backup verified: {$numFiles} files, integrity check passed ({$verifyTime}s)");
+        $this->log("   Backup verified: {$numFiles} files, integrity check passed ({$verifyTime}s)");
     }
 
+    protected function registerSignalHandlers(): void
+    {
+        if (!function_exists('pcntl_signal')) {
+            return;
+        }
+
+        $handler = function (int $signal) {
+            $this->log("Received signal {$signal}, aborting backup...");
+            Log::warning("Capsule backup interrupted by signal {$signal}");
+            throw new Exception("Backup interrupted by signal {$signal}");
+        };
+
+        pcntl_signal(SIGTERM, $handler);
+        pcntl_signal(SIGINT, $handler);
+    }
+
+    protected function applyPerformanceLimits(): void
+    {
+        $memoryLimit = config('capsule.performance.memory_limit');
+        if ($memoryLimit && $memoryLimit > 0) {
+            @ini_set('memory_limit', $memoryLimit . 'M');
+        }
+
+        $maxTime = config('capsule.performance.max_execution_time');
+        if ($maxTime !== null) {
+            @set_time_limit((int) $maxTime);
+        }
+    }
 }

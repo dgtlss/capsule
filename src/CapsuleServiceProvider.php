@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule;
 
 use Dgtlss\Capsule\Commands\AdvisorCommand;
 use Dgtlss\Capsule\Commands\BackupCommand;
+use Dgtlss\Capsule\Commands\BackupIfStaleCommand;
 use Dgtlss\Capsule\Commands\CleanupCommand;
 use Dgtlss\Capsule\Commands\DiagnoseCommand;
 use Dgtlss\Capsule\Commands\VerifyCommand;
@@ -68,6 +69,7 @@ class CapsuleServiceProvider extends ServiceProvider
             $this->commands([
                 AdvisorCommand::class,
                 BackupCommand::class,
+                BackupIfStaleCommand::class,
                 CleanupCommand::class,
                 DiagnoseCommand::class,
                 VerifyCommand::class,

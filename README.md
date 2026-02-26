@@ -24,6 +24,7 @@ Capsule supports MySQL, PostgreSQL, and SQLite. It stores backups on any Laravel
 - [Health](#health)
 - [Advisor](#advisor)
 - [Download](#download)
+- [Backup If Stale](#backup-if-stale)
 - [Features](#features)
 - [Incremental Backups](#incremental-backups)
 - [Backup Simulation](#backup-simulation)
@@ -31,6 +32,7 @@ Capsule supports MySQL, PostgreSQL, and SQLite. It stores backups on any Laravel
 - [Multi-Disk Storage](#multi-disk-storage)
 - [Chunked Streaming](#chunked-streaming)
 - [Encryption](#encryption)
+- [Programmatic API](#programmatic-api)
 - [Configuration](#configuration)
 - [Storage](#storage)
 - [Database](#database)
@@ -298,6 +300,21 @@ php artisan capsule:download 42
 php artisan capsule:download --path=/tmp/backups
 ```
 
+### Backup If Stale
+
+Only run a backup if the last successful one is older than a threshold. Useful for redundant scheduling or deploy hooks where you don't want to double-backup.
+
+```bash
+# Backup only if last success is older than 24 hours (default)
+php artisan capsule:backup-if-stale
+
+# Custom threshold
+php artisan capsule:backup-if-stale --hours=6
+
+# With a specific policy
+php artisan capsule:backup-if-stale --hours=12 --policy=database-hourly
+```
+
 ---
 
 ## Features
@@ -427,6 +444,38 @@ CAPSULE_BACKUP_PASSWORD=your-secret-key
 **Envelope encryption** (advanced, supports key rotation):
 
 Each backup is encrypted with a unique random data key (DEK), which is then wrapped with your master key. The key ID is stored in the manifest, enabling you to rotate the master key while old backups remain decryptable with their original key.
+
+### Programmatic API
+
+Use Capsule from your application code without going through artisan:
+
+```php
+use Dgtlss\Capsule\Facades\Capsule;
+
+// Run a backup
+$success = Capsule::backup();
+
+// With options
+$success = Capsule::backup([
+    'tag' => 'pre-deploy',
+    'db_only' => true,
+    'incremental' => true,
+]);
+
+// Simulate
+$estimate = Capsule::simulate();
+
+// List backups
+$backups = Capsule::list(10);
+
+// Get the latest successful backup
+$latest = Capsule::latest();
+
+// Health check
+if (!Capsule::isHealthy()) {
+    // alert
+}
+```
 
 ### Integrity Monitoring
 

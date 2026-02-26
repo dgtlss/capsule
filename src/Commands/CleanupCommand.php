@@ -2,6 +2,8 @@
 
 namespace Dgtlss\Capsule\Commands;
 
+use Dgtlss\Capsule\Events\CleanupCompleted;
+use Dgtlss\Capsule\Events\CleanupStarting;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Notifications\NotificationManager;
@@ -43,6 +45,8 @@ class CleanupCommand extends Command
         if ($isDryRun) {
             $this->warn('DRY RUN MODE - No files will be deleted');
         }
+
+        event(new CleanupStarting($isDryRun));
 
         $totalDeleted = 0;
         $totalSize = 0;
@@ -89,7 +93,8 @@ class CleanupCommand extends Command
             }
         }
 
-        // Send notification if items were actually cleaned (not dry-run and count > 0)
+        event(new CleanupCompleted($totalDeleted, $totalSize, $isDryRun));
+
         if (!$isDryRun && $totalDeleted > 0) {
             $notificationManager = new NotificationManager();
             $notificationManager->sendCleanupNotification($totalDeleted, $totalSize);
@@ -244,9 +249,14 @@ class CleanupCommand extends Command
             $this->info('🔍 Scanning failed backups...');
         }
 
-        $failedBackups = BackupLog::where('status', 'failed')
-            ->where('created_at', '<', now()->subDays($retentionDays))
-            ->get();
+        $staleTimeout = (int) config('capsule.lock.timeout_seconds', 900);
+        $failedBackups = BackupLog::where(function ($q) use ($retentionDays, $staleTimeout) {
+            $q->where('status', 'failed')
+              ->where('created_at', '<', now()->subDays($retentionDays));
+        })->orWhere(function ($q) use ($staleTimeout) {
+            $q->where('status', 'running')
+              ->where('started_at', '<', now()->subSeconds($staleTimeout));
+        })->get();
 
         if ($failedBackups->isEmpty()) {
             if ($verbose) {
@@ -260,7 +270,8 @@ class CleanupCommand extends Command
         $deletedCount = 0;
 
         foreach ($failedBackups as $backup) {
-            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} (failed: {$backup->error_message})");
+            $label = $backup->status === 'running' ? 'stale' : 'failed';
+            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({$label}: {$backup->error_message})");
 
             if (!$isDryRun) {
                 $backup->delete();

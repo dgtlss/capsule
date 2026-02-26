@@ -465,6 +465,16 @@ class DiagnoseCommand extends Command
                 $this->info('  Recent failures (7d): 0');
             }
             $this->info('  Storage usage: ' . Helpers::formatBytes($usage));
+
+            $staleTimeout = (int) config('capsule.lock.timeout_seconds', 900);
+            $staleRunning = BackupLog::running()
+                ->where('started_at', '<', now()->subSeconds($staleTimeout))
+                ->count();
+            if ($staleRunning > 0) {
+                $this->warn("  Stale 'running' backups: {$staleRunning} (started > " . ($staleTimeout / 60) . "min ago)");
+                $this->comment("  Run: capsule:cleanup --failed to clean these up");
+            }
+
             return true;
         } catch (\Throwable $e) {
             $this->error('  ❌ Failed to compute health summary: ' . $e->getMessage());
