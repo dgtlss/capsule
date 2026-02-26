@@ -1,11 +1,11 @@
-
+```
   ██████╗  █████╗  ██████╗  ███████╗ ██╗   ██╗ ██╗      ███████╗
  ██╔════╝ ██╔══██╗ ██╔══██╗ ██╔════╝ ██║   ██║ ██║      ██╔════╝
  ██║      ███████║ ██████╔╝ ███████╗ ██║   ██║ ██║      █████╗
  ██║      ██╔══██║ ██╔═══╝  ╚════██║ ██║   ██║ ██║      ██╔══╝
  ╚██████╗ ██║  ██║ ██║      ███████║ ╚██████╔╝ ███████╗ ███████╗
   ╚═════╝ ╚═╝  ╚═╝ ╚═╝      ╚══════╝  ╚═════╝  ╚══════╝ ╚══════╝
-
+```
 A comprehensive Laravel backup package. Back up your database and files, store them anywhere, get notified, and restore with confidence.
 
 Capsule supports MySQL, PostgreSQL, and SQLite. It stores backups on any Laravel filesystem disk (local, S3, SFTP, FTP, DigitalOcean Spaces, etc.) and notifies you via Email, Slack, Discord, Microsoft Teams, or Google Chat.
