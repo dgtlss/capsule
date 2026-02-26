@@ -2,9 +2,11 @@
 
 namespace Dgtlss\Capsule\Commands;
 
+use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
 use Dgtlss\Capsule\Services\SimulationService;
+use Dgtlss\Capsule\Support\BackupReport;
 use Dgtlss\Capsule\Support\Helpers;
 use Dgtlss\Capsule\Support\Lock;
 use Illuminate\Console\Command;
@@ -100,8 +102,16 @@ class BackupCommand extends Command
                 if ($format === 'json') {
                     $this->line(json_encode(['status' => 'success', 'duration_seconds' => $duration], JSON_PRETTY_PRINT));
                 } else {
-                    $label = $useChunkedBackup ? 'Chunked backup' : 'Backup';
-                    $this->info("{$label} completed successfully in {$duration} seconds.");
+                    $this->newLine();
+                    $latestLog = BackupLog::successful()->orderByDesc('created_at')->first();
+                    if ($latestLog) {
+                        $latestLog->load('metric');
+                        $report = BackupReport::build($latestLog, $duration);
+                        $this->line(BackupReport::render($report));
+                    } else {
+                        $label = $useChunkedBackup ? 'Chunked backup' : 'Backup';
+                        $this->info("{$label} completed successfully in {$duration} seconds.");
+                    }
                 }
                 return self::SUCCESS;
             }
