@@ -27,6 +27,9 @@ class StorageManager
         $this->retry(function () use ($filePath, $fileName) {
             $this->disk->putFileAs($this->backupPath, $filePath, $fileName);
         });
+
+        $this->replicateToAdditionalDisks($filePath, $fileName);
+
         return $remotePath;
     }
 
@@ -338,6 +341,23 @@ class StorageManager
         }
 
         return $backupPath . '/' . $fileName;
+    }
+
+    protected function replicateToAdditionalDisks(string $filePath, string $fileName): void
+    {
+        $additionalDisks = (array) config('capsule.additional_disks', []);
+
+        foreach ($additionalDisks as $diskName) {
+            try {
+                $additionalDisk = Storage::disk($diskName);
+                $this->retry(function () use ($additionalDisk, $filePath, $fileName) {
+                    $additionalDisk->putFileAs($this->backupPath, $filePath, $fileName);
+                });
+                Log::info("Backup replicated to additional disk: {$diskName}");
+            } catch (\Throwable $e) {
+                Log::error("Failed to replicate backup to disk '{$diskName}': {$e->getMessage()}");
+            }
+        }
     }
 
     protected function retry(callable $fn)

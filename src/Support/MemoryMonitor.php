@@ -2,6 +2,8 @@
 
 namespace Dgtlss\Capsule\Support;
 
+use Illuminate\Support\Facades\Log;
+
 class MemoryMonitor
 {
     protected static array $checkpoints = [];
@@ -31,26 +33,19 @@ class MemoryMonitor
     
     public static function formatBytes(int $bytes): string
     {
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $bytes = max($bytes, 0);
-        $pow = floor(($bytes ? log($bytes) : 0) / log(1024));
-        $pow = min($pow, count($units) - 1);
-        
-        $bytes /= (1 << (10 * $pow));
-        
-        return round($bytes, 2) . ' ' . $units[$pow];
+        return Helpers::formatBytes($bytes);
     }
-    
+
     public static function logMemoryUsage(string $context = ''): void
     {
         $usage = self::getMemoryUsage();
         $context = $context ? " ({$context})" : '';
-        
-        error_log(sprintf(
+
+        Log::debug(sprintf(
             "Memory Usage%s: Current: %s, Peak: %s, Limit: %s",
             $context,
-            self::formatBytes($usage['current']),
-            self::formatBytes($usage['peak']),
+            Helpers::formatBytes($usage['current']),
+            Helpers::formatBytes($usage['peak']),
             $usage['limit']
         ));
     }
@@ -69,8 +64,8 @@ class MemoryMonitor
             'peak_delta' => $toCheckpoint['peak_memory'] - $fromCheckpoint['peak_memory'],
             'time_delta' => $toCheckpoint['timestamp'] - $fromCheckpoint['timestamp'],
             'formatted' => [
-                'memory_delta' => self::formatBytes($toCheckpoint['memory_usage'] - $fromCheckpoint['memory_usage']),
-                'peak_delta' => self::formatBytes($toCheckpoint['peak_memory'] - $fromCheckpoint['peak_memory']),
+                'memory_delta' => Helpers::formatBytes($toCheckpoint['memory_usage'] - $fromCheckpoint['memory_usage']),
+                'peak_delta' => Helpers::formatBytes($toCheckpoint['peak_memory'] - $fromCheckpoint['peak_memory']),
                 'time_delta' => round(($toCheckpoint['timestamp'] - $fromCheckpoint['timestamp']) * 1000, 2) . 'ms',
             ],
         ];

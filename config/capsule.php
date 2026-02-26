@@ -19,6 +19,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Additional Storage Disks
+    |--------------------------------------------------------------------------
+    |
+    | Backups will also be copied to these disks for redundancy. Each entry
+    | should be a disk name from config/filesystems.php. The primary backup
+    | is always stored on `default_disk`; these are additional copies.
+    |
+    */
+
+    'additional_disks' => [
+        // 's3-secondary',
+        // 'local-archive',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Backup Path
     |--------------------------------------------------------------------------
     |
@@ -214,6 +230,10 @@ return [
         // Master switch for all notifications
         'enabled' => true,
 
+        // Webhook delivery retry configuration
+        'webhook_retries' => 3,
+        'webhook_backoff_ms' => 1000,
+
         'email' => [
             // Enable email notifications
             'enabled' => false,
@@ -221,9 +241,17 @@ return [
             // Email address to send notifications to
             'to' => env('CAPSULE_EMAIL_TO'),
 
-            // Email subject lines
+            // Optional: sender address (falls back to Laravel default)
+            'from' => env('CAPSULE_EMAIL_FROM'),
+
+            // Email subject lines (app name and env are prepended automatically)
             'subject_success' => 'Backup Completed Successfully',
             'subject_failure' => 'Backup Failed',
+            'subject_cleanup' => 'Backup Cleanup Completed',
+
+            // Which events trigger this channel: ['success', 'failure', 'cleanup']
+            // Set to null to receive all events
+            'notify_on' => null,
         ],
 
         'webhooks' => [
@@ -238,8 +266,12 @@ return [
                 // Channel to post to (include #)
                 'channel' => '#general',
 
-                // Username to post as
+                // Username and emoji to post as
                 'username' => 'Capsule',
+                'icon_emoji' => ':package:',
+
+                // Which events trigger this channel: ['success', 'failure', 'cleanup']
+                'notify_on' => null,
             ],
 
             'discord' => [
@@ -249,8 +281,12 @@ return [
                 // Discord webhook URL (get from Discord server settings)
                 'webhook_url' => env('CAPSULE_DISCORD_WEBHOOK_URL'),
 
-                // Username to post as
+                // Username and avatar
                 'username' => 'Capsule',
+                'avatar_url' => null,
+
+                // Which events trigger this channel
+                'notify_on' => null,
             ],
 
             'teams' => [
@@ -259,6 +295,9 @@ return [
 
                 // Teams webhook URL (get from Teams channel connectors)
                 'webhook_url' => env('CAPSULE_TEAMS_WEBHOOK_URL'),
+
+                // Which events trigger this channel
+                'notify_on' => null,
             ],
 
             'google_chat' => [
@@ -267,6 +306,9 @@ return [
 
                 // Google Chat webhook URL (get from Google Chat space settings)
                 'webhook_url' => env('CAPSULE_GOOGLE_CHAT_WEBHOOK_URL'),
+
+                // Which events trigger this channel
+                'notify_on' => null,
             ],
 
         ],
@@ -288,7 +330,9 @@ return [
         'enabled' => true,
 
         // How often to run backups
-        // Supported: "hourly", "daily", "weekly", "monthly"
+        // Supported: "hourly", "daily", "twiceDaily", "everyFourHours",
+        //            "everySixHours", "weekly", "monthly"
+        // Or provide a custom cron expression: "0 3 * * 1-5"
         'frequency' => 'daily',
 
         // Time to run daily backups (24-hour format)
@@ -398,6 +442,106 @@ return [
     | Health Integration (Spatie Laravel Health)
     |--------------------------------------------------------------------------
     */
+
+    /*
+    |--------------------------------------------------------------------------
+    | Automated Integrity Verification
+    |--------------------------------------------------------------------------
+    |
+    | Capsule can automatically verify backup integrity on a schedule.
+    | Each run picks an unverified (or stale) backup, downloads it,
+    | and validates the ZIP structure and manifest checksums.
+    |
+    */
+
+    /*
+    |--------------------------------------------------------------------------
+    | Anomaly Detection
+    |--------------------------------------------------------------------------
+    |
+    | Capsule automatically detects unusual backup sizes and durations by
+    | comparing each backup against the rolling average. Anomalies are
+    | logged and included in notifications.
+    |
+    */
+
+    /*
+    |--------------------------------------------------------------------------
+    | Backup Policies
+    |--------------------------------------------------------------------------
+    |
+    | Define named backup policies for different backup strategies.
+    | Each policy can override database/files, target disk, schedule,
+    | retention, and more. Policies are scheduled independently.
+    | Leave empty to use the global config as a single "default" policy.
+    |
+    | Example:
+    |   'policies' => [
+    |       'database-hourly' => [
+    |           'database' => true, 'files' => false,
+    |           'disk' => 's3',
+    |           'frequency' => 'hourly',
+    |           'retention' => ['days' => 7, 'count' => 168],
+    |       ],
+    |       'full-weekly' => [
+    |           'database' => true, 'files' => true,
+    |           'disk' => 'glacier',
+    |           'frequency' => 'weekly', 'time' => '03:00',
+    |           'retention' => ['days' => 365, 'count' => 52],
+    |           'incremental' => false,
+    |       ],
+    |   ],
+    |
+    */
+
+    'policies' => [],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Audit Log
+    |--------------------------------------------------------------------------
+    |
+    | Track every backup operation for compliance. Records who triggered
+    | the action, what was backed up/restored, and the result.
+    |
+    */
+
+    /*
+    |--------------------------------------------------------------------------
+    | S3 Lifecycle Management
+    |--------------------------------------------------------------------------
+    |
+    | Capsule can tag S3 objects and transition older backups to cheaper
+    | storage classes. This complements native S3 lifecycle policies.
+    |
+    */
+
+    's3_lifecycle' => [
+        'tagging_enabled' => false,
+        'transition_enabled' => false,
+        'default_storage_class' => null,
+
+        'transitions' => [
+            // ['after_days' => 30, 'storage_class' => 'STANDARD_IA'],
+            // ['after_days' => 90, 'storage_class' => 'GLACIER'],
+        ],
+    ],
+
+    'audit' => [
+        'enabled' => env('CAPSULE_AUDIT_ENABLED', true),
+    ],
+
+    'anomaly' => [
+        'size_deviation_percent' => 200,
+        'duration_deviation_percent' => 300,
+    ],
+
+    'verification' => [
+        'schedule_enabled' => env('CAPSULE_VERIFY_SCHEDULE_ENABLED', true),
+        'frequency' => 'daily',
+        'time' => '04:00',
+        'recheck_days' => 7,
+    ],
 
     'health' => [
         'enabled' => env('CAPSULE_HEALTH_ENABLED', true),

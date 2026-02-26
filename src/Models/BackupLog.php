@@ -4,6 +4,8 @@ namespace Dgtlss\Capsule\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class BackupLog extends Model
 {
@@ -11,6 +13,7 @@ class BackupLog extends Model
         'started_at',
         'completed_at',
         'status',
+        'tag',
         'file_path',
         'file_size',
         'error_message',
@@ -86,5 +89,15 @@ class BackupLog extends Model
     public function isRunning(): bool
     {
         return $this->status === 'running';
+    }
+
+    public function metric(): HasOne
+    {
+        return $this->hasOne(BackupMetric::class);
+    }
+
+    public function verificationLogs(): HasMany
+    {
+        return $this->hasMany(VerificationLog::class);
     }
 }

@@ -22,6 +22,7 @@ class ListCommand extends Command
                 return [
                     'id' => $log->id,
                     'status' => $log->status,
+                    'tag' => $log->tag,
                     'size' => $log->file_size,
                     'path' => $log->file_path,
                     'started_at' => optional($log->started_at)->toISOString(),
@@ -31,10 +32,11 @@ class ListCommand extends Command
             return self::SUCCESS;
         }
 
-        $this->table(['ID', 'Status', 'Size', 'Path', 'Created'], $logs->map(function ($log) {
+        $this->table(['ID', 'Status', 'Tag', 'Size', 'Path', 'Created'], $logs->map(function ($log) {
             return [
                 $log->id,
                 $log->status,
+                $log->tag ?? '-',
                 $log->formattedFileSize,
                 $log->file_path,
                 $log->created_at,

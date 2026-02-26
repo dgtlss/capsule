@@ -2,9 +2,12 @@
 
 namespace Dgtlss\Capsule\Commands;
 
+use Dgtlss\Capsule\Events\CleanupCompleted;
+use Dgtlss\Capsule\Events\CleanupStarting;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Notifications\NotificationManager;
+use Dgtlss\Capsule\Support\Helpers;
 use Illuminate\Console\Command;
 
 class CleanupCommand extends Command
@@ -14,7 +17,7 @@ class CleanupCommand extends Command
     {--days= : Override retention days from config}
     {--failed : Also clean up failed backup records}
     {--storage : Clean up orphaned files in storage}
-    {--v : Verbose output}
+    {--detailed : Verbose output}
     {--format=table : Output format (table|json)}';
     
     protected $description = 'Clean up old backup files according to retention policy';
@@ -31,7 +34,7 @@ class CleanupCommand extends Command
         $isDryRun = $this->option('dry-run');
         $cleanFailed = $this->option('failed');
         $cleanStorage = $this->option('storage');
-        $verbose = $this->option('v');
+        $verbose = $this->option('detailed');
 
         if ($daysOption !== null) {
             $this->info("Using command override: {$retentionDays} days (ignoring config and count-based retention)");
@@ -42,6 +45,8 @@ class CleanupCommand extends Command
         if ($isDryRun) {
             $this->warn('DRY RUN MODE - No files will be deleted');
         }
+
+        event(new CleanupStarting($isDryRun));
 
         $totalDeleted = 0;
         $totalSize = 0;
@@ -84,11 +89,12 @@ class CleanupCommand extends Command
                 $this->info('No items to clean up.');
             } else {
                 $action = $isDryRun ? 'Would delete' : 'Deleted';
-                $this->info("{$action} {$totalDeleted} items ({$this->formatBytes($totalSize)}) total");
+                $this->info("{$action} {$totalDeleted} items ({Helpers::formatBytes($totalSize)}) total");
             }
         }
 
-        // Send notification if items were actually cleaned (not dry-run and count > 0)
+        event(new CleanupCompleted($totalDeleted, $totalSize, $isDryRun));
+
         if (!$isDryRun && $totalDeleted > 0) {
             $notificationManager = new NotificationManager();
             $notificationManager->sendCleanupNotification($totalDeleted, $totalSize);
@@ -111,7 +117,7 @@ class CleanupCommand extends Command
         $totalBytes = (int) $currentFiles->sum('file_size');
         $budgetBytes = $maxStorageMb * 1024 * 1024;
         if ($verbose) {
-            $this->info('📊 Storage usage: ' . $this->formatBytes($totalBytes) . ' / ' . $this->formatBytes($budgetBytes));
+            $this->info('📊 Storage usage: ' . Helpers::formatBytes($totalBytes) . ' / ' . Helpers::formatBytes($budgetBytes));
         }
 
         if ($totalBytes <= $budgetBytes) {
@@ -133,7 +139,7 @@ class CleanupCommand extends Command
 
             $size = (int) ($backup->file_size ?? 0);
             if ($verbose) {
-                $this->line("- Pruning (budget): " . $backup->created_at->format('Y-m-d H:i:s') . ' (' . $this->formatBytes($size) . ')');
+                $this->line("- Pruning (budget): " . $backup->created_at->format('Y-m-d H:i:s') . ' (' . Helpers::formatBytes($size) . ')');
             }
 
             if (!$isDryRun) {
@@ -159,7 +165,7 @@ class CleanupCommand extends Command
 
         if ($deletedCount > 0) {
             $action = $isDryRun ? 'Would delete (budget)' : 'Deleted (budget)';
-            $this->info("{$action} {$deletedCount} items (" . $this->formatBytes($deletedSize) . ")");
+            $this->info("{$action} {$deletedCount} items (" . Helpers::formatBytes($deletedSize) . ")");
         } else if ($verbose) {
             $this->info('No items pruned by budget (respecting min_keep).');
         }
@@ -178,20 +184,16 @@ class CleanupCommand extends Command
                 ->where('created_at', '<', now()->subDays($retentionDays))
                 ->get();
         } else {
-            // Get IDs of backups to keep (latest N successful backups)
             $keepIds = BackupLog::where('status', 'success')
                 ->orderBy('created_at', 'desc')
                 ->limit($retentionCount)
                 ->pluck('id')
                 ->toArray();
 
-            // Delete old backups by date OR those not in the latest N
             $oldBackups = BackupLog::where('status', 'success')
-                ->where(function ($query) use ($retentionDays, $keepIds) {
-                    $query->where('created_at', '<', now()->subDays($retentionDays))
-                        ->when(!empty($keepIds), function ($q) use ($keepIds) {
-                            $q->orWhereNotIn('id', $keepIds);
-                        });
+                ->where('created_at', '<', now()->subDays($retentionDays))
+                ->when(!empty($keepIds), function ($q) use ($keepIds) {
+                    $q->whereNotIn('id', $keepIds);
                 })
                 ->get();
         }
@@ -211,7 +213,7 @@ class CleanupCommand extends Command
 
         foreach ($oldBackups as $backup) {
             $size = $backup->file_size ?? 0;
-            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({$this->formatBytes($size)})");
+            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({Helpers::formatBytes($size)})");
 
             if (!$isDryRun) {
                 if ($backup->file_path) {
@@ -233,9 +235,9 @@ class CleanupCommand extends Command
 
         if ($isDryRun) {
             $totalSize = $oldBackups->sum('file_size');
-            $this->info("Would delete {$oldBackups->count()} successful backups ({$this->formatBytes($totalSize)})");
+            $this->info("Would delete {$oldBackups->count()} successful backups ({Helpers::formatBytes($totalSize)})");
         } else {
-            $this->info("Deleted {$deletedCount} successful backups ({$this->formatBytes($deletedSize)})");
+            $this->info("Deleted {$deletedCount} successful backups ({Helpers::formatBytes($deletedSize)})");
         }
 
         return ['count' => $deletedCount, 'size' => $deletedSize];
@@ -247,9 +249,14 @@ class CleanupCommand extends Command
             $this->info('🔍 Scanning failed backups...');
         }
 
-        $failedBackups = BackupLog::where('status', 'failed')
-            ->where('created_at', '<', now()->subDays($retentionDays))
-            ->get();
+        $staleTimeout = (int) config('capsule.lock.timeout_seconds', 900);
+        $failedBackups = BackupLog::where(function ($q) use ($retentionDays, $staleTimeout) {
+            $q->where('status', 'failed')
+              ->where('created_at', '<', now()->subDays($retentionDays));
+        })->orWhere(function ($q) use ($staleTimeout) {
+            $q->where('status', 'running')
+              ->where('started_at', '<', now()->subSeconds($staleTimeout));
+        })->get();
 
         if ($failedBackups->isEmpty()) {
             if ($verbose) {
@@ -263,7 +270,8 @@ class CleanupCommand extends Command
         $deletedCount = 0;
 
         foreach ($failedBackups as $backup) {
-            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} (failed: {$backup->error_message})");
+            $label = $backup->status === 'running' ? 'stale' : 'failed';
+            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({$label}: {$backup->error_message})");
 
             if (!$isDryRun) {
                 $backup->delete();
@@ -320,7 +328,7 @@ class CleanupCommand extends Command
         foreach ($orphanedFiles as $filename) {
             try {
                 $size = $storageManager->size($filename);
-                $this->line("- {$filename} ({$this->formatBytes($size)})");
+                $this->line("- {$filename} ({Helpers::formatBytes($size)})");
 
                 if (!$isDryRun) {
                     $storageManager->delete($filename);
@@ -336,23 +344,12 @@ class CleanupCommand extends Command
         }
 
         if ($isDryRun) {
-            $this->info("Would delete " . count($orphanedFiles) . " orphaned files ({$this->formatBytes($deletedSize)})");
+            $this->info("Would delete " . count($orphanedFiles) . " orphaned files ({Helpers::formatBytes($deletedSize)})");
         } else {
-            $this->info("Deleted {$deletedCount} orphaned files ({$this->formatBytes($deletedSize)})");
+            $this->info("Deleted {$deletedCount} orphaned files ({Helpers::formatBytes($deletedSize)})");
         }
 
         return ['count' => $deletedCount, 'size' => $deletedSize];
     }
 
-    protected function formatBytes(int $bytes): string
-    {
-        if ($bytes === 0) {
-            return '0 B';
-        }
-
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $pow = floor(log($bytes, 1024));
-
-        return round($bytes / (1024 ** $pow), 2) . ' ' . $units[$pow];
-    }
 }

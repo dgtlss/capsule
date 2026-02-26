@@ -3,6 +3,7 @@
 namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Models\BackupLog;
+use Dgtlss\Capsule\Support\Helpers;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Storage;
 
@@ -12,7 +13,7 @@ class DiagnoseCommand extends Command
     {--detailed : Show detailed performance and security analysis}
     {--fix : Attempt to fix common issues automatically}
     {--format=table : Output format (table, json)}
-    {--v : Verbose output}';
+    {--detailed : Verbose output}';
     
     protected $description = 'Diagnose Capsule configuration and system requirements';
 
@@ -21,7 +22,7 @@ class DiagnoseCommand extends Command
         $detailed = $this->option('detailed');
         $format = $this->option('format');
         $fix = $this->option('fix');
-        $verbose = $this->option('v');
+        $verbose = $this->option('detailed');
 
         if ($format === 'json') {
             return $this->handleJsonOutput($detailed, $fix);
@@ -226,15 +227,15 @@ class DiagnoseCommand extends Command
             // Check database tools
             switch ($driver) {
                 case 'mysql':
-                    if ($this->commandExists('mysqldump')) {
-                        $this->info('    ✅ mysqldump available');
+                    if (Helpers::commandExists('mysqldump') || Helpers::commandExists('mariadb-dump')) {
+                        $this->info('    ✅ mysqldump/mariadb-dump available');
                     } else {
-                        $this->error('    ❌ mysqldump not found');
+                        $this->error('    ❌ mysqldump/mariadb-dump not found');
                         $allGood = false;
                     }
                     break;
                 case 'pgsql':
-                    if ($this->commandExists('pg_dump')) {
+                    if (Helpers::commandExists('pg_dump')) {
                         $this->info('    ✅ pg_dump available');
                     } else {
                         $this->error('    ❌ pg_dump not found');
@@ -380,7 +381,7 @@ class DiagnoseCommand extends Command
         }
 
         if ($estimatedSize > 5 * 1024 * 1024 * 1024) { // 5GB
-            if ($verbose) $this->warn("  ⚠️  Large dataset detected ({$this->formatBytes($estimatedSize)}). Consider using --no-local flag");
+            if ($verbose) $this->warn("  ⚠️  Large dataset detected ({Helpers::formatBytes($estimatedSize)}). Consider using --no-local flag");
             $issues[] = 'large_dataset';
         }
 
@@ -463,7 +464,17 @@ class DiagnoseCommand extends Command
             } else {
                 $this->info('  Recent failures (7d): 0');
             }
-            $this->info('  Storage usage: ' . $this->formatBytes($usage));
+            $this->info('  Storage usage: ' . Helpers::formatBytes($usage));
+
+            $staleTimeout = (int) config('capsule.lock.timeout_seconds', 900);
+            $staleRunning = BackupLog::running()
+                ->where('started_at', '<', now()->subSeconds($staleTimeout))
+                ->count();
+            if ($staleRunning > 0) {
+                $this->warn("  Stale 'running' backups: {$staleRunning} (started > " . ($staleTimeout / 60) . "min ago)");
+                $this->comment("  Run: capsule:cleanup --failed to clean these up");
+            }
+
             return true;
         } catch (\Throwable $e) {
             $this->error('  ❌ Failed to compute health summary: ' . $e->getMessage());
@@ -508,7 +519,7 @@ class DiagnoseCommand extends Command
         // Check backup size trends
         $avgSize = $successfulBackups->avg('file_size');
         if ($avgSize && $verbose) {
-            $this->info("  📦 Average backup size: {$this->formatBytes($avgSize)}");
+            $this->info("  📦 Average backup size: {Helpers::formatBytes($avgSize)}");
         }
 
         return $daysSinceLastBackup <= 7;
@@ -538,16 +549,10 @@ class DiagnoseCommand extends Command
         return $size;
     }
 
-    protected function commandExists(string $command): bool
-    {
-        $result = shell_exec("which {$command}");
-        return !empty($result);
-    }
-
     protected function getDirectorySize(string $path): string
     {
         if (!is_dir($path)) {
-            return is_file($path) ? $this->formatBytes(filesize($path)) : '0 B';
+            return is_file($path) ? Helpers::formatBytes(filesize($path)) : '0 B';
         }
 
         $size = 0;
@@ -567,13 +572,7 @@ class DiagnoseCommand extends Command
             }
         }
 
-        return $this->formatBytes($size);
+        return Helpers::formatBytes($size);
     }
 
-    protected function formatBytes(int $bytes): string
-    {
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $pow = floor(log($bytes, 1024));
-        return round($bytes / (1024 ** $pow), 2) . ' ' . $units[$pow];
-    }
 }
