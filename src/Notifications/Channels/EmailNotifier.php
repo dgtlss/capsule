@@ -17,9 +17,12 @@ class EmailNotifier implements NotifierInterface
         if (!$to) {
             return;
         }
-        Mail::html($this->buildHtml($message, $backupLog, true), function ($mail) use ($to, $subject) {
-            $mail->to($to)->subject($subject);
-        });
+
+        $appName = $message['context']['app_name'] ?? 'Laravel';
+        $env = $message['context']['app_env'] ?? '';
+        $subject = "[{$appName}] {$subject}" . ($env ? " ({$env})" : '');
+
+        $this->send($to, $subject, $message);
     }
 
     public function sendFailure(array $message, BackupLog $backupLog, Exception $exception): void
@@ -31,95 +34,139 @@ class EmailNotifier implements NotifierInterface
             return;
         }
 
-        Mail::html($this->buildHtml($message, $backupLog, false), function ($mail) use ($to, $subject) {
-            $mail->to($to)->subject($subject);
-        });
+        $appName = $message['context']['app_name'] ?? 'Laravel';
+        $env = $message['context']['app_env'] ?? '';
+        $subject = "[{$appName}] {$subject}" . ($env ? " ({$env})" : '');
+
+        $this->send($to, $subject, $message);
     }
 
     public function sendCleanup(array $message, int $deletedCount, int $deletedSize): void
     {
         $to = config('capsule.notifications.email.to');
-        $subject = config('capsule.notifications.email.subject_cleanup', 'Cleanup Completed');
+        $subject = config('capsule.notifications.email.subject_cleanup', 'Backup Cleanup Completed');
 
         if (!$to) {
             return;
         }
 
-        Mail::html($this->buildCleanupHtml($message, $deletedCount, $deletedSize), function ($mail) use ($to, $subject) {
+        $appName = $message['context']['app_name'] ?? 'Laravel';
+        $subject = "[{$appName}] {$subject}";
+
+        $this->send($to, $subject, $message);
+    }
+
+    protected function send(string $to, string $subject, array $message): void
+    {
+        $html = $this->buildHtml($message);
+        $from = config('capsule.notifications.email.from');
+
+        Mail::html($html, function ($mail) use ($to, $subject, $from) {
             $mail->to($to)->subject($subject);
+            if ($from) {
+                $mail->from($from);
+            }
         });
     }
 
-    protected function buildEmailContent(array $message): string
+    protected function buildHtml(array $message): string
     {
-        $content = $message['title'] . "\n\n";
-        $content .= $message['message'] . "\n\n";
-        $content .= "Details:\n";
+        $type = $message['type'] ?? 'success';
+        $color = $message['color'] ?? '#6b7280';
+        $emoji = $message['emoji'] ?? '';
+        $title = htmlspecialchars((string) ($message['title'] ?? 'Capsule Backup'));
+        $subtitle = htmlspecialchars((string) ($message['message'] ?? ''));
+        $appName = htmlspecialchars((string) ($message['context']['app_name'] ?? 'Laravel'));
+        $env = htmlspecialchars((string) ($message['context']['app_env'] ?? ''));
+        $hostname = htmlspecialchars((string) ($message['context']['hostname'] ?? ''));
 
-        foreach ($message['details'] as $key => $value) {
-            $content .= "- {$key}: {$value}\n";
+        $statusLabel = match ($type) {
+            'success' => 'Success',
+            'failure' => 'Failed',
+            'cleanup' => 'Cleanup Complete',
+            default => ucfirst($type),
+        };
+
+        $detailRows = '';
+        foreach ($message['details'] ?? [] as $key => $value) {
+            $k = htmlspecialchars((string) $key);
+            $v = htmlspecialchars((string) $value);
+            $isError = strtolower($key) === 'error' || strtolower($key) === 'recommended action';
+            $valueStyle = $isError
+                ? 'padding:10px 16px;color:#991b1b;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;word-break:break-all;background:#fef2f2'
+                : 'padding:10px 16px;color:#111827;font-size:13px';
+
+            $detailRows .= <<<ROW
+            <tr>
+              <td style="padding:10px 16px;color:#6b7280;font-size:12px;font-weight:500;white-space:nowrap;vertical-align:top;width:140px">{$k}</td>
+              <td style="{$valueStyle}">{$v}</td>
+            </tr>
+ROW;
         }
 
-        $content .= "\n--\nSent by Capsule Backup Package";
+        $timestamp = now()->format('M d, Y \a\t H:i T');
 
-        return $content;
-    }
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{$title}</title>
+</head>
+<body style="margin:0;padding:0;background-color:#f3f4f6;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased">
+  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background-color:#f3f4f6">
+    <tr>
+      <td align="center" style="padding:32px 16px">
+        <table role="presentation" width="600" cellspacing="0" cellpadding="0" style="max-width:600px;width:100%;background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.1)">
 
-    protected function buildHtml(array $message, BackupLog $backupLog, bool $success): string
-    {
-        $color = $success ? '#16a34a' : '#dc2626';
-        $emoji = $message['emoji'] ?? ($success ? '✅' : '❌');
-        $rows = '';
-        foreach ($message['details'] as $k => $v) {
-            $rows .= '<tr><td style="padding:6px 10px;color:#6b7280;font-size:12px">' . htmlspecialchars((string)$k) . '</td><td style="padding:6px 10px;color:#111827;font-size:12px">' . htmlspecialchars((string)$v) . '</td></tr>';
-        }
+          <!-- Status Banner -->
+          <tr>
+            <td style="background-color:{$color};padding:20px 24px">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td style="font-size:28px;line-height:1;padding-right:12px;vertical-align:middle" width="40">{$emoji}</td>
+                  <td style="vertical-align:middle">
+                    <div style="color:#ffffff;font-size:18px;font-weight:700;line-height:1.3">{$title}</div>
+                    <div style="color:rgba(255,255,255,0.85);font-size:13px;line-height:1.4;margin-top:2px">{$subtitle}</div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
 
-        return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-        <title>Capsule Backup</title></head>
-        <body style="margin:0;background:#f9fafb;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif">
-          <div style="max-width:640px;margin:24px auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
-            <div style="padding:16px 20px;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;gap:10px">
-              <div style="font-size:20px">' . $emoji . '</div>
-              <div>
-                <div style="font-weight:600;color:#111827">' . htmlspecialchars((string)($message['title'] ?? 'Backup')) . '</div>
-                <div style="color:#6b7280;font-size:13px">' . htmlspecialchars((string)($message['message'] ?? '')) . '</div>
-              </div>
-            </div>
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
-              <tbody>' . $rows . '</tbody>
-            </table>
-            <div style="padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px">
-              Capsule Backup • ' . ($success ? '<span style="color:' . $color . '">Success</span>' : '<span style="color:' . $color . '">Failed</span>') . '
-            </div>
-          </div>
-        </body></html>';
-    }
+          <!-- Detail Rows -->
+          <tr>
+            <td style="padding:8px 0">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
+                {$detailRows}
+              </table>
+            </td>
+          </tr>
 
-    protected function buildCleanupHtml(array $message, int $deletedCount, int $deletedSize): string
-    {
-        $color = '#16a34a';
-        $emoji = $message['emoji'] ?? '🧹';
-        $rows = '';
-        foreach ($message['details'] as $k => $v) {
-            $rows .= '<tr><td style="padding:8px 16px;border-bottom:1px solid #e5e7eb;color:#6b7280;font-size:13px">' . htmlspecialchars((string)$k) . '</td><td style="padding:8px 16px;border-bottom:1px solid #e5e7eb;color:#111827;font-size:13px">' . htmlspecialchars((string)$v) . '</td></tr>';
-        }
+          <!-- Footer -->
+          <tr>
+            <td style="padding:16px 24px;border-top:1px solid #e5e7eb;background-color:#f9fafb">
+              <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                <tr>
+                  <td style="color:#9ca3af;font-size:11px;line-height:1.5">
+                    Capsule Backup &middot; {$appName} &middot; {$env} &middot; {$hostname}<br>
+                    {$timestamp}
+                  </td>
+                  <td align="right" style="color:{$color};font-size:12px;font-weight:600">
+                    {$statusLabel}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
 
-        return '<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' . htmlspecialchars((string)($message['title'] ?? 'Cleanup')) . '</title></head><body style="font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica Neue,Arial,Noto Sans,sans-serif;line-height:1.5;color:#111827;background-color:#f9fafb;margin:0;padding:0">
-          <div style="max-width:600px;margin:0 auto;background-color:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px 0 rgba(0,0,0,0.1)">
-            <div style="padding:16px;border-bottom:1px solid #e5e7eb">
-              <div style="display:flex;align-items:center;gap:8px">
-                <span style="font-size:20px">' . $emoji . '</span>
-                <div style="font-weight:600;color:#111827">' . htmlspecialchars((string)($message['title'] ?? 'Cleanup')) . '</div>
-                <div style="color:#6b7280;font-size:13px">' . htmlspecialchars((string)($message['message'] ?? '')) . '</div>
-              </div>
-            </div>
-            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
-              <tbody>' . $rows . '</tbody>
-            </table>
-            <div style="padding:12px 16px;border-top:1px solid #e5e7eb;color:#6b7280;font-size:12px">
-              Capsule Backup • <span style="color:' . $color . '">Cleanup Completed</span>
-            </div>
-          </div>
-        </body></html>';
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+HTML;
     }
 }

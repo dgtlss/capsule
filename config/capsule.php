@@ -237,9 +237,17 @@ return [
             // Email address to send notifications to
             'to' => env('CAPSULE_EMAIL_TO'),
 
-            // Email subject lines
+            // Optional: sender address (falls back to Laravel default)
+            'from' => env('CAPSULE_EMAIL_FROM'),
+
+            // Email subject lines (app name and env are prepended automatically)
             'subject_success' => 'Backup Completed Successfully',
             'subject_failure' => 'Backup Failed',
+            'subject_cleanup' => 'Backup Cleanup Completed',
+
+            // Which events trigger this channel: ['success', 'failure', 'cleanup']
+            // Set to null to receive all events
+            'notify_on' => null,
         ],
 
         'webhooks' => [
@@ -254,8 +262,12 @@ return [
                 // Channel to post to (include #)
                 'channel' => '#general',
 
-                // Username to post as
+                // Username and emoji to post as
                 'username' => 'Capsule',
+                'icon_emoji' => ':package:',
+
+                // Which events trigger this channel: ['success', 'failure', 'cleanup']
+                'notify_on' => null,
             ],
 
             'discord' => [
@@ -265,8 +277,12 @@ return [
                 // Discord webhook URL (get from Discord server settings)
                 'webhook_url' => env('CAPSULE_DISCORD_WEBHOOK_URL'),
 
-                // Username to post as
+                // Username and avatar
                 'username' => 'Capsule',
+                'avatar_url' => null,
+
+                // Which events trigger this channel
+                'notify_on' => null,
             ],
 
             'teams' => [
@@ -275,6 +291,9 @@ return [
 
                 // Teams webhook URL (get from Teams channel connectors)
                 'webhook_url' => env('CAPSULE_TEAMS_WEBHOOK_URL'),
+
+                // Which events trigger this channel
+                'notify_on' => null,
             ],
 
             'google_chat' => [
@@ -283,6 +302,9 @@ return [
 
                 // Google Chat webhook URL (get from Google Chat space settings)
                 'webhook_url' => env('CAPSULE_GOOGLE_CHAT_WEBHOOK_URL'),
+
+                // Which events trigger this channel
+                'notify_on' => null,
             ],
 
         ],

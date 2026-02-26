@@ -28,11 +28,14 @@ class NotificationManager
 
         $message = $this->buildSuccessMessage($backupLog);
 
-        foreach ($this->notifiers as $notifier) {
+        foreach ($this->notifiers as $entry) {
+            if (!$this->shouldNotify($entry['config_key'], 'success')) {
+                continue;
+            }
             try {
-                $notifier->sendSuccess($message, $backupLog);
+                $entry['notifier']->sendSuccess($message, $backupLog);
             } catch (Exception $e) {
-                logger()->error("Failed to send success notification via " . get_class($notifier) . ": " . $e->getMessage());
+                logger()->error("Failed to send success notification via " . get_class($entry['notifier']) . ": " . $e->getMessage());
             }
         }
     }
@@ -45,11 +48,14 @@ class NotificationManager
 
         $message = $this->buildFailureMessage($backupLog, $exception);
 
-        foreach ($this->notifiers as $notifier) {
+        foreach ($this->notifiers as $entry) {
+            if (!$this->shouldNotify($entry['config_key'], 'failure')) {
+                continue;
+            }
             try {
-                $notifier->sendFailure($message, $backupLog, $exception);
+                $entry['notifier']->sendFailure($message, $backupLog, $exception);
             } catch (Exception $e) {
-                logger()->error("Failed to send failure notification via " . get_class($notifier) . ": " . $e->getMessage());
+                logger()->error("Failed to send failure notification via " . get_class($entry['notifier']) . ": " . $e->getMessage());
             }
         }
     }
@@ -62,102 +68,166 @@ class NotificationManager
 
         $message = $this->buildCleanupMessage($deletedCount, $deletedSize);
 
-        foreach ($this->notifiers as $notifier) {
+        foreach ($this->notifiers as $entry) {
+            if (!$this->shouldNotify($entry['config_key'], 'cleanup')) {
+                continue;
+            }
             try {
-                $notifier->sendCleanup($message, $deletedCount, $deletedSize);
+                $entry['notifier']->sendCleanup($message, $deletedCount, $deletedSize);
             } catch (Exception $e) {
-                logger()->error("Failed to send cleanup notification via " . get_class($notifier) . ": " . $e->getMessage());
+                logger()->error("Failed to send cleanup notification via " . get_class($entry['notifier']) . ": " . $e->getMessage());
             }
         }
+    }
+
+    protected function shouldNotify(string $configKey, string $event): bool
+    {
+        $notifyOn = config("{$configKey}.notify_on");
+
+        if ($notifyOn === null) {
+            return true;
+        }
+
+        $events = is_array($notifyOn) ? $notifyOn : explode(',', (string) $notifyOn);
+        $events = array_map('trim', $events);
+
+        return in_array($event, $events, true);
     }
 
     protected function initializeNotifiers(): void
     {
         if (config('capsule.notifications.email.enabled', false)) {
-            $this->notifiers[] = new EmailNotifier();
+            $this->notifiers[] = [
+                'notifier' => new EmailNotifier(),
+                'config_key' => 'capsule.notifications.email',
+            ];
         }
 
-        if (config('capsule.notifications.webhooks.slack.enabled', false)) {
-            $this->notifiers[] = new SlackNotifier();
-        }
+        $webhookChannels = [
+            'slack' => SlackNotifier::class,
+            'discord' => DiscordNotifier::class,
+            'teams' => TeamsNotifier::class,
+            'google_chat' => GoogleChatNotifier::class,
+        ];
 
-        if (config('capsule.notifications.webhooks.discord.enabled', false)) {
-            $this->notifiers[] = new DiscordNotifier();
+        foreach ($webhookChannels as $key => $class) {
+            if (config("capsule.notifications.webhooks.{$key}.enabled", false)) {
+                $this->notifiers[] = [
+                    'notifier' => new $class(),
+                    'config_key' => "capsule.notifications.webhooks.{$key}",
+                ];
+            }
         }
+    }
 
-        if (config('capsule.notifications.webhooks.teams.enabled', false)) {
-            $this->notifiers[] = new TeamsNotifier();
-        }
-
-        if (config('capsule.notifications.webhooks.google_chat.enabled', false)) {
-            $this->notifiers[] = new GoogleChatNotifier();
-        }
+    protected function buildContext(): array
+    {
+        return [
+            'app_name' => config('app.name', 'Laravel'),
+            'app_env' => app()->environment(),
+            'hostname' => gethostname() ?: 'unknown',
+            'disk' => config('capsule.default_disk', 'local'),
+            'backup_path' => config('capsule.backup_path', 'backups'),
+            'app_url' => config('app.url'),
+        ];
     }
 
     protected function buildSuccessMessage(BackupLog $backupLog): array
     {
+        $ctx = $this->buildContext();
+        $duration = $backupLog->started_at && $backupLog->completed_at
+            ? $backupLog->started_at->diffForHumans($backupLog->completed_at, true)
+            : 'unknown';
+
         return [
+            'type' => 'success',
             'title' => 'Backup Completed Successfully',
-            'message' => 'The backup process has completed successfully.',
+            'message' => "A backup of {$ctx['app_name']} ({$ctx['app_env']}) completed successfully.",
+            'context' => $ctx,
             'details' => [
-                'Started at' => $backupLog->started_at->format('Y-m-d H:i:s'),
-                'Completed at' => $backupLog->completed_at->format('Y-m-d H:i:s'),
-                'Duration' => $backupLog->started_at->diffForHumans($backupLog->completed_at, true),
-                'File size' => Helpers::formatBytes($backupLog->file_size),
-                'Status' => 'Success',
+                'Application' => $ctx['app_name'],
+                'Environment' => $ctx['app_env'],
+                'Host' => $ctx['hostname'],
+                'Started at' => $backupLog->started_at ? $backupLog->started_at->format('Y-m-d H:i:s T') : 'Unknown',
+                'Completed at' => $backupLog->completed_at ? $backupLog->completed_at->format('Y-m-d H:i:s T') : 'Unknown',
+                'Duration' => $duration,
+                'File size' => Helpers::formatBytes($backupLog->file_size ?? 0),
+                'Storage disk' => $ctx['disk'],
+                'Backup path' => $backupLog->file_path ?? $ctx['backup_path'],
+                'Tag' => $backupLog->tag ?? '-',
             ],
-            'color' => 'good',
-            'emoji' => '✅',
+            'color' => '#16a34a',
+            'color_int' => 0x16a34a,
+            'color_name' => 'good',
+            'emoji' => "\u{2705}",
         ];
     }
 
     protected function buildFailureMessage(BackupLog $backupLog, Exception $exception): array
     {
+        $ctx = $this->buildContext();
         $isPreflightDb = str_contains(strtolower($exception->getMessage()), 'database unreachable')
             || (is_array($backupLog->metadata ?? null) && ($backupLog->metadata['failure_stage'] ?? '') === 'preflight');
 
-        $title = $isPreflightDb ? 'Backup Failed – Database Unreachable' : 'Backup Failed';
+        $title = $isPreflightDb ? 'Backup Failed - Database Unreachable' : 'Backup Failed';
         $message = $isPreflightDb
-            ? 'Capsule could not reach the configured database connection(s). No backup was performed.'
-            : 'The backup process has failed.';
+            ? "Capsule could not reach the database for {$ctx['app_name']} ({$ctx['app_env']}). No backup was produced."
+            : "The backup of {$ctx['app_name']} ({$ctx['app_env']}) has failed.";
 
         $details = [
-            'Started at' => $backupLog->started_at ? $backupLog->started_at->format('Y-m-d H:i:s') : 'Unknown',
-            'Failed at' => $backupLog->completed_at ? $backupLog->completed_at->format('Y-m-d H:i:s') : 'Unknown',
+            'Application' => $ctx['app_name'],
+            'Environment' => $ctx['app_env'],
+            'Host' => $ctx['hostname'],
+            'Started at' => $backupLog->started_at ? $backupLog->started_at->format('Y-m-d H:i:s T') : 'Unknown',
+            'Failed at' => $backupLog->completed_at ? $backupLog->completed_at->format('Y-m-d H:i:s T') : 'Unknown',
             'Error' => $exception->getMessage(),
         ];
+
+        if ($backupLog->tag) {
+            $details['Tag'] = $backupLog->tag;
+        }
 
         if ($isPreflightDb && is_array($backupLog->metadata ?? null) && !empty($backupLog->metadata['failed_connections'] ?? [])) {
             $failed = collect($backupLog->metadata['failed_connections'])->pluck('connection')->implode(', ');
             $details['Affected connections'] = $failed;
-            $details['Action'] = 'Verify DB host/port/credentials and that the database service is reachable from the application environment.';
+            $details['Recommended action'] = 'Verify DB host/port/credentials and that the database service is reachable.';
         }
 
-        $details['Status'] = 'Failed';
-
         return [
+            'type' => 'failure',
             'title' => $title,
             'message' => $message,
+            'context' => $ctx,
             'details' => $details,
-            'color' => 'danger',
-            'emoji' => '❌',
+            'color' => '#dc2626',
+            'color_int' => 0xdc2626,
+            'color_name' => 'danger',
+            'emoji' => "\u{274C}",
         ];
     }
 
     protected function buildCleanupMessage(int $deletedCount, int $deletedSize): array
     {
+        $ctx = $this->buildContext();
+
         return [
-            'title' => 'Cleanup Completed',
-            'message' => "{$deletedCount} items were removed.",
+            'type' => 'cleanup',
+            'title' => 'Backup Cleanup Completed',
+            'message' => "{$deletedCount} old backup(s) removed from {$ctx['app_name']} ({$ctx['app_env']}).",
+            'context' => $ctx,
             'details' => [
-                'Items deleted' => $deletedCount,
+                'Application' => $ctx['app_name'],
+                'Environment' => $ctx['app_env'],
+                'Host' => $ctx['hostname'],
+                'Backups deleted' => (string) $deletedCount,
                 'Space freed' => Helpers::formatBytes($deletedSize),
-                'Completed at' => now()->format('Y-m-d H:i:s'),
-                'Status' => 'Success',
+                'Storage disk' => $ctx['disk'],
+                'Completed at' => now()->format('Y-m-d H:i:s T'),
             ],
-            'color' => 'good',
-            'emoji' => '🧹',
+            'color' => '#2563eb',
+            'color_int' => 0x2563eb,
+            'color_name' => 'warning',
+            'emoji' => "\u{1F9F9}",
         ];
     }
-
 }
