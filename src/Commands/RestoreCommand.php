@@ -17,24 +17,118 @@ class RestoreCommand extends Command
         {--files-only : Only restore files}
         {--target= : Target directory for file restoration (default: original paths)}
         {--connection= : Database connection to restore to (default: from backup)}
+        {--only=* : Only restore specific files (glob patterns, e.g. config/*.php)}
+        {--list : List archive contents without restoring}
         {--dry-run : Show what would be restored without making changes}
         {--force : Skip confirmation prompt}
-        {--detailed : Verbose output}';
+        {--detailed : Verbose output}
+        {--format=table : Output format (table|json)}';
 
     protected $description = 'Restore a backup (database and/or files)';
 
     public function handle(): int
     {
-        $verbose = (bool) $this->option('detailed');
-        $dryRun = (bool) $this->option('dry-run');
-        $dbOnly = (bool) $this->option('db-only');
-        $filesOnly = (bool) $this->option('files-only');
-
         $backup = $this->resolveBackup();
         if (!$backup) {
             $this->error('No successful backup found to restore.');
             return self::FAILURE;
         }
+
+        $zip = $this->downloadAndOpen($backup);
+        if (!$zip) {
+            return self::FAILURE;
+        }
+
+        try {
+            if ($this->option('list')) {
+                return $this->listContents($zip, $backup);
+            }
+
+            return $this->performRestore($zip, $backup);
+        } finally {
+            $tmpPath = $zip->filename;
+            $zip->close();
+            @unlink($tmpPath);
+        }
+    }
+
+    protected function listContents(ZipArchive $zip, BackupLog $backup): int
+    {
+        $format = $this->option('format');
+        $entries = [];
+
+        for ($i = 0; $i < $zip->numFiles; $i++) {
+            $name = $zip->getNameIndex($i);
+            $stat = $zip->statIndex($i);
+            $entries[] = [
+                'path' => $name,
+                'size' => $stat['size'] ?? 0,
+                'size_formatted' => Helpers::formatBytes($stat['size'] ?? 0),
+                'compressed' => $stat['comp_size'] ?? 0,
+                'type' => str_starts_with($name, 'database/') ? 'database' : (str_starts_with($name, 'files/') ? 'file' : 'meta'),
+            ];
+        }
+
+        if ($format === 'json') {
+            $this->line(json_encode([
+                'backup_id' => $backup->id,
+                'total_entries' => count($entries),
+                'entries' => $entries,
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            return self::SUCCESS;
+        }
+
+        $this->info("Backup #{$backup->id} - {$zip->numFiles} entries");
+        $this->newLine();
+
+        $dbEntries = array_filter($entries, fn($e) => $e['type'] === 'database');
+        $fileEntries = array_filter($entries, fn($e) => $e['type'] === 'file');
+        $metaEntries = array_filter($entries, fn($e) => $e['type'] === 'meta');
+
+        if (!empty($dbEntries)) {
+            $this->info('Database dumps (' . count($dbEntries) . ')');
+            foreach ($dbEntries as $e) {
+                $this->line("  {$e['size_formatted']}  {$e['path']}");
+            }
+            $this->newLine();
+        }
+
+        if (!empty($fileEntries)) {
+            $this->info('Files (' . count($fileEntries) . ')');
+            $shown = 0;
+            foreach ($fileEntries as $e) {
+                if ($shown < 50 || $this->option('detailed')) {
+                    $this->line("  {$e['size_formatted']}  {$e['path']}");
+                }
+                $shown++;
+            }
+            if ($shown > 50 && !$this->option('detailed')) {
+                $this->comment("  ... and " . ($shown - 50) . " more (use --detailed to show all)");
+            }
+            $this->newLine();
+        }
+
+        if (!empty($metaEntries)) {
+            $this->comment('Metadata');
+            foreach ($metaEntries as $e) {
+                $this->line("  {$e['size_formatted']}  {$e['path']}");
+            }
+        }
+
+        $totalSize = array_sum(array_column($entries, 'size'));
+        $this->newLine();
+        $this->info('Total: ' . count($entries) . ' entries, ' . Helpers::formatBytes($totalSize));
+
+        return self::SUCCESS;
+    }
+
+    protected function performRestore(ZipArchive $zip, BackupLog $backup): int
+    {
+        $verbose = (bool) $this->option('detailed');
+        $dryRun = (bool) $this->option('dry-run');
+        $dbOnly = (bool) $this->option('db-only');
+        $filesOnly = (bool) $this->option('files-only');
+        $onlyPatterns = $this->option('only');
 
         $this->info("Backup #{$backup->id} | {$backup->created_at} | " . Helpers::formatBytes($backup->file_size ?? 0));
 
@@ -49,12 +143,32 @@ class RestoreCommand extends Command
             }
         }
 
+        $restoredDb = 0;
+        $restoredFiles = 0;
+
+        if (!$filesOnly && empty($onlyPatterns)) {
+            $restoredDb = $this->restoreDatabase($zip, $dryRun, $verbose);
+        }
+
+        if (!$dbOnly) {
+            $restoredFiles = $this->restoreFiles($zip, $dryRun, $verbose, $onlyPatterns);
+        }
+
+        $this->newLine();
+        $action = $dryRun ? 'Would restore' : 'Restored';
+        $this->info("{$action}: {$restoredDb} database dump(s), {$restoredFiles} file(s).");
+
+        return self::SUCCESS;
+    }
+
+    protected function downloadAndOpen(BackupLog $backup): ?ZipArchive
+    {
         $diskName = config('capsule.default_disk', 'local');
         $disk = Storage::disk($diskName);
 
         if (!$backup->file_path || !$disk->exists($backup->file_path)) {
             $this->error("Backup file not found on disk '{$diskName}': {$backup->file_path}");
-            return self::FAILURE;
+            return null;
         }
 
         $tmpPath = tempnam(sys_get_temp_dir(), 'capsule_restore_');
@@ -63,7 +177,7 @@ class RestoreCommand extends Command
         $stream = $disk->readStream($backup->file_path);
         if ($stream === false) {
             $this->error('Failed to open remote file stream.');
-            return self::FAILURE;
+            return null;
         }
 
         $out = fopen($tmpPath, 'wb');
@@ -75,39 +189,18 @@ class RestoreCommand extends Command
 
         $zip = new ZipArchive();
         $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-        $openResult = $zip->open($tmpPath);
 
-        if ($openResult !== true) {
+        if ($zip->open($tmpPath) !== true) {
             @unlink($tmpPath);
             $this->error('Failed to open backup archive.');
-            return self::FAILURE;
+            return null;
         }
 
         if (!empty($password)) {
             @$zip->setPassword($password);
         }
 
-        $restoredDb = 0;
-        $restoredFiles = 0;
-
-        try {
-            if (!$filesOnly) {
-                $restoredDb = $this->restoreDatabase($zip, $dryRun, $verbose);
-            }
-
-            if (!$dbOnly) {
-                $restoredFiles = $this->restoreFiles($zip, $dryRun, $verbose);
-            }
-        } finally {
-            $zip->close();
-            @unlink($tmpPath);
-        }
-
-        $this->newLine();
-        $action = $dryRun ? 'Would restore' : 'Restored';
-        $this->info("{$action}: {$restoredDb} database dump(s), {$restoredFiles} file(s).");
-
-        return self::SUCCESS;
+        return $zip;
     }
 
     protected function resolveBackup(): ?BackupLog
@@ -276,11 +369,12 @@ class RestoreCommand extends Command
         }
     }
 
-    protected function restoreFiles(ZipArchive $zip, bool $dryRun, bool $verbose): int
+    protected function restoreFiles(ZipArchive $zip, bool $dryRun, bool $verbose, array $onlyPatterns = []): int
     {
         $this->info('Restoring files...');
         $targetBase = $this->option('target') ?? base_path();
         $count = 0;
+        $skipped = 0;
 
         for ($i = 0; $i < $zip->numFiles; $i++) {
             $name = $zip->getNameIndex($i);
@@ -290,6 +384,11 @@ class RestoreCommand extends Command
 
             $relativePath = substr($name, strlen('files/'));
             if (empty($relativePath) || str_ends_with($name, '/')) {
+                continue;
+            }
+
+            if (!empty($onlyPatterns) && !$this->matchesPatterns($relativePath, $onlyPatterns)) {
+                $skipped++;
                 continue;
             }
 
@@ -322,6 +421,20 @@ class RestoreCommand extends Command
             $count++;
         }
 
+        if (!empty($onlyPatterns) && $skipped > 0) {
+            $this->comment("  Skipped {$skipped} file(s) not matching --only patterns");
+        }
+
         return $count;
+    }
+
+    protected function matchesPatterns(string $path, array $patterns): bool
+    {
+        foreach ($patterns as $pattern) {
+            if (fnmatch($pattern, $path) || fnmatch($pattern, basename($path))) {
+                return true;
+            }
+        }
+        return false;
     }
 }
