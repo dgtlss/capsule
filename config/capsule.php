@@ -19,6 +19,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Additional Storage Disks
+    |--------------------------------------------------------------------------
+    |
+    | Backups will also be copied to these disks for redundancy. Each entry
+    | should be a disk name from config/filesystems.php. The primary backup
+    | is always stored on `default_disk`; these are additional copies.
+    |
+    */
+
+    'additional_disks' => [
+        // 's3-secondary',
+        // 'local-archive',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Backup Path
     |--------------------------------------------------------------------------
     |
