@@ -9,6 +9,7 @@ use Dgtlss\Capsule\Commands\VerifyCommand;
 use Dgtlss\Capsule\Commands\ListCommand;
 use Dgtlss\Capsule\Commands\InspectCommand;
 use Dgtlss\Capsule\Commands\HealthCommand;
+use Dgtlss\Capsule\Commands\RestoreCommand;
 use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Services\BackupService;
@@ -69,6 +70,7 @@ class CapsuleServiceProvider extends ServiceProvider
                 ListCommand::class,
                 InspectCommand::class,
                 HealthCommand::class,
+                RestoreCommand::class,
             ]);
         }
 
