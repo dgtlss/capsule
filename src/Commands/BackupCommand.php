@@ -4,6 +4,8 @@ namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
+use Dgtlss\Capsule\Services\SimulationService;
+use Dgtlss\Capsule\Support\Helpers;
 use Dgtlss\Capsule\Support\Lock;
 use Illuminate\Console\Command;
 
@@ -19,6 +21,7 @@ class BackupCommand extends Command
     {--verify : Verify backup integrity after creation}
     {--db-only : Only backup database (skip files)}
     {--files-only : Only backup files (skip database)}
+    {--simulate : Estimate backup size and duration without running}
     {--tag= : Label this backup (e.g., pre-deploy, nightly)}
     {--format=table : Output format (table|json)}';
     
@@ -52,6 +55,10 @@ class BackupCommand extends Command
 
         if ($this->option('files-only')) {
             config(['capsule.database.enabled' => false]);
+        }
+
+        if ($this->option('simulate')) {
+            return $this->runSimulation();
         }
 
         $service->setVerbose($verbose);
@@ -129,5 +136,85 @@ class BackupCommand extends Command
                 $lock->release();
             }
         }
+    }
+
+    protected function runSimulation(): int
+    {
+        $this->info('Simulating backup (no data will be written)...');
+        $this->newLine();
+
+        $sim = app(SimulationService::class);
+        $result = $sim->simulate();
+        $format = $this->option('format');
+
+        if ($format === 'json') {
+            $this->line(json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            return self::SUCCESS;
+        }
+
+        if ($db = $result['database'] ?? null) {
+            $this->info('Database');
+            foreach ($db['connections'] as $conn) {
+                $this->line("  {$conn['connection']} ({$conn['driver']}) - {$conn['estimated_size_formatted']}");
+            }
+            $this->line("  Total: {$db['total_size_formatted']}");
+            $this->newLine();
+        }
+
+        if ($files = $result['files'] ?? null) {
+            $this->info('Files');
+            $this->line("  {$files['file_count']} files in {$files['directory_count']} directories");
+            $this->line("  Total: {$files['total_size_formatted']}");
+
+            if (!empty($files['top_extensions'])) {
+                $this->newLine();
+                $this->info('Top extensions by size');
+                foreach (array_slice($files['top_extensions'], 0, 5) as $ext) {
+                    $this->line("  .{$ext['extension']}  {$ext['size_formatted']}");
+                }
+            }
+
+            if (!empty($files['largest_files'])) {
+                $this->newLine();
+                $this->info('Largest files');
+                foreach (array_slice($files['largest_files'], 0, 5) as $f) {
+                    $this->line("  {$f['size_formatted']}  {$f['path']}");
+                }
+            }
+            $this->newLine();
+        }
+
+        $totals = $result['totals'];
+        $est = $result['estimate'];
+
+        $this->table(
+            ['Metric', 'Value'],
+            [
+                ['Raw data size', $totals['raw_size_formatted']],
+                ['Estimated archive size', $est['archive_size_formatted']],
+                ['Compression ratio', $est['compression_ratio'] . 'x'],
+                ['Estimated duration', $est['duration_formatted']],
+                ['Files', number_format($totals['file_count'])],
+                ['Databases', $totals['database_count']],
+            ]
+        );
+
+        if (!empty($result['history'])) {
+            $this->newLine();
+            $this->info('Historical comparison');
+            $h = $result['history'];
+            $this->line("  Last backup:     {$h['last_backup_size_formatted']}");
+            $this->line("  Average backup:  {$h['avg_backup_size_formatted']} (over {$h['backup_count']} backups)");
+            $this->line("  Average duration: {$h['avg_duration_seconds']}s");
+        }
+
+        if (!empty($result['warnings'])) {
+            $this->newLine();
+            foreach ($result['warnings'] as $warning) {
+                $this->warn("  Warning: {$warning}");
+            }
+        }
+
+        return self::SUCCESS;
     }
 }
