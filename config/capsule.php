@@ -496,6 +496,20 @@ return [
 
     'policies' => [],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Audit Log
+    |--------------------------------------------------------------------------
+    |
+    | Track every backup operation for compliance. Records who triggered
+    | the action, what was backed up/restored, and the result.
+    |
+    */
+
+    'audit' => [
+        'enabled' => env('CAPSULE_AUDIT_ENABLED', true),
+    ],
+
     'anomaly' => [
         'size_deviation_percent' => 200,
         'duration_deviation_percent' => 300,

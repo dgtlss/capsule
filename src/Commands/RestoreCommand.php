@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Models\BackupLog;
+use Dgtlss\Capsule\Services\AuditLogger;
 use Dgtlss\Capsule\Support\Helpers;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Storage;
@@ -157,6 +158,19 @@ class RestoreCommand extends Command
         $this->newLine();
         $action = $dryRun ? 'Would restore' : 'Restored';
         $this->info("{$action}: {$restoredDb} database dump(s), {$restoredFiles} file(s).");
+
+        if (!$dryRun) {
+            AuditLogger::log('backup.restored', [
+                'backup_log_id' => $backup->id,
+                'status' => 'completed',
+                'details' => [
+                    'databases_restored' => $restoredDb,
+                    'files_restored' => $restoredFiles,
+                    'target' => $this->option('target') ?? 'original',
+                    'only_patterns' => $onlyPatterns ?: null,
+                ],
+            ]);
+        }
 
         return self::SUCCESS;
     }

@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Services;
 
 use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Database\DumpValidator;
+use Dgtlss\Capsule\Services\AuditLogger;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
@@ -151,6 +152,16 @@ class BackupService
         $context->verification = $this->verification;
         event(new BackupStarting($context));
 
+        AuditLogger::log('backup.started', [
+            'trigger' => 'artisan',
+            'status' => 'started',
+            'details' => [
+                'mode' => $this->incremental ? 'incremental' : 'full',
+                'tag' => $this->tag,
+                'encryption' => $context->encryption,
+            ],
+        ]);
+
         // Execute pre-steps
         $this->executeSteps((array) config('capsule.extensibility.pre_steps', []), $context, 'pre');
         // Try to persist backup log, but degrade gracefully if DB is unavailable
@@ -241,7 +252,17 @@ class BackupService
                 $this->cleanup();
             }
             
-            $this->log('📧 Sending success notification...');
+            AuditLogger::log('backup.completed', [
+                'backup_log_id' => $backupLog->id ?? null,
+                'status' => 'completed',
+                'details' => [
+                    'type' => $this->backupType,
+                    'file_size' => $fileSize,
+                    'file_path' => $remotePath,
+                    'tag' => $this->tag,
+                ],
+            ]);
+
             $this->notificationManager->sendSuccessNotification($backupLog);
             event(new BackupSucceeded($context));
 
@@ -262,6 +283,13 @@ class BackupService
             }
 
             Log::error('Backup failed: ' . $e->getMessage(), ['exception' => $e]);
+
+            AuditLogger::log('backup.failed', [
+                'backup_log_id' => $backupLog->id ?? null,
+                'status' => 'failed',
+                'details' => ['error' => $e->getMessage(), 'tag' => $this->tag],
+            ]);
+
             $this->notificationManager->sendFailureNotification($backupLog, $e);
             event(new BackupFailed($context, $e));
 
