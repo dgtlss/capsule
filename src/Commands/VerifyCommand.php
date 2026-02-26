@@ -12,7 +12,7 @@ class VerifyCommand extends Command
     protected $signature = 'capsule:verify 
         {--id= : Verify a specific backup log id} 
         {--keep : Keep the downloaded file instead of deleting it} 
-        {--v : Verbose output}
+        {--detailed : Verbose output}
         {--all : Verify all successful backups}
         {--format=table : Output format (table|json)}';
 
@@ -20,7 +20,7 @@ class VerifyCommand extends Command
 
     public function handle(): int
     {
-        $verbose = (bool) $this->option('v');
+        $verbose = (bool) $this->option('detailed');
         $format = $this->option('format');
         $results = [];
 

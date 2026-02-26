@@ -15,7 +15,7 @@ class CleanupCommand extends Command
     {--days= : Override retention days from config}
     {--failed : Also clean up failed backup records}
     {--storage : Clean up orphaned files in storage}
-    {--v : Verbose output}
+    {--detailed : Verbose output}
     {--format=table : Output format (table|json)}';
     
     protected $description = 'Clean up old backup files according to retention policy';
@@ -32,7 +32,7 @@ class CleanupCommand extends Command
         $isDryRun = $this->option('dry-run');
         $cleanFailed = $this->option('failed');
         $cleanStorage = $this->option('storage');
-        $verbose = $this->option('v');
+        $verbose = $this->option('detailed');
 
         if ($daysOption !== null) {
             $this->info("Using command override: {$retentionDays} days (ignoring config and count-based retention)");

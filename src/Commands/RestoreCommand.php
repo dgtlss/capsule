@@ -19,13 +19,13 @@ class RestoreCommand extends Command
         {--connection= : Database connection to restore to (default: from backup)}
         {--dry-run : Show what would be restored without making changes}
         {--force : Skip confirmation prompt}
-        {--v : Verbose output}';
+        {--detailed : Verbose output}';
 
     protected $description = 'Restore a backup (database and/or files)';
 
     public function handle(): int
     {
-        $verbose = (bool) $this->option('v');
+        $verbose = (bool) $this->option('detailed');
         $dryRun = (bool) $this->option('dry-run');
         $dbOnly = (bool) $this->option('db-only');
         $filesOnly = (bool) $this->option('files-only');

@@ -12,7 +12,7 @@ class BackupCommand extends Command
     protected $signature = 'capsule:backup 
     {--force : Force backup even if another is running} 
     {--no-local : Stream backup directly to external storage without using local disk}
-    {--v : Verbose output with progress details}
+    {--detailed : Verbose output with progress details}
     {--parallel : Enable parallel processing for multiple databases}
     {--compress=1 : Compression level 1-9 (1=fastest, 9=smallest)}
     {--encrypt : Encrypt backup archive}
@@ -24,7 +24,7 @@ class BackupCommand extends Command
     public function handle(BackupService $backupService, ChunkedBackupService $chunkedBackupService): int
     {
         $useChunkedBackup = $this->option('no-local');
-        $verbose = $this->option('v');
+        $verbose = $this->option('detailed');
         $parallel = $this->option('parallel');
         $compress = (int) $this->option('compress');
         $encrypt = $this->option('encrypt');
@@ -88,7 +88,7 @@ class BackupCommand extends Command
                     $this->error('Detailed error information:');
                     $this->error($lastError);
                 } else {
-                    $this->error('Check the logs for more details or run with --v for verbose output.');
+                    $this->error('Check the logs for more details or run with --detailed for verbose output.');
                 }
             }
             return self::FAILURE;
@@ -103,7 +103,7 @@ class BackupCommand extends Command
                 $this->error("Stack trace:");
                 $this->line($e->getTraceAsString());
             } else {
-                $this->error('Run with --v flag for more detailed error information.');
+                $this->error('Run with --detailed flag for more detailed error information.');
             }
             
             return self::FAILURE;

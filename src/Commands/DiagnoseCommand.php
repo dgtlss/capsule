@@ -13,7 +13,7 @@ class DiagnoseCommand extends Command
     {--detailed : Show detailed performance and security analysis}
     {--fix : Attempt to fix common issues automatically}
     {--format=table : Output format (table, json)}
-    {--v : Verbose output}';
+    {--detailed : Verbose output}';
     
     protected $description = 'Diagnose Capsule configuration and system requirements';
 
@@ -22,7 +22,7 @@ class DiagnoseCommand extends Command
         $detailed = $this->option('detailed');
         $format = $this->option('format');
         $fix = $this->option('fix');
-        $verbose = $this->option('v');
+        $verbose = $this->option('detailed');
 
         if ($format === 'json') {
             return $this->handleJsonOutput($detailed, $fix);
