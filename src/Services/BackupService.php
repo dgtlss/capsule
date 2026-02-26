@@ -3,6 +3,7 @@
 namespace Dgtlss\Capsule\Services;
 
 use Dgtlss\Capsule\Database\DatabaseDumper;
+use Dgtlss\Capsule\Database\DumpValidator;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
@@ -414,6 +415,9 @@ class BackupService
             $this->log("   Dumping database: {$connection}");
             $dumpPath = storage_path("app/backups/db_{$connection}_{$timestamp}.sql");
             $this->databaseDumper->dump($connection, $dumpPath);
+
+            $driver = config("database.connections.{$connection}.driver", 'unknown');
+            DumpValidator::validate($dumpPath, $driver);
 
             $dumpSize = filesize($dumpPath);
             $entryName = "database/{$connection}.sql";
