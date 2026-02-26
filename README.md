@@ -1,4 +1,10 @@
-# Capsule
+```
+   ____    _    ____  ____  _   _ _     _____
+  / ___|  / \  |  _ \/ ___|| | | | |   | ____|
+ | |     / _ \ | |_) \___ \| | | | |   |  _|
+ | |___ / ___ \|  __/ ___) | |_| | |___| |___
+  \____/_/   \_\_|   |____/ \___/|_____|_____|
+```
 
 A comprehensive Laravel backup package. Back up your database and files, store them anywhere, get notified, and restore with confidence.
 
