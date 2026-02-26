@@ -4,16 +4,17 @@ namespace Dgtlss\Capsule\Notifications\Channels;
 
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotifierInterface;
+use Dgtlss\Capsule\Notifications\WebhookDispatcher;
 use GuzzleHttp\Client;
 use Exception;
 
 class GoogleChatNotifier implements NotifierInterface
 {
-    protected Client $client;
+    protected WebhookDispatcher $dispatcher;
 
-    public function __construct(?Client $client = null)
+    public function __construct(?WebhookDispatcher $dispatcher = null)
     {
-        $this->client = $client ?? new Client();
+        $this->dispatcher = $dispatcher ?? new WebhookDispatcher();
     }
 
     public function sendSuccess(array $message, BackupLog $backupLog): void
@@ -39,11 +40,7 @@ class GoogleChatNotifier implements NotifierInterface
         }
 
         $payload = $this->buildPayload($message);
-
-        $this->client->post($webhookUrl, [
-            'json' => $payload,
-            'timeout' => 10,
-        ]);
+        $this->dispatcher->dispatch($webhookUrl, $payload, 'google_chat');
     }
 
     protected function buildPayload(array $message): array

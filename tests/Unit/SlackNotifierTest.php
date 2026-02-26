@@ -3,6 +3,7 @@
 namespace Dgtlss\Capsule\Tests\Unit;
 
 use Dgtlss\Capsule\Notifications\Channels\SlackNotifier;
+use Dgtlss\Capsule\Notifications\WebhookDispatcher;
 use Dgtlss\Capsule\Tests\TestCase;
 
 class SlackNotifierTest extends TestCase

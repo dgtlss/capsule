@@ -230,6 +230,10 @@ return [
         // Master switch for all notifications
         'enabled' => true,
 
+        // Webhook delivery retry configuration
+        'webhook_retries' => 3,
+        'webhook_backoff_ms' => 1000,
+
         'email' => [
             // Enable email notifications
             'enabled' => false,
