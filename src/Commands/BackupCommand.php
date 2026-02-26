@@ -19,6 +19,7 @@ class BackupCommand extends Command
     {--verify : Verify backup integrity after creation}
     {--db-only : Only backup database (skip files)}
     {--files-only : Only backup files (skip database)}
+    {--tag= : Label this backup (e.g., pre-deploy, nightly)}
     {--format=table : Output format (table|json)}';
     
     protected $description = 'Create a backup of the database and files';
@@ -55,6 +56,7 @@ class BackupCommand extends Command
 
         $service->setVerbose($verbose);
         $service->setParallel($parallel);
+        $service->setTag($this->option('tag'));
         if ($compress >= 1 && $compress <= 9) {
             $service->setCompressionLevel($compress);
         }

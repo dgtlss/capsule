@@ -11,6 +11,7 @@ class BackupLog extends Model
         'started_at',
         'completed_at',
         'status',
+        'tag',
         'file_path',
         'file_size',
         'error_message',

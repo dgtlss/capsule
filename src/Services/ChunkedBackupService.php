@@ -34,6 +34,7 @@ class ChunkedBackupService
     protected bool $encryption = false;
     protected bool $verification = false;
     protected ?string $lastError = null;
+    protected ?string $tag = null;
     protected $outputCallback = null;
 
     public function __construct(
@@ -75,6 +76,11 @@ class ChunkedBackupService
     public function setVerification(bool $verification): void
     {
         $this->verification = $verification;
+    }
+
+    public function setTag(?string $tag): void
+    {
+        $this->tag = $tag;
     }
 
     public function setOutputCallback(callable $callback): void
@@ -136,6 +142,7 @@ class ChunkedBackupService
             $backupLog = BackupLog::create([
                 'started_at' => now(),
                 'status' => 'running',
+                'tag' => $this->tag,
                 'metadata' => ['backup_id' => $this->backupId, 'chunked' => true],
             ]);
             $backupLogPersisted = true;

@@ -35,6 +35,7 @@ class BackupService
     protected bool $backupLogPersisted = false;
     protected ?string $lastRemotePath = null;
     protected ?int $lastFileSize = null;
+    protected ?string $tag = null;
 
     public function __construct(
         Application $app,
@@ -74,6 +75,11 @@ class BackupService
     public function setVerification(bool $verification): void
     {
         $this->verification = $verification;
+    }
+
+    public function setTag(?string $tag): void
+    {
+        $this->tag = $tag;
     }
 
     public function setOutputCallback(callable $callback): void
@@ -138,6 +144,7 @@ class BackupService
             $backupLog = BackupLog::create([
                 'started_at' => now(),
                 'status' => 'running',
+                'tag' => $this->tag,
             ]);
             $this->backupLogPersisted = true;
         } catch (\Throwable $e) {
