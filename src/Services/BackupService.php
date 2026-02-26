@@ -36,6 +36,7 @@ class BackupService
     protected ?string $lastRemotePath = null;
     protected ?int $lastFileSize = null;
     protected ?string $tag = null;
+    protected MetricsCollector $metricsCollector;
 
     public function __construct(
         Application $app,
@@ -49,6 +50,7 @@ class BackupService
         $this->notificationManager = $notificationManager ?? new NotificationManager();
         $this->databaseDumper = $databaseDumper ?? new DatabaseDumper();
         $this->manifestBuilder = $manifestBuilder ?? new ManifestBuilder();
+        $this->metricsCollector = new MetricsCollector();
         $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
@@ -156,8 +158,11 @@ class BackupService
             $this->backupLogPersisted = false;
         }
 
+        $this->metricsCollector = new MetricsCollector();
+        $this->metricsCollector->start();
+
         try {
-            $this->log('📦 Creating backup archive...');
+            $this->log('Creating backup archive...');
             $localBackupPath = $this->createBackup();
             $context->localArchivePath = $localBackupPath;
             
@@ -189,7 +194,10 @@ class BackupService
                 }
             }
 
-            // Clean up local file if not using local disk
+            if ($this->backupLogPersisted) {
+                $this->metricsCollector->persist($backupLog);
+            }
+
             if (config('capsule.default_disk') !== 'local') {
                 $this->log('🧹 Cleaning up local backup file...');
                 unlink($localBackupPath);
@@ -347,6 +355,7 @@ class BackupService
             $zip->addFile($dumpPath, $entryName);
             $this->applyCompressionAndEncryption($zip, $entryName);
             $this->manifestBuilder->addEntry($entryName, $dumpPath);
+            $this->metricsCollector->addDatabaseDump($dumpSize);
             $tempFiles[] = $dumpPath;
         }
 
@@ -414,6 +423,7 @@ class BackupService
                 $zip->addFile($path, $relative);
                 $this->applyCompressionAndEncryption($zip, $relative);
                 $this->manifestBuilder->addEntry($relative, $path);
+                $this->metricsCollector->addFile($path, $fileSize);
             }
         }
     }
@@ -450,15 +460,17 @@ class BackupService
 
             if ($file->isDir()) {
                 $zip->addEmptyDir($relativePath);
+                $this->metricsCollector->addDirectory();
             } else {
                 // Add file with immediate compression to reduce memory usage
                 $zip->addFile($filePath, $relativePath);
                 $this->applyCompressionAndEncryption($zip, $relativePath);
                 $this->manifestBuilder->addEntry($relativePath, $filePath);
-                
+
                 $fileSize = $file->getSize();
                 $totalSize += $fileSize;
                 $fileCount++;
+                $this->metricsCollector->addFile($filePath, $fileSize);
                 
                 // Show progress every 100 files to avoid spam
                 if ($fileCount % 100 === 0) {

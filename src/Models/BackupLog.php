@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class BackupLog extends Model
 {
@@ -87,5 +88,10 @@ class BackupLog extends Model
     public function isRunning(): bool
     {
         return $this->status === 'running';
+    }
+
+    public function metric(): HasOne
+    {
+        return $this->hasOne(BackupMetric::class);
     }
 }

@@ -2,6 +2,7 @@
 
 namespace Dgtlss\Capsule;
 
+use Dgtlss\Capsule\Commands\AdvisorCommand;
 use Dgtlss\Capsule\Commands\BackupCommand;
 use Dgtlss\Capsule\Commands\CleanupCommand;
 use Dgtlss\Capsule\Commands\DiagnoseCommand;
@@ -64,6 +65,7 @@ class CapsuleServiceProvider extends ServiceProvider
 
         if ($this->app->runningInConsole()) {
             $this->commands([
+                AdvisorCommand::class,
                 BackupCommand::class,
                 CleanupCommand::class,
                 DiagnoseCommand::class,
