@@ -178,20 +178,16 @@ class CleanupCommand extends Command
                 ->where('created_at', '<', now()->subDays($retentionDays))
                 ->get();
         } else {
-            // Get IDs of backups to keep (latest N successful backups)
             $keepIds = BackupLog::where('status', 'success')
                 ->orderBy('created_at', 'desc')
                 ->limit($retentionCount)
                 ->pluck('id')
                 ->toArray();
 
-            // Delete old backups by date OR those not in the latest N
             $oldBackups = BackupLog::where('status', 'success')
-                ->where(function ($query) use ($retentionDays, $keepIds) {
-                    $query->where('created_at', '<', now()->subDays($retentionDays))
-                        ->when(!empty($keepIds), function ($q) use ($keepIds) {
-                            $q->orWhereNotIn('id', $keepIds);
-                        });
+                ->where('created_at', '<', now()->subDays($retentionDays))
+                ->when(!empty($keepIds), function ($q) use ($keepIds) {
+                    $q->whereNotIn('id', $keepIds);
                 })
                 ->get();
         }

@@ -1044,22 +1044,18 @@ class BackupService
         $retentionDays = config('capsule.retention.days', 30);
         $retentionCount = config('capsule.retention.count', 10);
 
-        // Get IDs of backups to keep (latest N successful backups)
         $keepIds = BackupLog::where('status', 'success')
             ->orderBy('created_at', 'desc')
             ->limit($retentionCount)
             ->pluck('id')
             ->toArray();
 
-        // Delete old backups by date OR those not in the latest N
         BackupLog::where('status', 'success')
-            ->where(function ($query) use ($retentionDays, $keepIds) {
-                $query->where('created_at', '<', now()->subDays($retentionDays))
-                    ->when(!empty($keepIds), function ($q) use ($keepIds) {
-                        $q->orWhereNotIn('id', $keepIds);
-                    });
+            ->where('created_at', '<', now()->subDays($retentionDays))
+            ->when(!empty($keepIds), function ($q) use ($keepIds) {
+                $q->whereNotIn('id', $keepIds);
             })
-            ->each(function (BackupLog $backup) {
+            ->eachById(function (BackupLog $backup) {
                 if ($backup->file_path) {
                     $fileName = basename($backup->file_path);
                     $this->storageManager->delete($fileName);
