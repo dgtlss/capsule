@@ -2,10 +2,13 @@
 
 namespace Dgtlss\Capsule\Services;
 
+use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Support\BackupContext;
+use Dgtlss\Capsule\Support\Helpers;
+use Dgtlss\Capsule\Support\ManifestBuilder;
 use Dgtlss\Capsule\Contracts\FileFilterInterface;
 use Dgtlss\Capsule\Contracts\StepInterface;
 use Dgtlss\Capsule\Events\{BackupStarting, DatabaseDumpStarting, DatabaseDumpCompleted, FilesCollectStarting, FilesCollectCompleted, ArchiveFinalizing, BackupUploaded, BackupSucceeded, BackupFailed};
@@ -20,6 +23,8 @@ class BackupService
     protected Application $app;
     protected StorageManager $storageManager;
     protected NotificationManager $notificationManager;
+    protected DatabaseDumper $databaseDumper;
+    protected ManifestBuilder $manifestBuilder;
     protected bool $verbose = false;
     protected bool $parallel = false;
     protected int $compressionLevel = 1;
@@ -30,14 +35,19 @@ class BackupService
     protected bool $backupLogPersisted = false;
     protected ?string $lastRemotePath = null;
     protected ?int $lastFileSize = null;
-    /** @var array<int, array<string, mixed>> */
-    protected array $manifestEntries = [];
 
-    public function __construct(Application $app)
-    {
+    public function __construct(
+        Application $app,
+        StorageManager $storageManager = null,
+        NotificationManager $notificationManager = null,
+        DatabaseDumper $databaseDumper = null,
+        ManifestBuilder $manifestBuilder = null,
+    ) {
         $this->app = $app;
-        $this->storageManager = new StorageManager();
-        $this->notificationManager = new NotificationManager();
+        $this->storageManager = $storageManager ?? new StorageManager();
+        $this->notificationManager = $notificationManager ?? new NotificationManager();
+        $this->databaseDumper = $databaseDumper ?? new DatabaseDumper();
+        $this->manifestBuilder = $manifestBuilder ?? new ManifestBuilder();
         $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
@@ -152,7 +162,7 @@ class BackupService
                 $this->verifyBackup($localBackupPath);
             }
 
-            $this->log("📤 Uploading backup to storage ({$this->formatBytes($fileSize)})...");
+            $this->log("Uploading backup to storage (" . Helpers::formatBytes($fileSize) . ")...");
             $remotePath = $this->storageManager->store($localBackupPath);
             $context->remotePath = $remotePath;
             $this->lastRemotePath = $remotePath;
@@ -215,31 +225,22 @@ class BackupService
         }
     }
 
-    /**
-     * Attempt to open PDO for all configured DB connections that should be backed up.
-     * Returns an array of failures: [ ['connection' => name, 'error' => message], ... ]
-     */
     protected function probeDatabaseConnections(): array
     {
-        $connections = config('capsule.database.connections');
-        if ($connections === null) {
-            $connections = [config('database.default')];
-        } else {
-            $connections = is_string($connections) ? [$connections] : $connections;
-        }
-
+        $connections = $this->databaseDumper->resolveConnections();
         $failures = [];
+
         foreach ($connections as $connection) {
-            $resolved = $connection === 'default' ? config('database.default') : $connection;
             try {
-                \DB::connection($resolved)->getPdo();
+                \DB::connection($connection)->getPdo();
             } catch (\Throwable $e) {
                 $failures[] = [
-                    'connection' => $resolved,
+                    'connection' => $connection,
                     'error' => $e->getMessage(),
                 ];
             }
         }
+
         return $failures;
     }
 
@@ -277,9 +278,9 @@ class BackupService
             event(new FilesCollectCompleted(new BackupContext('normal')));
         }
 
-        // Add manifest before closing
-        $this->log('🧾 Writing manifest...');
-        $manifest = $this->buildManifest(false);
+        $this->log('Writing manifest...');
+        $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
+        $manifest = $this->manifestBuilder->build(false, $this->compressionLevel, $encryptionEnabled);
         $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         $zip->addFromString('manifest.json', $manifestJson);
         $this->applyCompressionAndEncryption($zip, 'manifest.json');
@@ -313,22 +314,15 @@ class BackupService
 
     protected function addDatabaseToBackup(ZipArchive $zip, string $timestamp): array
     {
-        $connections = config('capsule.database.connections');
-        
-        // Auto-detect current database if not specified
-        if ($connections === null) {
-            $connections = [config('database.default')];
-        } else {
-            $connections = is_string($connections) ? [$connections] : $connections;
-        }
+        $connections = $this->databaseDumper->resolveConnections();
 
-        $this->log("   📊 Processing " . count($connections) . " database connection(s)...");
-        
+        $this->log("   Processing " . count($connections) . " database connection(s)...");
+
         if ($this->parallel && count($connections) > 1) {
             return $this->addDatabasesParallel($zip, $connections, $timestamp);
-        } else {
-            return $this->addDatabasesSequential($zip, $connections, $timestamp);
         }
+
+        return $this->addDatabasesSequential($zip, $connections, $timestamp);
     }
 
     protected function addDatabasesSequential(ZipArchive $zip, array $connections, string $timestamp): array
@@ -336,17 +330,16 @@ class BackupService
         $tempFiles = [];
 
         foreach ($connections as $connection) {
-            // Resolve 'default' to the actual default connection name
-            $resolvedConnection = $connection === 'default' ? config('database.default') : $connection;
-            $this->log("   🔗 Dumping database: {$resolvedConnection}");
-            
-            $dumpPath = $this->createDatabaseDump($resolvedConnection, $timestamp);
+            $this->log("   Dumping database: {$connection}");
+            $dumpPath = storage_path("app/backups/db_{$connection}_{$timestamp}.sql");
+            $this->databaseDumper->dump($connection, $dumpPath);
+
             $dumpSize = filesize($dumpPath);
-            $entryName = "database/{$resolvedConnection}.sql";
-            $this->log("   💾 Adding {$entryName} ({$this->formatBytes($dumpSize)}) to archive");
+            $entryName = "database/{$connection}.sql";
+            $this->log("   Adding {$entryName} (" . Helpers::formatBytes($dumpSize) . ") to archive");
             $zip->addFile($dumpPath, $entryName);
             $this->applyCompressionAndEncryption($zip, $entryName);
-            $this->appendManifestEntry($entryName, $dumpPath);
+            $this->manifestBuilder->addEntry($entryName, $dumpPath);
             $tempFiles[] = $dumpPath;
         }
 
@@ -355,443 +348,40 @@ class BackupService
 
     protected function addDatabasesParallel(ZipArchive $zip, array $connections, string $timestamp): array
     {
-        $this->log("   🚀 Using parallel processing for database dumps");
+        $this->log("   Using parallel processing for database dumps");
         $tempFiles = [];
         $processes = [];
 
-        // Start all database dumps in parallel
         foreach ($connections as $connection) {
-            $resolvedConnection = $connection === 'default' ? config('database.default') : $connection;
-            $this->log("   🔗 Starting parallel dump: {$resolvedConnection}");
-            
-            $dumpPath = storage_path("app/backups/db_{$resolvedConnection}_{$timestamp}.sql");
+            $this->log("   Starting parallel dump: {$connection}");
+            $dumpPath = storage_path("app/backups/db_{$connection}_{$timestamp}.sql");
             $tempFiles[] = $dumpPath;
-            
-            // Start the dump process in background
-            $process = $this->startDatabaseDumpProcess($resolvedConnection, $dumpPath);
-            $processes[$resolvedConnection] = ['process' => $process, 'path' => $dumpPath];
+
+            $process = $this->databaseDumper->startDumpProcess($connection, $dumpPath);
+            $processes[$connection] = ['process' => $process, 'path' => $dumpPath];
         }
 
-        // Wait for all processes to complete and add to ZIP
         foreach ($processes as $connectionName => $processInfo) {
-            $this->log("   ⏳ Waiting for {$connectionName} dump to complete...");
+            if ($processInfo['process'] === null) {
+                continue; // SQLite -- already done synchronously
+            }
+
+            $this->log("   Waiting for {$connectionName} dump to complete...");
             $returnCode = proc_close($processInfo['process']);
-            
+
             if ($returnCode !== 0) {
                 throw new Exception("Parallel database dump failed for connection: {$connectionName}");
             }
 
             $dumpSize = filesize($processInfo['path']);
             $entryName = "database/{$connectionName}.sql";
-            $this->log("   💾 Adding {$entryName} ({$this->formatBytes($dumpSize)}) to archive");
+            $this->log("   Adding {$entryName} (" . Helpers::formatBytes($dumpSize) . ") to archive");
             $zip->addFile($processInfo['path'], $entryName);
             $this->applyCompressionAndEncryption($zip, $entryName);
-            $this->appendManifestEntry($entryName, $processInfo['path']);
+            $this->manifestBuilder->addEntry($entryName, $processInfo['path']);
         }
 
         return $tempFiles;
-    }
-
-    protected function startDatabaseDumpProcess(string $connection, string $dumpPath)
-    {
-        $config = config("database.connections.{$connection}");
-        $driver = $config['driver'];
-        
-        switch ($driver) {
-            case 'mysql':
-            case 'mariadb':
-                return $this->startMysqlDumpProcess($config, $dumpPath);
-            case 'pgsql':
-                return $this->startPostgresDumpProcess($config, $dumpPath);
-            case 'sqlite':
-                // SQLite is just a file copy, do it synchronously
-                copy($config['database'], $dumpPath);
-                return null;
-            default:
-                throw new Exception("Unsupported database driver for parallel processing: {$driver}");
-        }
-    }
-
-    protected function startMysqlDumpProcess(array $config, string $dumpPath)
-    {
-        $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
-            return '"' . $value . '"';
-        };
-        
-        // Determine which dump command to use
-        $dumpCommand = $this->getMysqlDumpCommand();
-        
-        $configContent = sprintf(
-            "[%s]\nuser=%s\npassword=%s\n",
-            $dumpCommand,
-            $escape($config['username'] ?? ''),
-            $escape($config['password'] ?? '')
-        );
-        if (!empty($config['unix_socket'])) {
-            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
-        } else {
-            $configContent .= sprintf(
-                "host=%s\nport=%s\n",
-                $escape($config['host'] ?? 'localhost'),
-                $escape($config['port'] ?? 3306)
-            );
-        }
-
-        // Optional SSL configuration
-        $sslMode = config("database.connections." . ($config['name'] ?? 'mysql') . ".sslmode") ?? env('DB_SSL_MODE');
-        $sslCa = env('MYSQL_ATTR_SSL_CA');
-        $sslCert = env('MYSQL_ATTR_SSL_CERT');
-        $sslKey = env('MYSQL_ATTR_SSL_KEY');
-        if (!empty($sslMode)) {
-            $configContent .= 'ssl-mode=' . $escape($sslMode) . "\n";
-        }
-        if (!empty($sslCa)) {
-            $configContent .= 'ssl-ca=' . $escape($sslCa) . "\n";
-        }
-        if (!empty($sslCert)) {
-            $configContent .= 'ssl-cert=' . $escape($sslCert) . "\n";
-        }
-        if (!empty($sslKey)) {
-            $configContent .= 'ssl-key=' . $escape($sslKey) . "\n";
-        }
-        
-        file_put_contents($configFile, $configContent);
-        chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
-
-        $includeTriggers = (bool) (config('capsule.database.include_triggers', true));
-        $includeRoutines = (bool) (config('capsule.database.include_routines', false));
-        $safeFlags = ['--single-transaction', '--hex-blob'];
-        if ($includeTriggers) {
-            $safeFlags[] = '--triggers';
-        } else {
-            $safeFlags[] = '--skip-triggers';
-        }
-        if ($includeRoutines) {
-            $safeFlags[] = '--routines';
-        }
-        $extraFlags = trim((string) (config('capsule.database.mysqldump_flags') ?? env('CAPSULE_MYSQLDUMP_FLAGS', '')));
-        $allFlags = trim(implode(' ', $safeFlags) . ' ' . $extraFlags);
-        $command = sprintf(
-            '%s --defaults-extra-file=%s %s %s > %s 2>&1; rm %s',
-            $dumpCommand,
-            escapeshellarg($configFile),
-            $allFlags,
-            escapeshellarg($config['database']),
-            escapeshellarg($dumpPath),
-            escapeshellarg($configFile)
-        );
-
-        return proc_open($command, [], $pipes);
-    }
-
-    protected function startPostgresDumpProcess(array $config, string $dumpPath)
-    {
-        $pgpassFile = tempnam(sys_get_temp_dir(), 'pgpass_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            // Escape backslashes and colons for .pgpass format
-            return str_replace(['\\', ':'], ['\\\\', '\\:'], $value);
-        };
-        $pgpassContent = sprintf(
-            "%s:%s:%s:%s:%s\n",
-            $escape($config['host']),
-            $escape($config['port'] ?? 5432),
-            $escape($config['database']),
-            $escape($config['username']),
-            $escape($config['password'])
-        );
-        
-        file_put_contents($pgpassFile, $pgpassContent);
-        chmod($pgpassFile, config('capsule.security.temp_file_permissions', 0600));
-
-        $command = sprintf(
-            'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s > %s 2>&1; rm %s',
-            escapeshellarg($pgpassFile),
-            escapeshellarg($config['host']),
-            escapeshellarg($config['port'] ?? 5432),
-            escapeshellarg($config['username']),
-            escapeshellarg($config['database']),
-            escapeshellarg($dumpPath),
-            escapeshellarg($pgpassFile)
-        );
-
-        return proc_open($command, [], $pipes);
-    }
-
-    protected function createDatabaseDump(string $connection, string $timestamp): string
-    {
-        $config = config("database.connections.{$connection}");
-        $driver = $config['driver'];
-        
-        $dumpPath = storage_path("app/backups/db_{$connection}_{$timestamp}.sql");
-
-        switch ($driver) {
-            case 'mysql':
-            case 'mariadb':
-                $this->createMysqlDump($config, $dumpPath);
-                break;
-            case 'pgsql':
-                $this->createPostgresDump($config, $dumpPath);
-                break;
-            case 'sqlite':
-                $this->createSqliteDump($config, $dumpPath);
-                break;
-            default:
-                throw new Exception("Unsupported database driver: {$driver}");
-        }
-
-        return $dumpPath;
-    }
-
-    protected function createMysqlDump(array $config, string $dumpPath): void
-    {
-        // Create temporary MySQL config file for secure password handling
-        $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
-            return '"' . $value . '"';
-        };
-        
-        // Determine which dump command to use
-        $dumpCommand = $this->getMysqlDumpCommand();
-        
-        $configContent = sprintf(
-            "[%s]\nuser=%s\npassword=%s\n",
-            $dumpCommand,
-            $escape($config['username'] ?? ''),
-            $escape($config['password'] ?? '')
-        );
-        if (!empty($config['unix_socket'])) {
-            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
-        } else {
-            $configContent .= sprintf(
-                "host=%s\nport=%s\n",
-                $escape($config['host'] ?? 'localhost'),
-                $escape($config['port'] ?? 3306)
-            );
-        }
-
-        // Optional SSL configuration
-        $sslMode = config("database.connections." . ($config['name'] ?? 'mysql') . ".sslmode") ?? env('DB_SSL_MODE');
-        $sslCa = env('MYSQL_ATTR_SSL_CA');
-        $sslCert = env('MYSQL_ATTR_SSL_CERT');
-        $sslKey = env('MYSQL_ATTR_SSL_KEY');
-        if (!empty($sslMode)) {
-            $configContent .= 'ssl-mode=' . $escape($sslMode) . "\n";
-        }
-        if (!empty($sslCa)) {
-            $configContent .= 'ssl-ca=' . $escape($sslCa) . "\n";
-        }
-        if (!empty($sslCert)) {
-            $configContent .= 'ssl-cert=' . $escape($sslCert) . "\n";
-        }
-        if (!empty($sslKey)) {
-            $configContent .= 'ssl-key=' . $escape($sslKey) . "\n";
-        }
-        
-        file_put_contents($configFile, $configContent);
-        chmod($configFile, config('capsule.security.temp_file_permissions', 0600));
-
-        try {
-            $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
-            $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
-
-            $includeTriggers = (bool) (config('capsule.database.include_triggers', true));
-            $includeRoutines = (bool) (config('capsule.database.include_routines', false));
-            $safeParts = ['--single-transaction', '--hex-blob'];
-            $safeParts[] = $includeTriggers ? '--triggers' : '--skip-triggers';
-            if ($includeRoutines) {
-                $safeParts[] = '--routines';
-            }
-            $safeFlags = implode(' ', $safeParts);
-            $extraFlags = trim((string) (config('capsule.database.mysqldump_flags') ?? env('CAPSULE_MYSQLDUMP_FLAGS', '')));
-
-            $dbName = $config['database'];
-            $ignoreFlags = '';
-            if (empty($includeTables) && !empty($excludeTables)) {
-                foreach ($excludeTables as $table) {
-                    $ignoreFlags .= ' --ignore-table=' . escapeshellarg($dbName . '.' . $table);
-                }
-            }
-
-            if (!empty($includeTables)) {
-                $tables = implode(' ', array_map('escapeshellarg', $includeTables));
-                $command = sprintf(
-                    '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
-                    $dumpCommand,
-                    escapeshellarg($configFile),
-                    $safeFlags,
-                    $extraFlags,
-                    escapeshellarg($dbName),
-                    $tables,
-                    escapeshellarg($dumpPath)
-                );
-            } else {
-                $command = sprintf(
-                    '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
-                    $dumpCommand,
-                    escapeshellarg($configFile),
-                    $safeFlags,
-                    $extraFlags,
-                    $ignoreFlags,
-                    escapeshellarg($dbName),
-                    escapeshellarg($dumpPath)
-                );
-            }
-
-            $output = [];
-            $returnCode = 0;
-            exec($command, $output, $returnCode);
-
-            if ($returnCode !== 0) {
-                $outputText = trim(implode("\n", $output));
-                // Automatic fallback: retry without routines/triggers if enabled
-                $retried = false;
-                if ($includeRoutines || $includeTriggers) {
-                    $safeParts = ['--single-transaction', '--hex-blob', '--skip-triggers'];
-                    // Do NOT include routines in fallback
-                    $fallbackFlags = implode(' ', $safeParts);
-                    if (!empty($includeTables)) {
-                        $tables = implode(' ', array_map('escapeshellarg', $includeTables));
-                        $retryCommand = sprintf(
-                            '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
-                            $dumpCommand,
-                            escapeshellarg($configFile),
-                            $fallbackFlags,
-                            $extraFlags,
-                            escapeshellarg($dbName),
-                            $tables,
-                            escapeshellarg($dumpPath)
-                        );
-                    } else {
-                        $retryCommand = sprintf(
-                            '%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1',
-                            $dumpCommand,
-                            escapeshellarg($configFile),
-                            $fallbackFlags,
-                            $extraFlags,
-                            $ignoreFlags,
-                            escapeshellarg($dbName),
-                            escapeshellarg($dumpPath)
-                        );
-                    }
-                    $retryOutput = [];
-                    $retryCode = 0;
-                    exec($retryCommand, $retryOutput, $retryCode);
-                    if ($retryCode === 0) {
-                        \Log::warning('MySQL dump succeeded after disabling routines/triggers', [
-                            'database' => $config['database'] ?? null,
-                        ]);
-                        $retried = true;
-                    } else {
-                        $outputText .= "\n[Retry output]\n" . trim(implode("\n", $retryOutput));
-                        $returnCode = $retryCode;
-                    }
-                }
-
-                if (!$retried) {
-                    $this->lastError = "MySQL dump failed with return code: {$returnCode}" . (!empty($outputText) ? "\nCommand output:\n{$outputText}" : '');
-                    \Log::error('MySQL dump failed', [
-                        'code' => $returnCode,
-                        'output' => $outputText,
-                        'database' => $config['database'] ?? null,
-                    ]);
-                    throw new Exception($this->lastError);
-                }
-            }
-        } finally {
-            // Always clean up the temporary config file
-            if (file_exists($configFile)) {
-                unlink($configFile);
-            }
-        }
-    }
-
-    protected function createPostgresDump(array $config, string $dumpPath): void
-    {
-        // Create temporary .pgpass file for secure password handling
-        $pgpassFile = tempnam(sys_get_temp_dir(), 'pgpass_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            // Escape backslashes and colons for .pgpass format
-            return str_replace(['\\', ':'], ['\\\\', '\\:'], $value);
-        };
-        $pgpassContent = sprintf(
-            "%s:%s:%s:%s:%s\n",
-            $escape($config['host']),
-            $escape($config['port'] ?? 5432),
-            $escape($config['database']),
-            $escape($config['username']),
-            $escape($config['password'])
-        );
-        
-        file_put_contents($pgpassFile, $pgpassContent);
-        chmod($pgpassFile, config('capsule.security.temp_file_permissions', 0600));
-
-        try {
-            $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
-            $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
-
-            $safeFlags = '--no-owner --no-privileges --format=plain';
-
-            $tableFlags = '';
-            if (!empty($includeTables)) {
-                foreach ($includeTables as $table) {
-                    $tableFlags .= ' -t ' . escapeshellarg($table);
-                }
-            } elseif (!empty($excludeTables)) {
-                foreach ($excludeTables as $table) {
-                    $tableFlags .= ' --exclude-table=' . escapeshellarg($table);
-                }
-            }
-
-            $command = sprintf(
-                'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s %s %s > %s 2>&1',
-                escapeshellarg($pgpassFile),
-                escapeshellarg($config['host']),
-                escapeshellarg($config['port'] ?? 5432),
-                escapeshellarg($config['username']),
-                escapeshellarg($config['database']),
-                $safeFlags,
-                $tableFlags,
-                escapeshellarg($dumpPath)
-            );
-
-            exec($command, $output, $returnCode);
-
-            if ($returnCode !== 0) {
-                $this->lastError = "PostgreSQL dump failed with return code: {$returnCode}";
-                if ($this->verbose && !empty($output)) {
-                    $this->lastError .= "\nCommand output: " . implode("\n", $output);
-                }
-                throw new Exception($this->lastError);
-            }
-        } finally {
-            // Always clean up the temporary pgpass file
-            if (file_exists($pgpassFile)) {
-                unlink($pgpassFile);
-            }
-        }
-    }
-
-    protected function createSqliteDump(array $config, string $dumpPath): void
-    {
-        if (!file_exists($config['database'])) {
-            $this->lastError = "SQLite database file not found: {$config['database']}";
-            throw new Exception($this->lastError);
-        }
-
-        if (!copy($config['database'], $dumpPath)) {
-            $this->lastError = "Failed to copy SQLite database from {$config['database']} to {$dumpPath}";
-            if ($this->verbose) {
-                $this->lastError .= "\nCheck file permissions and disk space.";
-            }
-            throw new Exception($this->lastError);
-        }
     }
 
     protected function addFilesToBackup(ZipArchive $zip): void
@@ -813,10 +403,10 @@ class BackupService
                 if (!$this->passesFilters($path, $filters)) {
                     continue;
                 }
-                $this->log("   📄 Adding file: " . basename($path) . " ({$this->formatBytes($fileSize)})");
+                $this->log("   Adding file: " . basename($path) . " (" . Helpers::formatBytes($fileSize) . ")");
                 $zip->addFile($path, $relative);
                 $this->applyCompressionAndEncryption($zip, $relative);
-                $this->appendManifestEntry($relative, $path);
+                $this->manifestBuilder->addEntry($relative, $path);
             }
         }
     }
@@ -857,7 +447,7 @@ class BackupService
                 // Add file with immediate compression to reduce memory usage
                 $zip->addFile($filePath, $relativePath);
                 $this->applyCompressionAndEncryption($zip, $relativePath);
-                $this->appendManifestEntry($relativePath, $filePath);
+                $this->manifestBuilder->addEntry($relativePath, $filePath);
                 
                 $fileSize = $file->getSize();
                 $totalSize += $fileSize;
@@ -865,13 +455,13 @@ class BackupService
                 
                 // Show progress every 100 files to avoid spam
                 if ($fileCount % 100 === 0) {
-                    $this->log("   📊 Added {$fileCount} files ({$this->formatBytes($totalSize)})...");
+                    $this->log("   Added {$fileCount} files (" . Helpers::formatBytes($totalSize) . ")...");
                 }
             }
         }
         
         if ($fileCount > 0) {
-            $this->log("   ✅ Completed: {$fileCount} files ({$this->formatBytes($totalSize)}) from " . basename($dir));
+            $this->log("   Completed: {$fileCount} files (" . Helpers::formatBytes($totalSize) . ") from " . basename($dir));
         }
     }
 
@@ -943,59 +533,6 @@ class BackupService
         }
     }
 
-    protected function appendManifestEntry(string $zipPath, string $sourceFilePath): void
-    {
-        $size = @filesize($sourceFilePath) ?: 0;
-        $hash = @hash_file('sha256', $sourceFilePath) ?: '';
-        $this->manifestEntries[] = [
-            'path' => $zipPath,
-            'size' => $size,
-            'sha256' => $hash,
-        ];
-    }
-
-    protected function buildManifest(bool $isChunked): array
-    {
-        $now = now()->toISOString();
-        $appName = config('app.name');
-        $appEnv = app()->environment();
-        $laravelVersion = app()->version();
-        $disk = config('capsule.default_disk');
-        $backupPath = config('capsule.backup_path');
-        $dbConns = config('capsule.database.connections');
-        $dbConns = $dbConns === null ? [config('database.default')] : (is_string($dbConns) ? [$dbConns] : $dbConns);
-
-        return [
-            'schema_version' => 1,
-            'generated_at' => $now,
-            'app' => [
-                'name' => $appName,
-                'env' => $appEnv,
-                'laravel_version' => $laravelVersion,
-                'host' => gethostname() ?: null,
-            ],
-            'capsule' => [
-                'version' => null,
-                'chunked' => $isChunked,
-                'compression_level' => $this->compressionLevel,
-                'encryption_enabled' => $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
-            ],
-            'storage' => [
-                'disk' => $disk,
-                'backup_path' => $backupPath,
-            ],
-            'database' => [
-                'connections' => $dbConns,
-                'include_tables' => (array) (config('capsule.database.include_tables', []) ?? []),
-                'exclude_tables' => (array) (config('capsule.database.exclude_tables', []) ?? []),
-            ],
-            'files' => [
-                'paths' => (array) config('capsule.files.paths', []),
-                'exclude_paths' => (array) config('capsule.files.exclude_paths', []),
-            ],
-            'entries' => $this->manifestEntries,
-        ];
-    }
 
     protected function shouldExcludePath(string $path, array $excludePaths): bool
     {
@@ -1026,14 +563,6 @@ class BackupService
         return false;
     }
 
-    protected function formatBytes(int $bytes): string
-    {
-        if ($bytes === 0) return '0 B';
-        
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $power = floor(log($bytes, 1024));
-        return round($bytes / (1024 ** $power), 2) . ' ' . $units[$power];
-    }
 
     protected function cleanup(): void
     {
@@ -1116,13 +645,12 @@ class BackupService
                 switch ($driver) {
                     case 'mysql':
                     case 'mariadb':
-                        // Check if either mysqldump or mariadb-dump is available
-                        if (!$this->commandExists('mysqldump') && !$this->commandExists('mariadb-dump')) {
+                        if (!Helpers::commandExists('mysqldump') && !Helpers::commandExists('mariadb-dump')) {
                             throw new Exception('Neither mysqldump nor mariadb-dump command found. Install MySQL or MariaDB client tools.');
                         }
                         break;
                     case 'pgsql':
-                        if (!$this->commandExists('pg_dump')) {
+                        if (!Helpers::commandExists('pg_dump')) {
                             throw new Exception('pg_dump command not found. Install PostgreSQL client tools.');
                         }
                         break;
@@ -1148,12 +676,6 @@ class BackupService
                 }
             }
         }
-    }
-
-    protected function commandExists(string $command): bool
-    {
-        $result = shell_exec("which {$command}");
-        return !empty($result);
     }
 
     protected function verifyBackup(string $backupPath): void
@@ -1186,41 +708,6 @@ class BackupService
 
         $verifyTime = round(microtime(true) - $startTime, 2);
         $this->log("   ✅ Backup verified: {$numFiles} files, integrity check passed ({$verifyTime}s)");
-    }
-
-    /**
-     * Determine the appropriate MySQL/MariaDB dump command to use.
-     * Tries mysqldump first, then falls back to mariadb-dump.
-     * 
-     * @return string The dump command to use
-     * @throws Exception If neither command is available
-     */
-    protected function getMysqlDumpCommand(): string
-    {
-        // Try mysqldump first (preferred for compatibility)
-        if ($this->commandExists('mysqldump')) {
-            $this->log('Using mysqldump command');
-            return 'mysqldump';
-        }
-        
-        // Fall back to mariadb-dump for newer MariaDB versions
-        if ($this->commandExists('mariadb-dump')) {
-            $this->log('mysqldump not found, using mariadb-dump command');
-            return 'mariadb-dump';
-        }
-        
-        // Neither command is available
-        $errorMessage = 'Neither mysqldump nor mariadb-dump command found. Please install MySQL or MariaDB client tools.';
-        
-        // Send notification if enabled
-        if (config('capsule.notifications.enabled', false)) {
-            $this->notificationManager->sendFailureNotification(
-                null, 
-                new Exception($errorMessage)
-            );
-        }
-        
-        throw new Exception($errorMessage);
     }
 
 }

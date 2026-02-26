@@ -9,8 +9,12 @@ use Dgtlss\Capsule\Commands\VerifyCommand;
 use Dgtlss\Capsule\Commands\ListCommand;
 use Dgtlss\Capsule\Commands\InspectCommand;
 use Dgtlss\Capsule\Commands\HealthCommand;
+use Dgtlss\Capsule\Database\DatabaseDumper;
+use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
+use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Support\ManifestBuilder;
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Console\Scheduling\Schedule;
 
@@ -20,12 +24,28 @@ class CapsuleServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/capsule.php', 'capsule');
 
+        $this->app->singleton(StorageManager::class);
+        $this->app->singleton(NotificationManager::class);
+        $this->app->singleton(DatabaseDumper::class);
+
         $this->app->singleton(BackupService::class, function ($app) {
-            return new BackupService($app);
+            return new BackupService(
+                $app,
+                $app->make(StorageManager::class),
+                $app->make(NotificationManager::class),
+                $app->make(DatabaseDumper::class),
+                new ManifestBuilder(),
+            );
         });
 
         $this->app->singleton(ChunkedBackupService::class, function ($app) {
-            return new ChunkedBackupService($app);
+            return new ChunkedBackupService(
+                $app,
+                $app->make(StorageManager::class),
+                $app->make(NotificationManager::class),
+                $app->make(DatabaseDumper::class),
+                new ManifestBuilder(),
+            );
         });
     }
 

@@ -2,9 +2,12 @@
 
 namespace Dgtlss\Capsule\Services;
 
+use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Support\Helpers;
+use Dgtlss\Capsule\Support\ManifestBuilder;
 use Dgtlss\Capsule\Support\MemoryMonitor;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Log;
@@ -16,9 +19,10 @@ class ChunkedBackupService
     protected Application $app;
     protected StorageManager $storageManager;
     protected NotificationManager $notificationManager;
+    protected DatabaseDumper $databaseDumper;
+    protected ManifestBuilder $manifestBuilder;
     protected array $chunks = [];
-    protected array $chunkMetadata = []; // Store minimal metadata for collation
-    protected array $manifestEntries = []; // Store manifest entries
+    protected array $chunkMetadata = [];
     protected string $backupId;
     protected bool $verbose = false;
     protected bool $parallel = false;
@@ -28,11 +32,18 @@ class ChunkedBackupService
     protected ?string $lastError = null;
     protected $outputCallback = null;
 
-    public function __construct(Application $app)
-    {
+    public function __construct(
+        Application $app,
+        StorageManager $storageManager = null,
+        NotificationManager $notificationManager = null,
+        DatabaseDumper $databaseDumper = null,
+        ManifestBuilder $manifestBuilder = null,
+    ) {
         $this->app = $app;
-        $this->storageManager = new StorageManager();
-        $this->notificationManager = new NotificationManager();
+        $this->storageManager = $storageManager ?? new StorageManager();
+        $this->notificationManager = $notificationManager ?? new NotificationManager();
+        $this->databaseDumper = $databaseDumper ?? new DatabaseDumper();
+        $this->manifestBuilder = $manifestBuilder ?? new ManifestBuilder();
         $this->backupId = uniqid('backup_', true);
         $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
@@ -166,14 +177,7 @@ class ChunkedBackupService
 
     protected function createChunkedDatabaseBackup(string $timestamp): void
     {
-        $connections = config('capsule.database.connections');
-        
-        // Auto-detect current database if not specified
-        if ($connections === null) {
-            $connections = [config('database.default')];
-        } else {
-            $connections = is_string($connections) ? [$connections] : $connections;
-        }
+        $connections = $this->databaseDumper->resolveConnections();
 
         foreach ($connections as $connection) {
             $this->log("Streaming database '{$connection}' to chunks...");
@@ -183,137 +187,18 @@ class ChunkedBackupService
 
     protected function streamDatabaseToChunks(string $connection, string $timestamp): void
     {
-        $config = config("database.connections.{$connection}");
-        $driver = $config['driver'];
-        
-        $chunkSize = config('capsule.chunked_backup.chunk_size', 10485760); // 10MB
+        $chunkSize = config('capsule.chunked_backup.chunk_size', 10485760);
         $tempPrefix = config('capsule.chunked_backup.temp_prefix', 'capsule_chunk_');
-        
-        switch ($driver) {
-            case 'mysql':
-            case 'mariadb':
-                $this->streamMysqlToChunks($config, $connection, $timestamp, $chunkSize, $tempPrefix);
-                break;
-            case 'pgsql':
-                $this->streamPostgresToChunks($config, $connection, $timestamp, $chunkSize, $tempPrefix);
-                break;
-            case 'sqlite':
-                $this->streamSqliteToChunks($config, $connection, $timestamp, $chunkSize, $tempPrefix);
-                break;
-            default:
-                throw new Exception("Unsupported database driver for chunked backup: {$driver}");
-        }
-    }
 
-    protected function streamMysqlToChunks(array $config, string $connection, string $timestamp, int $chunkSize, string $tempPrefix): void
-    {
-        // Create a temporary config file for secure password handling
-        $configFile = tempnam(sys_get_temp_dir(), 'mysql_config_');
-        $escape = function ($value) {
-            $value = (string) $value;
-            $value = str_replace(["\\", "\n", "\r", '"'], ["\\\\", "\\n", "\\r", '\\"'], $value);
-            return '"' . $value . '"';
-        };
-        
-        // Determine which dump command to use
-        $dumpCommand = $this->getMysqlDumpCommand();
-        
-        $configContent = sprintf(
-            "[%s]\nuser=%s\npassword=%s\n",
-            $dumpCommand,
-            $escape($config['username'] ?? ''),
-            $escape($config['password'] ?? '')
-        );
-        if (!empty($config['unix_socket'])) {
-            $configContent .= 'socket=' . $escape($config['unix_socket']) . "\n";
-        } else {
-            $configContent .= sprintf(
-                "host=%s\nport=%s\n",
-                $escape($config['host'] ?? 'localhost'),
-                $escape($config['port'] ?? 3306)
-            );
-        }
-        file_put_contents($configFile, $configContent);
-        chmod($configFile, 0600);
+        $streamInfo = $this->databaseDumper->buildStreamCommand($connection);
 
-        $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
-        $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
-
-        $safeFlags = '--single-transaction --routines --triggers --hex-blob';
-        $dbName = $config['database'];
-        $ignoreFlags = '';
-        if (empty($includeTables) && !empty($excludeTables)) {
-            foreach ($excludeTables as $table) {
-                $ignoreFlags .= ' --ignore-table=' . escapeshellarg($dbName . '.' . $table);
+        try {
+            $this->streamCommandToChunks($streamInfo['command'], "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
+        } finally {
+            if (!empty($streamInfo['cleanup']) && file_exists($streamInfo['cleanup'])) {
+                @unlink($streamInfo['cleanup']);
             }
         }
-
-        if (!empty($includeTables)) {
-            $tables = implode(' ', array_map('escapeshellarg', $includeTables));
-            $command = sprintf(
-                '%s --defaults-extra-file=%s %s %s %s',
-                $dumpCommand,
-                escapeshellarg($configFile),
-                $safeFlags,
-                escapeshellarg($dbName),
-                $tables
-            );
-        } else {
-            $command = sprintf(
-                '%s --defaults-extra-file=%s %s %s %s',
-                $dumpCommand,
-                escapeshellarg($configFile),
-                $safeFlags,
-                $ignoreFlags,
-                escapeshellarg($dbName)
-            );
-        }
-
-        $this->streamCommandToChunks($command, "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
-
-        // Clean up the temporary config file
-        @unlink($configFile);
-    }
-
-    protected function streamPostgresToChunks(array $config, string $connection, string $timestamp, int $chunkSize, string $tempPrefix): void
-    {
-        $includeTables = (array) (config('capsule.database.include_tables', []) ?? []);
-        $excludeTables = (array) (config('capsule.database.exclude_tables', []) ?? []);
-
-        $safeFlags = '--no-owner --no-privileges --format=plain --no-password';
-        $tableFlags = '';
-        if (!empty($includeTables)) {
-            foreach ($includeTables as $table) {
-                $tableFlags .= ' -t ' . escapeshellarg($table);
-            }
-        } elseif (!empty($excludeTables)) {
-            foreach ($excludeTables as $table) {
-                $tableFlags .= ' --exclude-table=' . escapeshellarg($table);
-            }
-        }
-
-        $command = sprintf(
-            'PGPASSWORD=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s %s %s',
-            escapeshellarg($config['password']),
-            escapeshellarg($config['host']),
-            escapeshellarg($config['port'] ?? 5432),
-            escapeshellarg($config['username']),
-            escapeshellarg($config['database']),
-            $safeFlags,
-            $tableFlags
-        );
-
-        $this->streamCommandToChunks($command, "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
-    }
-
-    protected function streamSqliteToChunks(array $config, string $connection, string $timestamp, int $chunkSize, string $tempPrefix): void
-    {
-        if (!file_exists($config['database'])) {
-            throw new Exception("SQLite database file not found: {$config['database']}");
-        }
-
-        $command = sprintf('cat %s', escapeshellarg($config['database']));
-        $this->streamCommandToChunks($command, "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
     }
 
     protected function streamCommandToChunks(string $command, string $baseName, int $chunkSize, string $tempPrefix): void
@@ -481,77 +366,12 @@ class ChunkedBackupService
         fclose($handle);
     }
 
-    protected function appendManifestEntry(string $zipPath, string $sourceFilePath): void
-    {
-        // For memory efficiency, we'll calculate hash and size during manifest building
-        // instead of storing all entries in memory
-        $this->manifestEntries[] = [
-            'path' => $zipPath,
-            'source_file' => $sourceFilePath,
-        ];
-    }
-
-    protected function buildManifest(bool $isChunked): array
-    {
-        $now = now()->toISOString();
-        $appName = config('app.name');
-        $appEnv = app()->environment();
-        $laravelVersion = app()->version();
-        $disk = config('capsule.default_disk');
-        $backupPath = config('capsule.backup_path');
-        $dbConns = config('capsule.database.connections');
-        $dbConns = $dbConns === null ? [config('database.default')] : (is_string($dbConns) ? [$dbConns] : $dbConns);
-
-        // Process manifest entries to calculate size and hash
-        $processedEntries = [];
-        foreach ($this->manifestEntries as $entry) {
-            $size = @filesize($entry['source_file']) ?: 0;
-            $hash = @hash_file('sha256', $entry['source_file']) ?: '';
-            $processedEntries[] = [
-                'path' => $entry['path'],
-                'size' => $size,
-                'sha256' => $hash,
-            ];
-        }
-
-        return [
-            'schema_version' => 1,
-            'generated_at' => $now,
-            'app' => [
-                'name' => $appName,
-                'env' => $appEnv,
-                'laravel_version' => $laravelVersion,
-                'host' => gethostname() ?: null,
-            ],
-            'capsule' => [
-                'version' => null,
-                'chunked' => $isChunked,
-                'compression_level' => $this->compressionLevel,
-                'encryption_enabled' => $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
-            ],
-            'storage' => [
-                'disk' => $disk,
-                'backup_path' => $backupPath,
-            ],
-            'database' => [
-                'connections' => $dbConns,
-                'include_tables' => (array) (config('capsule.database.include_tables', []) ?? []),
-                'exclude_tables' => (array) (config('capsule.database.exclude_tables', []) ?? []),
-            ],
-            'files' => [
-                'paths' => (array) config('capsule.files.paths', []),
-                'exclude_paths' => (array) config('capsule.files.exclude_paths', []),
-            ],
-            'entries' => $processedEntries,
-        ];
-    }
 
     protected function prepareFileForChunk(string $filePath, string $baseDir): string
     {
         $relativePath = substr($filePath, strlen($baseDir) + 1);
         
-        // Add to manifest without loading file content yet
-        $this->appendManifestEntry('files/' . $relativePath, $filePath);
+        $this->manifestBuilder->addDeferredEntry('files/' . $relativePath, $filePath);
         
         // Stream file content instead of loading all at once
         $fileHandle = fopen($filePath, 'r');
@@ -581,7 +401,7 @@ class ChunkedBackupService
     protected function streamLargeFileToChunks(string $filePath, string $baseDir, string $baseName, int $chunkSize, string $tempPrefix, int &$chunkIndex): void
     {
         $relativePath = substr($filePath, strlen($baseDir) + 1);
-        $this->appendManifestEntry('files/' . $relativePath, $filePath);
+        $this->manifestBuilder->addDeferredEntry('files/' . $relativePath, $filePath);
         
         $fileHandle = fopen($filePath, 'r');
         if (!$fileHandle) {
@@ -663,8 +483,8 @@ class ChunkedBackupService
         $timestamp = now()->format('Y-m-d_H-i-s');
         $finalBackupName = "backup_{$timestamp}.zip";
 
-        // Build manifest and upload it as a chunk
-        $manifest = $this->buildManifest(true);
+        $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
+        $manifest = $this->manifestBuilder->build(true, $this->compressionLevel, $encryptionEnabled);
         $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         
         // Upload manifest chunk directly
@@ -763,52 +583,4 @@ class ChunkedBackupService
         }
     }
 
-    /**
-     * Determine the appropriate MySQL/MariaDB dump command to use.
-     * Tries mysqldump first, then falls back to mariadb-dump.
-     * 
-     * @return string The dump command to use
-     * @throws Exception If neither command is available
-     */
-    protected function getMysqlDumpCommand(): string
-    {
-        // Try mysqldump first (preferred for compatibility)
-        if ($this->commandExists('mysqldump')) {
-            $this->log('Using mysqldump command');
-            return 'mysqldump';
-        }
-        
-        // Fall back to mariadb-dump for newer MariaDB versions
-        if ($this->commandExists('mariadb-dump')) {
-            $this->log('mysqldump not found, using mariadb-dump command');
-            return 'mariadb-dump';
-        }
-        
-        // Neither command is available
-        $errorMessage = 'Neither mysqldump nor mariadb-dump command found. Please install MySQL or MariaDB client tools.';
-        
-        // Send notification if enabled
-        if (config('capsule.notifications.enabled', false)) {
-            $this->notificationManager->sendFailureNotification(
-                null, 
-                new Exception($errorMessage)
-            );
-        }
-        
-        throw new Exception($errorMessage);
-    }
-
-    /**
-     * Check if a command exists in the system PATH
-     * 
-     * @param string $command The command to check
-     * @return bool True if command exists, false otherwise
-     */
-    protected function commandExists(string $command): bool
-    {
-        $returnCode = 0;
-        $output = [];
-        exec("which {$command} 2>/dev/null", $output, $returnCode);
-        return $returnCode === 0;
-    }
 }

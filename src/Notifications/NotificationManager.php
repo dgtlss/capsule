@@ -8,6 +8,7 @@ use Dgtlss\Capsule\Notifications\Channels\SlackNotifier;
 use Dgtlss\Capsule\Notifications\Channels\DiscordNotifier;
 use Dgtlss\Capsule\Notifications\Channels\TeamsNotifier;
 use Dgtlss\Capsule\Notifications\Channels\GoogleChatNotifier;
+use Dgtlss\Capsule\Support\Helpers;
 use Exception;
 
 class NotificationManager
@@ -102,7 +103,7 @@ class NotificationManager
                 'Started at' => $backupLog->started_at->format('Y-m-d H:i:s'),
                 'Completed at' => $backupLog->completed_at->format('Y-m-d H:i:s'),
                 'Duration' => $backupLog->started_at->diffForHumans($backupLog->completed_at, true),
-                'File size' => $this->formatBytes($backupLog->file_size),
+                'File size' => Helpers::formatBytes($backupLog->file_size),
                 'Status' => 'Success',
             ],
             'color' => 'good',
@@ -150,7 +151,7 @@ class NotificationManager
             'message' => "{$deletedCount} items were removed.",
             'details' => [
                 'Items deleted' => $deletedCount,
-                'Space freed' => $this->formatBytes($deletedSize),
+                'Space freed' => Helpers::formatBytes($deletedSize),
                 'Completed at' => now()->format('Y-m-d H:i:s'),
                 'Status' => 'Success',
             ],
@@ -159,15 +160,4 @@ class NotificationManager
         ];
     }
 
-    protected function formatBytes(int $bytes): string
-    {
-        if ($bytes === 0) {
-            return '0 B';
-        }
-
-        $units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        $pow = floor(log($bytes, 1024));
-
-        return round($bytes / (1024 ** $pow), 2) . ' ' . $units[$pow];
-    }
 }
