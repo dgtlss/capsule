@@ -506,6 +506,27 @@ return [
     |
     */
 
+    /*
+    |--------------------------------------------------------------------------
+    | S3 Lifecycle Management
+    |--------------------------------------------------------------------------
+    |
+    | Capsule can tag S3 objects and transition older backups to cheaper
+    | storage classes. This complements native S3 lifecycle policies.
+    |
+    */
+
+    's3_lifecycle' => [
+        'tagging_enabled' => false,
+        'transition_enabled' => false,
+        'default_storage_class' => null,
+
+        'transitions' => [
+            // ['after_days' => 30, 'storage_class' => 'STANDARD_IA'],
+            // ['after_days' => 90, 'storage_class' => 'GLACIER'],
+        ],
+    ],
+
     'audit' => [
         'enabled' => env('CAPSULE_AUDIT_ENABLED', true),
     ],
