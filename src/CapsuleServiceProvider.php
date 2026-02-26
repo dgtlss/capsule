@@ -8,6 +8,7 @@ use Dgtlss\Capsule\Commands\DiagnoseCommand;
 use Dgtlss\Capsule\Commands\VerifyCommand;
 use Dgtlss\Capsule\Commands\ListCommand;
 use Dgtlss\Capsule\Commands\InspectCommand;
+use Dgtlss\Capsule\Commands\DownloadCommand;
 use Dgtlss\Capsule\Commands\HealthCommand;
 use Dgtlss\Capsule\Commands\RestoreCommand;
 use Dgtlss\Capsule\Database\DatabaseDumper;
@@ -71,6 +72,7 @@ class CapsuleServiceProvider extends ServiceProvider
                 InspectCommand::class,
                 HealthCommand::class,
                 RestoreCommand::class,
+                DownloadCommand::class,
             ]);
         }
 
