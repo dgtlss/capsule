@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Models;
 
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class BackupLog extends Model
@@ -93,5 +94,10 @@ class BackupLog extends Model
     public function metric(): HasOne
     {
         return $this->hasOne(BackupMetric::class);
+    }
+
+    public function verificationLogs(): HasMany
+    {
+        return $this->hasMany(VerificationLog::class);
     }
 }

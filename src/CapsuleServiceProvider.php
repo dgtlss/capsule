@@ -7,6 +7,7 @@ use Dgtlss\Capsule\Commands\BackupCommand;
 use Dgtlss\Capsule\Commands\CleanupCommand;
 use Dgtlss\Capsule\Commands\DiagnoseCommand;
 use Dgtlss\Capsule\Commands\VerifyCommand;
+use Dgtlss\Capsule\Commands\VerifyScheduledCommand;
 use Dgtlss\Capsule\Commands\ListCommand;
 use Dgtlss\Capsule\Commands\InspectCommand;
 use Dgtlss\Capsule\Commands\DownloadCommand;
@@ -75,6 +76,7 @@ class CapsuleServiceProvider extends ServiceProvider
                 HealthCommand::class,
                 RestoreCommand::class,
                 DownloadCommand::class,
+                VerifyScheduledCommand::class,
             ]);
         }
 
@@ -91,6 +93,19 @@ class CapsuleServiceProvider extends ServiceProvider
             $schedule = $this->app->make(Schedule::class);
             $frequency = config('capsule.schedule.frequency', 'daily');
             $time = config('capsule.schedule.time', '02:00');
+
+            if (config('capsule.verification.schedule_enabled', true)) {
+                $verifyFreq = config('capsule.verification.frequency', 'daily');
+                $verifyTime = config('capsule.verification.time', '04:00');
+                $verifyCmd = $schedule->command('capsule:verify-scheduled');
+
+                match ($verifyFreq) {
+                    'hourly' => $verifyCmd->hourly(),
+                    'daily' => $verifyCmd->dailyAt($verifyTime),
+                    'weekly' => $verifyCmd->weeklyOn(0, $verifyTime),
+                    default => $verifyCmd->dailyAt($verifyTime),
+                };
+            }
 
             $command = $schedule->command('capsule:backup');
 

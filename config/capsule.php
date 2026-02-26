@@ -439,6 +439,24 @@ return [
     |--------------------------------------------------------------------------
     */
 
+    /*
+    |--------------------------------------------------------------------------
+    | Automated Integrity Verification
+    |--------------------------------------------------------------------------
+    |
+    | Capsule can automatically verify backup integrity on a schedule.
+    | Each run picks an unverified (or stale) backup, downloads it,
+    | and validates the ZIP structure and manifest checksums.
+    |
+    */
+
+    'verification' => [
+        'schedule_enabled' => env('CAPSULE_VERIFY_SCHEDULE_ENABLED', true),
+        'frequency' => 'daily',
+        'time' => '04:00',
+        'recheck_days' => 7,
+    ],
+
     'health' => [
         'enabled' => env('CAPSULE_HEALTH_ENABLED', true),
         // Warn when last success older than N days
