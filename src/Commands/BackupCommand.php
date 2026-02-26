@@ -21,6 +21,7 @@ class BackupCommand extends Command
     {--verify : Verify backup integrity after creation}
     {--db-only : Only backup database (skip files)}
     {--files-only : Only backup files (skip database)}
+    {--incremental : Only backup files changed since last full backup}
     {--simulate : Estimate backup size and duration without running}
     {--tag= : Label this backup (e.g., pre-deploy, nightly)}
     {--format=table : Output format (table|json)}';
@@ -64,6 +65,9 @@ class BackupCommand extends Command
         $service->setVerbose($verbose);
         $service->setParallel($parallel);
         $service->setTag($this->option('tag'));
+        if ($this->option('incremental') && $service instanceof BackupService) {
+            $service->setIncremental(true);
+        }
         if ($compress >= 1 && $compress <= 9) {
             $service->setCompressionLevel($compress);
         }

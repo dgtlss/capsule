@@ -36,7 +36,12 @@ class BackupService
     protected ?string $lastRemotePath = null;
     protected ?int $lastFileSize = null;
     protected ?string $tag = null;
+    protected bool $incremental = false;
     protected MetricsCollector $metricsCollector;
+    protected IncrementalService $incrementalService;
+    protected array $currentFileIndex = [];
+    protected string $backupType = 'full';
+    protected ?int $baseSnapshotId = null;
 
     public function __construct(
         Application $app,
@@ -51,6 +56,7 @@ class BackupService
         $this->databaseDumper = $databaseDumper ?? new DatabaseDumper();
         $this->manifestBuilder = $manifestBuilder ?? new ManifestBuilder();
         $this->metricsCollector = new MetricsCollector();
+        $this->incrementalService = new IncrementalService();
         $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
@@ -82,6 +88,11 @@ class BackupService
     public function setTag(?string $tag): void
     {
         $this->tag = $tag;
+    }
+
+    public function setIncremental(bool $incremental): void
+    {
+        $this->incremental = $incremental;
     }
 
     public function setOutputCallback(callable $callback): void
@@ -196,6 +207,14 @@ class BackupService
 
             if ($this->backupLogPersisted) {
                 $this->metricsCollector->persist($backupLog);
+
+                if (config('capsule.files.enabled') && !empty($this->currentFileIndex)) {
+                    try {
+                        $this->incrementalService->saveSnapshot($backupLog, $this->currentFileIndex, $this->backupType, $this->baseSnapshotId);
+                    } catch (\Throwable $e) {
+                        Log::warning('Failed to save backup snapshot', ['exception' => $e]);
+                    }
+                }
             }
 
             if (config('capsule.default_disk') !== 'local') {
@@ -286,16 +305,51 @@ class BackupService
             event(new DatabaseDumpCompleted(new BackupContext('normal')));
         }
 
+        $this->backupType = 'full';
+        $this->baseSnapshotId = null;
+        $this->currentFileIndex = [];
+
         if (config('capsule.files.enabled')) {
-            $this->log('📁 Adding files to backup...');
             event(new FilesCollectStarting(new BackupContext('normal')));
-            $this->addFilesToBackup($zip);
+
+            if ($this->incremental) {
+                $baseSnapshot = $this->incrementalService->getLatestFullSnapshot();
+                if ($baseSnapshot) {
+                    $this->log('Scanning files for changes (incremental)...');
+                    $this->currentFileIndex = $this->incrementalService->buildCurrentIndex();
+                    $diff = $this->incrementalService->diff($this->currentFileIndex, $baseSnapshot);
+                    $changedFiles = $this->incrementalService->getChangedFiles($diff);
+
+                    $this->log("   Changed: " . count($diff['added']) . " added, " . count($diff['modified']) . " modified, " . count($diff['removed']) . " removed");
+                    $this->log("   Unchanged: " . $diff['unchanged_count'] . " files skipped");
+
+                    if (!empty($changedFiles)) {
+                        $this->addSpecificFilesToBackup($zip, $changedFiles);
+                    }
+
+                    $this->backupType = 'incremental';
+                    $this->baseSnapshotId = $baseSnapshot->id;
+                } else {
+                    $this->log('No base snapshot found, running full file backup...');
+                    $this->currentFileIndex = $this->incrementalService->buildCurrentIndex();
+                    $this->addFilesToBackup($zip);
+                }
+            } else {
+                $this->log('Adding files to backup...');
+                $this->currentFileIndex = $this->incrementalService->buildCurrentIndex();
+                $this->addFilesToBackup($zip);
+            }
+
             event(new FilesCollectCompleted(new BackupContext('normal')));
         }
 
         $this->log('Writing manifest...');
         $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
         $manifest = $this->manifestBuilder->build(false, $this->compressionLevel, $encryptionEnabled);
+        $manifest['backup_type'] = $this->backupType;
+        if ($this->baseSnapshotId) {
+            $manifest['base_snapshot_id'] = $this->baseSnapshotId;
+        }
         $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         $zip->addFromString('manifest.json', $manifestJson);
         $this->applyCompressionAndEncryption($zip, 'manifest.json');
@@ -398,6 +452,38 @@ class BackupService
         }
 
         return $tempFiles;
+    }
+
+    protected function addSpecificFilesToBackup(ZipArchive $zip, array $absolutePaths): void
+    {
+        $basePaths = config('capsule.files.paths', []);
+
+        foreach ($absolutePaths as $filePath) {
+            if (!is_file($filePath)) {
+                continue;
+            }
+
+            $relativePath = $filePath;
+            foreach ($basePaths as $basePath) {
+                $normalizedBase = rtrim($basePath, '/');
+                if (strpos($filePath, $normalizedBase . '/') === 0) {
+                    $relativePath = 'files/' . substr($filePath, strlen($normalizedBase) + 1);
+                    break;
+                }
+            }
+
+            if ($relativePath === $filePath) {
+                $relativePath = 'files/' . basename($filePath);
+            }
+
+            $fileSize = (int) filesize($filePath);
+            $zip->addFile($filePath, $relativePath);
+            $this->applyCompressionAndEncryption($zip, $relativePath);
+            $this->manifestBuilder->addEntry($relativePath, $filePath);
+            $this->metricsCollector->addFile($filePath, $fileSize);
+        }
+
+        $this->log("   Added " . count($absolutePaths) . " changed file(s) to incremental backup");
     }
 
     protected function addFilesToBackup(ZipArchive $zip): void
