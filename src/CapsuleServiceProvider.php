@@ -93,9 +93,14 @@ class CapsuleServiceProvider extends ServiceProvider
             match ($frequency) {
                 'hourly' => $command->hourly(),
                 'daily' => $command->dailyAt($time),
-                'weekly' => $command->weekly(),
-                'monthly' => $command->monthly(),
-                default => $command->dailyAt($time),
+                'twiceDaily' => $command->twiceDaily(1, 13),
+                'everyFourHours' => $command->everyFourHours(),
+                'everySixHours' => $command->everySixHours(),
+                'weekly' => $command->weeklyOn(0, $time),
+                'monthly' => $command->monthlyOn(1, $time),
+                default => str_contains($frequency, ' ')
+                    ? $command->cron($frequency)
+                    : $command->dailyAt($time),
             };
         });
     }

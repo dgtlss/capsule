@@ -288,7 +288,9 @@ return [
         'enabled' => true,
 
         // How often to run backups
-        // Supported: "hourly", "daily", "weekly", "monthly"
+        // Supported: "hourly", "daily", "twiceDaily", "everyFourHours",
+        //            "everySixHours", "weekly", "monthly"
+        // Or provide a custom cron expression: "0 3 * * 1-5"
         'frequency' => 'daily',
 
         // Time to run daily backups (24-hour format)
