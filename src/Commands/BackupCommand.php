@@ -17,6 +17,8 @@ class BackupCommand extends Command
     {--compress=1 : Compression level 1-9 (1=fastest, 9=smallest)}
     {--encrypt : Encrypt backup archive}
     {--verify : Verify backup integrity after creation}
+    {--db-only : Only backup database (skip files)}
+    {--files-only : Only backup files (skip database)}
     {--format=table : Output format (table|json)}';
     
     protected $description = 'Create a backup of the database and files';
@@ -36,6 +38,19 @@ class BackupCommand extends Command
         } else {
             $this->info('Starting backup process...');
             $service = $backupService;
+        }
+
+        if ($this->option('db-only') && $this->option('files-only')) {
+            $this->error('Cannot use --db-only and --files-only together.');
+            return self::FAILURE;
+        }
+
+        if ($this->option('db-only')) {
+            config(['capsule.files.enabled' => false]);
+        }
+
+        if ($this->option('files-only')) {
+            config(['capsule.database.enabled' => false]);
         }
 
         $service->setVerbose($verbose);
