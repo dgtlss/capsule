@@ -91,6 +91,29 @@ class CapsuleServiceProvider extends ServiceProvider
 
         $this->app->booted(function () {
             $schedule = $this->app->make(Schedule::class);
+
+            $policies = config('capsule.policies', []);
+            if (!empty($policies)) {
+                foreach ($policies as $name => $policy) {
+                    if (!($policy['enabled'] ?? true)) {
+                        continue;
+                    }
+                    $freq = $policy['frequency'] ?? 'daily';
+                    $time = $policy['time'] ?? '02:00';
+                    $cmd = $schedule->command("capsule:backup --policy={$name} --tag={$name}");
+
+                    match ($freq) {
+                        'hourly' => $cmd->hourly(),
+                        'daily' => $cmd->dailyAt($time),
+                        'twiceDaily' => $cmd->twiceDaily(1, 13),
+                        'everyFourHours' => $cmd->everyFourHours(),
+                        'weekly' => $cmd->weeklyOn(0, $time),
+                        'monthly' => $cmd->monthlyOn(1, $time),
+                        default => str_contains($freq, ' ') ? $cmd->cron($freq) : $cmd->dailyAt($time),
+                    };
+                }
+            }
+
             $frequency = config('capsule.schedule.frequency', 'daily');
             $time = config('capsule.schedule.time', '02:00');
 

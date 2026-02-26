@@ -465,6 +465,37 @@ return [
     |
     */
 
+    /*
+    |--------------------------------------------------------------------------
+    | Backup Policies
+    |--------------------------------------------------------------------------
+    |
+    | Define named backup policies for different backup strategies.
+    | Each policy can override database/files, target disk, schedule,
+    | retention, and more. Policies are scheduled independently.
+    | Leave empty to use the global config as a single "default" policy.
+    |
+    | Example:
+    |   'policies' => [
+    |       'database-hourly' => [
+    |           'database' => true, 'files' => false,
+    |           'disk' => 's3',
+    |           'frequency' => 'hourly',
+    |           'retention' => ['days' => 7, 'count' => 168],
+    |       ],
+    |       'full-weekly' => [
+    |           'database' => true, 'files' => true,
+    |           'disk' => 'glacier',
+    |           'frequency' => 'weekly', 'time' => '03:00',
+    |           'retention' => ['days' => 365, 'count' => 52],
+    |           'incremental' => false,
+    |       ],
+    |   ],
+    |
+    */
+
+    'policies' => [],
+
     'anomaly' => [
         'size_deviation_percent' => 200,
         'duration_deviation_percent' => 300,

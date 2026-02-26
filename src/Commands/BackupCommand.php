@@ -5,6 +5,7 @@ namespace Dgtlss\Capsule\Commands;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\ChunkedBackupService;
+use Dgtlss\Capsule\Services\PolicyRunner;
 use Dgtlss\Capsule\Services\SimulationService;
 use Dgtlss\Capsule\Support\BackupReport;
 use Dgtlss\Capsule\Support\Helpers;
@@ -25,6 +26,7 @@ class BackupCommand extends Command
     {--files-only : Only backup files (skip database)}
     {--incremental : Only backup files changed since last full backup}
     {--simulate : Estimate backup size and duration without running}
+    {--policy= : Run a named backup policy from config}
     {--tag= : Label this backup (e.g., pre-deploy, nightly)}
     {--format=table : Output format (table|json)}';
     
@@ -47,6 +49,20 @@ class BackupCommand extends Command
             $service = $backupService;
         }
 
+        $policyName = $this->option('policy');
+        if ($policyName) {
+            try {
+                $policy = PolicyRunner::applyPolicy($policyName);
+                $this->info("Using policy: {$policyName}");
+                if (!empty($policy['tag']) && !$this->option('tag')) {
+                    $service->setTag($policyName);
+                }
+            } catch (\Exception $e) {
+                $this->error($e->getMessage());
+                return self::FAILURE;
+            }
+        }
+
         if ($this->option('db-only') && $this->option('files-only')) {
             $this->error('Cannot use --db-only and --files-only together.');
             return self::FAILURE;
@@ -67,7 +83,7 @@ class BackupCommand extends Command
         $service->setVerbose($verbose);
         $service->setParallel($parallel);
         $service->setTag($this->option('tag'));
-        if ($this->option('incremental') && $service instanceof BackupService) {
+        if (($this->option('incremental') || config('capsule._policy_incremental')) && $service instanceof BackupService) {
             $service->setIncremental(true);
         }
         if ($compress >= 1 && $compress <= 9) {
