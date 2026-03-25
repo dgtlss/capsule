@@ -36,6 +36,8 @@ class BackupReport
             $report['throughput'] = $metric->throughput_bytes_per_sec
                 ? Helpers::formatBytes((int) $metric->throughput_bytes_per_sec) . '/s'
                 : 'N/A';
+            // file_count is only from the file-backup step; DB + manifest are separate ZIP entries.
+            $report['files_backup_enabled'] = (bool) config('capsule.files.enabled', true);
         }
 
         $anomalies = $backupLog->metadata['anomalies'] ?? [];
@@ -79,6 +81,13 @@ class BackupReport
             $fileDesc = number_format($report['file_count']) . ' files';
             if ($report['directory_count'] > 0) {
                 $fileDesc .= " in {$report['directory_count']} dirs";
+            }
+            if (
+                $report['file_count'] === 0
+                && empty($report['files_backup_enabled'])
+                && ($report['db_dumps'] ?? 0) > 0
+            ) {
+                $fileDesc .= ' (file backup off; ZIP still has database/ + manifest.json)';
             }
             $rows[] = ['Files', $fileDesc];
         }
