@@ -233,19 +233,32 @@ class DatabaseDumper
         $configFile = $this->buildMysqlConfigFile($config, $dumpCommand);
         $safeFlags = implode(' ', $this->buildMysqlFlags());
         $tableArgs = $this->buildMysqlTableArgs($config['database']);
-        $extraFlags = $tableArgs['extraFlags'];
+        $extraFlags = trim($safeFlags . ' ' . $tableArgs['extraFlags']);
 
-        $allFlags = trim($safeFlags . ' ' . $extraFlags);
-
-        $command = sprintf(
-            '%s --defaults-extra-file=%s %s %s > %s 2>&1; rm %s',
-            $dumpCommand,
-            escapeshellarg($configFile),
-            $allFlags,
-            escapeshellarg($config['database']),
-            escapeshellarg($dumpPath),
-            escapeshellarg($configFile)
-        );
+        // Must match dumpMysql() / sequential path: include_tables / ignore-table / extra flags.
+        if ($tableArgs['useInclude']) {
+            $command = sprintf(
+                '%s --defaults-extra-file=%s %s %s %s > %s 2>&1; rm %s',
+                $dumpCommand,
+                escapeshellarg($configFile),
+                $extraFlags,
+                escapeshellarg($config['database']),
+                $tableArgs['tablesArg'],
+                escapeshellarg($dumpPath),
+                escapeshellarg($configFile)
+            );
+        } else {
+            $command = sprintf(
+                '%s --defaults-extra-file=%s %s %s %s > %s 2>&1; rm %s',
+                $dumpCommand,
+                escapeshellarg($configFile),
+                $extraFlags,
+                $tableArgs['ignoreFlags'],
+                escapeshellarg($config['database']),
+                escapeshellarg($dumpPath),
+                escapeshellarg($configFile)
+            );
+        }
 
         return proc_open($command, [], $pipes);
     }
@@ -339,14 +352,17 @@ class DatabaseDumper
     protected function startPostgresDumpProcess(array $config, string $dumpPath)
     {
         $pgpassFile = $this->buildPgpassFile($config);
+        $tableFlags = $this->buildPostgresTableFlags();
 
+        // Must match dumpPostgres(): same format and table include/exclude flags.
         $command = sprintf(
-            'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s > %s 2>&1; rm %s',
+            'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s --no-owner --no-privileges --format=plain %s > %s 2>&1; rm %s',
             escapeshellarg($pgpassFile),
             escapeshellarg($config['host']),
             escapeshellarg($config['port'] ?? 5432),
             escapeshellarg($config['username']),
             escapeshellarg($config['database']),
+            $tableFlags,
             escapeshellarg($dumpPath),
             escapeshellarg($pgpassFile)
         );
