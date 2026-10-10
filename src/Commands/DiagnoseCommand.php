@@ -12,8 +12,7 @@ class DiagnoseCommand extends Command
     protected $signature = 'capsule:diagnose 
     {--detailed : Show detailed performance and security analysis}
     {--fix : Attempt to fix common issues automatically}
-    {--format=table : Output format (table, json)}
-    {--detailed : Verbose output}';
+    {--format=table : Output format (table, json)}';
     
     protected $description = 'Diagnose Capsule configuration and system requirements';
 
@@ -115,7 +114,7 @@ class DiagnoseCommand extends Command
             if ($verbose) $this->error('  ❌ Config file missing. Run: php artisan vendor:publish --tag=capsule-config');
             if ($fix) {
                 if ($verbose) $this->info('  🔧 Attempting to publish config...');
-                $this->call('vendor:publish', ['--tag' => 'capsule-config']);
+                $verbose ? $this->call('vendor:publish', ['--tag' => 'capsule-config']) : $this->callSilent('vendor:publish', ['--tag' => 'capsule-config']);
                 $configExists = file_exists(config_path('capsule.php'));
                 if ($configExists && $verbose) {
                     $this->info('  ✅ Config file published successfully');

@@ -1,5 +1,7 @@
 # Capsule Package Analysis
 
+> Historical design analysis. It predates the recovery reliability audit and current tests. See [the recovery audit mapping](docs/recovery-audit.md) for the implemented changes and verification limits.
+
 ## Package Summary
 
 **Capsule** (v1.1.0) is a Laravel backup package that backs up databases and files to external storage on a schedule. It supports MySQL/MariaDB, PostgreSQL, and SQLite; stores to any Laravel filesystem disk (local, S3, FTP, etc.); sends notifications via Email/Slack/Discord/Teams/Google Chat; and provides retention policies, verification, a Filament panel, and Spatie Health integration.

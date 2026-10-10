@@ -43,6 +43,8 @@ Capsule supports MySQL, PostgreSQL, and SQLite. It stores backups on any Laravel
 - [Extensibility](#extensibility)
 - [Integrations](#integrations)
 - [Requirements](#requirements)
+- [Testing and Compatibility](#testing-and-compatibility)
+- [Recovery Audit](docs/recovery-audit.md)
 - [License](#license)
 
 ---
@@ -136,7 +138,7 @@ php artisan capsule:backup --simulate
 # Use a named policy
 php artisan capsule:backup --policy=database-hourly
 
-# Stream directly to cloud (no local disk usage)
+# Stream ZIP output to storage (bounded buffers)
 php artisan capsule:backup --no-local
 
 # Encrypt the backup
@@ -167,11 +169,15 @@ php artisan capsule:restore
 # Restore a specific backup
 php artisan capsule:restore 42
 
+# Recover without the application database or backup catalog
+php artisan capsule:restore --archive=/safe/backup.zip --target=/tmp/recovered
+php artisan capsule:restore --disk=s3 --path=backups/backup.zip --target=/tmp/recovered
+
 # Browse what's inside before restoring
 php artisan capsule:restore --list
 
-# Restore specific files only
-php artisan capsule:restore --only=config/database.php --only=config/app.php
+# Restore specific files only (schema 2 preserves named or numbered roots)
+php artisan capsule:restore --only=root-0/config/database.php --only=root-0/config/app.php
 
 # Restore using glob patterns
 php artisan capsule:restore --only='*.php'
@@ -194,6 +200,10 @@ php artisan capsule:restore --dry-run
 # Skip confirmation
 php artisan capsule:restore --force
 ```
+
+Restoration validates the full archive manifest and payload checksums before changing files or importing databases. Invalid paths, symlink destinations, unreadable encrypted entries, and failed database imports return a nonzero exit code. JSON mode requires `--force` for a restore that changes data.
+
+Schema 2 archives keep each configured file root separate: `files/root-0/...`, `files/root-1/...`, or `files/<configured-name>/...`. `--target` receives these root directories; without it, they are restored beneath the application base path. Review `--list` and `--dry-run` before moving restored files into production. Manifests are limited to 16 MiB in both backup and restore; a backup with metadata exceeding this limit fails rather than publishing an archive that recovery cannot read. Safe legacy schema 1 archives with valid SHA-256 manifests remain restorable in their original unnamespaced layout. Archives without a valid manifest are rejected.
 
 ### List & Inspect
 
@@ -321,13 +331,21 @@ php artisan capsule:backup-if-stale --hours=12 --policy=database-hourly
 
 ### Incremental Backups
 
-Instead of backing up all files every time, incremental mode only includes files that changed since the last full backup. Capsule tracks file sizes and modification times to detect changes.
+Instead of backing up all files every time, incremental mode only includes files that changed since the last full backup. Capsule compares file sizes, modification times, and SHA-256 hashes to detect changes, including edits that preserve size and timestamps.
 
 ```bash
 php artisan capsule:backup --incremental
 ```
 
-If no previous full backup exists, Capsule automatically runs a full backup instead.
+If no compatible previous full backup exists, Capsule automatically runs a full backup instead. Each incremental manifest records its base archive disk, object path, SHA-256 checksum, and deleted file paths. Restore verifies the base, applies its files, overlays changed files, then applies deletions. Retention protects bases required by retained incremental backups.
+
+For disaster recovery with downloaded archives, explicitly supply the matching base:
+
+```bash
+php artisan capsule:restore --archive=/safe/incremental.zip --base-archive=/safe/full.zip --target=/tmp/recovered
+```
+
+Keep both archives. A missing or mismatched base fails before restoration starts.
 
 A typical workflow:
 
@@ -405,7 +423,7 @@ Back up to multiple destinations for redundancy:
 'additional_disks' => ['local-archive', 's3-secondary'],
 ```
 
-The primary backup goes to `default_disk`. Copies are replicated to each additional disk. Replication failures are logged but don't fail the backup.
+The primary backup goes to `default_disk`. Every configured additional copy must also be written and verified successfully; a replication failure fails the run and preserves its recovery source. Recorded destinations are retained with the backup so cleanup can remove expired replicas even after configuration changes.
 
 ### Chunked Streaming
 
@@ -415,21 +433,18 @@ For large backups or limited local storage, stream directly to cloud storage:
 php artisan capsule:backup --no-local
 ```
 
-Data is streamed in configurable chunks, uploaded directly to storage, then collated into a final ZIP archive. No local disk space required beyond small temporary buffers.
+ZIP output and payloads use bounded streams; Capsule does not assemble a complete local ZIP or load the whole archive into memory. SQLite requires a consistent temporary on-disk database snapshot, which can be as large as the database. Budget temporary space for that snapshot and any filesystem adapter buffering. Chunk buffers accept 1 byte through 64 MiB (10 MiB by default); metadata grows with file/chunk count. Upload verification reads back stored objects to check their sizes and SHA-256 hashes, so allow for additional storage read traffic. If final publication fails, recovery chunk references remain in the failed backup log. Streaming encryption is not supported: `--no-local --encrypt` fails instead of storing plaintext.
 
 ```php
 'chunked_backup' => [
     'chunk_size' => 10485760,        // 10 MB chunks
     'temp_prefix' => 'capsule_chunk_',
-    'max_concurrent_uploads' => 3,
 ],
 ```
 
 ### Encryption
 
-Capsule supports two encryption approaches:
-
-**ZIP-level encryption** (simple, compatible with standard ZIP tools):
+Standard backups support AES-256 ZIP encryption with a compatible libzip build and a required password:
 
 ```bash
 php artisan capsule:backup --encrypt
@@ -441,9 +456,7 @@ Set the password via environment variable:
 CAPSULE_BACKUP_PASSWORD=your-secret-key
 ```
 
-**Envelope encryption** (advanced, supports key rotation):
-
-Each backup is encrypted with a unique random data key (DEK), which is then wrapped with your master key. The key ID is stored in the manifest, enabling you to rotate the master key while old backups remain decryptable with their original key.
+Missing passwords, unsupported encryption, or failed encryption calls abort the backup. Retain the password securely outside the archive. Use a ZIP tool that supports AES encryption when extracting manually. Envelope encryption and master-key rotation are not implemented.
 
 ### Programmatic API
 
@@ -537,20 +550,6 @@ Every backup operation is recorded in an immutable audit trail:
 
 Tracks: action (backup/restore/cleanup), trigger (artisan/scheduler/api), actor (system user or authenticated user), status, and full details. Stored in the `backup_audit_logs` table.
 
-### S3 Lifecycle Management
-
-For S3-compatible storage, Capsule can tag objects and transition them to cheaper storage classes:
-
-```php
-'s3_lifecycle' => [
-    'tagging_enabled' => true,
-    'transition_enabled' => true,
-    'transitions' => [
-        ['after_days' => 30,  'storage_class' => 'STANDARD_IA'],
-        ['after_days' => 90,  'storage_class' => 'GLACIER'],
-    ],
-],
-```
 
 ---
 
@@ -627,12 +626,16 @@ Set `connections` to an array to back up multiple databases:
 ```php
 'retention' => [
     'days' => 30,               // Delete backups older than this
-    'count' => 10,              // Always keep the latest N
+    'count' => 10,              // Protect latest N from age-based pruning
     'max_storage_mb' => null,   // Optional storage budget
     'min_keep' => 3,            // Never drop below this count
     'cleanup_enabled' => true,
 ],
 ```
+
+Age pruning protects the newest `count` backups; it is not a maximum archive count. An explicit `capsule:cleanup --days=...` bypasses that count protection. Budget pruning may exceed it, but both `min_keep` and bases required by retained incrementals remain protected. Failed storage deletions keep their catalog records for retry. Policies and original storage destinations are respected throughout cleanup.
+
+Backup and cleanup share a cache lock. Set `capsule.lock.timeout_seconds` longer than the longest expected backup or cleanup operation: the lease is not renewed automatically. `--force` intentionally bypasses this coordination and can overlap an active operation; avoid it in routine scheduled runs.
 
 ### Scheduling
 
@@ -792,11 +795,34 @@ php artisan capsule:advisor --format=json
 
 ## Requirements
 
-- PHP 8.1+
-- Laravel 10, 11, or 12
+- PHP 8.2+ for Laravel 12; PHP 8.3+ for Laravel 13
+- Laravel 12 or 13
 - `zip` PHP extension
 - Database tools: `mysqldump` (MySQL/MariaDB), `pg_dump` (PostgreSQL)
-- Optional: `mysql` / `psql` for restore
+- `mysql` / `mariadb` or `psql` client for the corresponding database restore
+- `pdo_sqlite` for SQLite snapshots/validation; `sqlite3` for SQLite restoration (including live WAL databases)
+
+---
+
+## Testing and Compatibility
+
+```bash
+composer install
+composer test
+```
+
+Tests use isolated temporary storage, actual ZIP archives, and SQLite databases. The recovery suite covers standard, streamed, and encrypted backup/restore round trips, plus failure-path regressions. No cloud credentials are required.
+
+The GitHub Actions workflow resolves and runs the complete suite for these combinations:
+
+| Laravel | PHP versions | Testbench | PHPUnit |
+| --- | --- | --- | --- |
+| 12 | 8.2, 8.3, 8.4, 8.5 | 10 | 11.5 |
+| 13 | 8.3, 8.4, 8.5 | 11 | 11.5 |
+
+The matrix follows [Laravel's supported PHP versions](https://laravel.com/docs/13.x/releases) and the official [Testbench 10](https://github.com/orchestral/testbench/blob/10.x/composer.json) and [11](https://github.com/orchestral/testbench/blob/11.x/composer.json) dependency constraints. Breaking compatibility change: Laravel 10/11 and PHP 8.1 support have been removed. Those framework versions are upstream end-of-life and Composer blocks the released dependency sets because of security advisories; see [the compatibility evidence](docs/compatibility-resolution.md). Upgrade the host application to a supported Laravel/PHP combination before adopting these changes. A configured CI row is not evidence of a passing run: check the workflow results on your commit.
+
+Live MySQL/PostgreSQL recovery and real cloud adapters still require deployment-specific integration tests. Always perform a restore drill on the infrastructure you rely on.
 
 ---
 

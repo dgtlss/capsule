@@ -10,7 +10,7 @@ class BackupHealthCheck
     {
         $last = BackupLog::successful()->orderByDesc('created_at')->first();
         if (!$last) return null;
-        return now()->diffInDays($last->created_at);
+        return max(0, (int) $last->created_at->diffInDays(now(), false));
     }
 
     public static function recentFailuresCount(int $days = 7): int

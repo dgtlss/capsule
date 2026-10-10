@@ -8,8 +8,6 @@ use Dgtlss\Capsule\Services\ChunkedBackupService;
 use Dgtlss\Capsule\Services\PolicyRunner;
 use Dgtlss\Capsule\Services\SimulationService;
 use Dgtlss\Capsule\Support\BackupReport;
-use Dgtlss\Capsule\Support\Helpers;
-use Dgtlss\Capsule\Support\Lock;
 use Illuminate\Console\Command;
 
 class BackupCommand extends Command
@@ -19,7 +17,7 @@ class BackupCommand extends Command
     {--no-local : Stream backup directly to external storage without using local disk}
     {--detailed : Verbose output with progress details}
     {--parallel : Enable parallel processing for multiple databases}
-    {--compress=1 : Compression level 1-9 (1=fastest, 9=smallest)}
+    {--compress= : Compression level 1-9 (defaults to config)}
     {--encrypt : Encrypt backup archive}
     {--verify : Verify backup integrity after creation}
     {--db-only : Only backup database (skip files)}
@@ -32,146 +30,105 @@ class BackupCommand extends Command
     
     protected $description = 'Create a backup of the database and files';
 
-    public function handle(BackupService $backupService, ChunkedBackupService $chunkedBackupService): int
+    public function handle(): int
     {
-        $useChunkedBackup = $this->option('no-local');
-        $verbose = $this->option('detailed');
-        $parallel = $this->option('parallel');
-        $compress = (int) $this->option('compress');
-        $encrypt = $this->option('encrypt');
-        $verify = $this->option('verify');
-        
-        if ($useChunkedBackup) {
-            $this->info('Starting chunked backup process (no local storage)...');
-            $service = $chunkedBackupService;
-        } else {
-            $this->info('Starting backup process...');
-            $service = $backupService;
-        }
-
-        $policyName = $this->option('policy');
-        if ($policyName) {
-            try {
-                $policy = PolicyRunner::applyPolicy($policyName);
-                $this->info("Using policy: {$policyName}");
-                if (!empty($policy['tag']) && !$this->option('tag')) {
-                    $service->setTag($policyName);
-                }
-            } catch (\Exception $e) {
-                $this->error($e->getMessage());
-                return self::FAILURE;
-            }
-        }
-
-        if ($this->option('db-only') && $this->option('files-only')) {
-            $this->error('Cannot use --db-only and --files-only together.');
-            return self::FAILURE;
-        }
-
-        if ($this->option('db-only')) {
-            config(['capsule.files.enabled' => false]);
-        }
-
-        if ($this->option('files-only')) {
-            config(['capsule.database.enabled' => false]);
-        }
-
-        if ($this->option('simulate')) {
-            return $this->runSimulation();
-        }
-
-        $service->setVerbose($verbose);
-        $service->setParallel($parallel);
-        $service->setTag($this->option('tag'));
-        if (($this->option('incremental') || config('capsule._policy_incremental')) && $service instanceof BackupService) {
-            $service->setIncremental(true);
-        }
-        if ($compress >= 1 && $compress <= 9) {
-            $service->setCompressionLevel($compress);
-        }
-        $service->setEncryption($encrypt);
-        $service->setVerification($verify);
-        
-        if ($verbose) {
-            $service->setOutputCallback(function ($message) {
-                $this->info($message);
-            });
-        }
-
         $startTime = microtime(true);
-        $lock = null;
-        
+        $json = $this->option('format') === 'json';
+
         try {
-            if (!$this->option('force')) {
-                $lock = Lock::acquire('capsule:backup');
-                if (!$lock) {
-                    $this->warn('Another backup is currently running. Use --force to override.');
-                    return self::FAILURE;
-                }
+            if (!in_array($this->option('format'), ['table', 'json'], true)) {
+                throw new \InvalidArgumentException('Output format must be table or json.');
+            }
+            if ($this->option('db-only') && $this->option('files-only')) {
+                throw new \InvalidArgumentException('Cannot use --db-only and --files-only together.');
+            }
+            $compress = $this->option('compress');
+            if ($compress !== null && (!ctype_digit((string) $compress) || (int) $compress < 1 || (int) $compress > 9)) {
+                throw new \InvalidArgumentException('Compression level must be between 1 and 9.');
             }
 
-            $success = $service->run();
-            $duration = round(microtime(true) - $startTime, 2);
-            $format = $this->option('format');
+            return PolicyRunner::withPolicy($this->option('policy'), function (array $policy) use ($startTime, $json, $compress): int {
+                if ($this->option('db-only')) {
+                    config(['capsule.files.enabled' => false]);
+                }
+                if ($this->option('files-only')) {
+                    config(['capsule.database.enabled' => false]);
+                }
+                if ($this->option('simulate')) {
+                    return $this->runSimulation();
+                }
 
-            if ($success) {
-                if ($format === 'json') {
-                    $this->line(json_encode(['status' => 'success', 'duration_seconds' => $duration], JSON_PRETTY_PRINT));
-                } else {
-                    $this->newLine();
-                    $latestLog = BackupLog::successful()->orderByDesc('created_at')->first();
-                    if ($latestLog) {
-                        $latestLog->load('metric');
-                        $report = BackupReport::build($latestLog, $duration);
-                        $this->line(BackupReport::render($report));
-                    } else {
-                        $label = $useChunkedBackup ? 'Chunked backup' : 'Backup';
-                        $this->info("{$label} completed successfully in {$duration} seconds.");
+                // Resolve dependencies after applying overrides: storage captures its disk at construction.
+                $useChunkedBackup = (bool) $this->option('no-local');
+                $incremental = (bool) ($this->option('incremental') || config('capsule._policy_incremental', false));
+                if ($useChunkedBackup && $incremental) {
+                    throw new \InvalidArgumentException('Incremental backups require local archive creation; remove --no-local.');
+                }
+                $service = app($useChunkedBackup ? ChunkedBackupService::class : BackupService::class);
+                $verbose = (bool) $this->option('detailed');
+                $service->setVerbose($verbose && !$json);
+                $service->setParallel((bool) $this->option('parallel'));
+                $service->setTag($this->option('tag') ?? ($policy['tag'] ?? $this->option('policy')));
+                $service->setCompressionLevel((int) ($compress ?? config('capsule.backup.compression_level', 1)));
+                $service->setEncryption((bool) $this->option('encrypt'));
+                $service->setVerification((bool) $this->option('verify'));
+                if ($service instanceof BackupService) {
+                    $service->setIncremental($incremental);
+                }
+                if ($verbose && !$json) {
+                    $service->setOutputCallback(fn ($message) => $this->info($message));
+                }
+                if (!$json) {
+                    $this->info($useChunkedBackup ? 'Starting chunked backup process (no local storage)...' : 'Starting backup process...');
+                    if ($this->option('policy')) {
+                        $this->info('Using policy: ' . $this->option('policy'));
                     }
                 }
-                return self::SUCCESS;
-            }
 
-            if ($format === 'json') {
-                $this->line(json_encode(['status' => 'failed', 'duration_seconds' => $duration, 'error' => $service->getLastError()], JSON_PRETTY_PRINT));
-            } else {
-                $label = $useChunkedBackup ? 'Chunked backup' : 'Backup';
-                $this->error("{$label} failed after {$duration} seconds.");
-                $lastError = $service->getLastError();
-                if ($verbose && $lastError) {
-                    $this->error('Detailed error information:');
-                    $this->error($lastError);
+                $success = $service->run((bool) $this->option('force'));
+                $duration = round(microtime(true) - $startTime, 2);
+                if ($json) {
+                    $payload = ['status' => $success ? 'success' : 'failed', 'duration_seconds' => $duration];
+                    if (!$success) {
+                        $payload['error'] = $service->getLastError();
+                    }
+                    $this->line(json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+                } elseif ($success) {
+                    $latestLog = BackupLog::successful()->orderByDesc('created_at')->orderByDesc('id')->first();
+                    if ($latestLog) {
+                        $latestLog->load('metric');
+                        $this->line(BackupReport::render(BackupReport::build($latestLog, $duration)));
+                    } else {
+                        $this->info("Backup completed successfully in {$duration} seconds.");
+                    }
                 } else {
-                    $this->error('Check the logs for more details or run with --detailed for verbose output.');
+                    $this->error($service->getLastError() ?: "Backup failed after {$duration} seconds.");
+                }
+                return $success ? self::SUCCESS : self::FAILURE;
+            });
+        } catch (\Throwable $e) {
+            if ($json) {
+                $this->line(json_encode([
+                    'status' => 'failed',
+                    'duration_seconds' => round(microtime(true) - $startTime, 2),
+                    'error' => $e->getMessage(),
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            } else {
+                $this->error($e->getMessage());
+                if ($this->option('detailed')) {
+                    $this->line($e->getTraceAsString());
                 }
             }
             return self::FAILURE;
-        } catch (\Exception $e) {
-            $duration = round(microtime(true) - $startTime, 2);
-            
-            $this->error("Backup failed after {$duration} seconds with exception:");
-            $this->error("Error: {$e->getMessage()}");
-            
-            if ($verbose) {
-                $this->error("File: {$e->getFile()}:{$e->getLine()}");
-                $this->error("Stack trace:");
-                $this->line($e->getTraceAsString());
-            } else {
-                $this->error('Run with --detailed flag for more detailed error information.');
-            }
-            
-            return self::FAILURE;
-        } finally {
-            if ($lock) {
-                $lock->release();
-            }
         }
     }
 
     protected function runSimulation(): int
     {
-        $this->info('Simulating backup (no data will be written)...');
-        $this->newLine();
+        if ($this->option('format') !== 'json') {
+            $this->info('Simulating backup (no data will be written)...');
+            $this->newLine();
+        }
 
         $sim = app(SimulationService::class);
         $result = $sim->simulate();

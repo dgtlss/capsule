@@ -6,6 +6,7 @@ use Dgtlss\Capsule\Contracts\FileFilterInterface;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Models\BackupSnapshot;
 use Dgtlss\Capsule\Support\BackupContext;
+use Dgtlss\Capsule\Support\FileSelection;
 use Illuminate\Support\Facades\Log;
 
 class IncrementalService
@@ -18,20 +19,10 @@ class IncrementalService
      */
     public function buildCurrentIndex(bool $computeHashes = false): array
     {
-        $paths = config('capsule.files.paths', []);
-        $excludePaths = config('capsule.files.exclude_paths', []);
-        $filters = $this->resolveFileFilters();
         $index = [];
-
-        foreach ($paths as $basePath) {
-            if (is_dir($basePath)) {
-                $this->indexDirectory($basePath, $excludePaths, $filters, $index, $computeHashes);
-            } elseif (is_file($basePath)) {
-                if (!$this->passesFilters($basePath, $filters)) {
-                    continue;
-                }
-                $index[$basePath] = $this->fileEntry($basePath, $computeHashes);
-            }
+        foreach (FileSelection::files() as $archivePath => $source) {
+            $index[$archivePath] = $this->fileEntry($source, true);
+            $index[$archivePath]['source'] = $source;
         }
 
         return $index;
@@ -60,6 +51,10 @@ class IncrementalService
             if (($current['size'] ?? 0) !== ($base['size'] ?? 0)) {
                 $changed = true;
             } elseif (($current['mtime'] ?? 0) !== ($base['mtime'] ?? 0)) {
+                $changed = true;
+            }
+
+            if (($current['hash'] ?? null) !== ($base['hash'] ?? null)) {
                 $changed = true;
             }
 
@@ -101,12 +96,24 @@ class IncrementalService
      */
     public function getLatestFullSnapshot(): ?BackupSnapshot
     {
-        return BackupSnapshot::where('type', 'full')
-            ->whereHas('backupLog', function ($q) {
-                $q->where('status', 'success');
-            })
-            ->orderByDesc('created_at')
-            ->first();
+        $snapshots = BackupSnapshot::where('type', 'full')
+            ->whereHas('backupLog', fn ($q) => $q->where('status', 'success'))
+            ->with('backupLog')->orderByDesc('id')->get();
+        foreach ($snapshots as $snapshot) {
+            $metadata = $snapshot->backupLog->metadata ?? [];
+            if (($metadata['schema_version'] ?? 1) !== 2 ||
+                ($metadata['storage']['disk'] ?? null) !== config('capsule.default_disk', 'local') ||
+                ($metadata['storage']['backup_path'] ?? null) !== config('capsule.backup_path', 'backups') ||
+                ($metadata['policy'] ?? null) !== config('capsule._policy_name') ||
+                empty($metadata['archive_sha256'])) {
+                continue;
+            }
+            if (!\Illuminate\Support\Facades\Storage::disk($metadata['storage']['disk'])->exists($snapshot->backupLog->file_path)) {
+                continue;
+            }
+            return $snapshot;
+        }
+        return null;
     }
 
     /**
@@ -166,12 +173,15 @@ class IncrementalService
     protected function fileEntry(string $path, bool $computeHash): array
     {
         $entry = [
-            'size' => (int) @filesize($path),
-            'mtime' => (int) @filemtime($path),
+            'size' => (int) filesize($path),
+            'mtime' => (int) filemtime($path),
         ];
 
         if ($computeHash) {
-            $entry['hash'] = @hash_file('sha256', $path) ?: null;
+            $entry['hash'] = hash_file('sha256', $path);
+            if ($entry['hash'] === false) {
+                throw new \RuntimeException("Unable to hash backup file: {$path}");
+            }
         }
 
         return $entry;

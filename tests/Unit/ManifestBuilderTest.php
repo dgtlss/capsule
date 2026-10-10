@@ -12,7 +12,7 @@ class ManifestBuilderTest extends TestCase
         $builder = new ManifestBuilder();
         $manifest = $builder->build(false, 6, false);
 
-        $this->assertEquals(1, $manifest['schema_version']);
+        $this->assertEquals(2, $manifest['schema_version']);
         $this->assertArrayHasKey('generated_at', $manifest);
         $this->assertArrayHasKey('app', $manifest);
         $this->assertArrayHasKey('capsule', $manifest);
@@ -76,4 +76,24 @@ class ManifestBuilderTest extends TestCase
 
         @unlink($tmp);
     }
+    public function test_manifest_encoder_refuses_archives_that_restore_cannot_read(): void
+    {
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('16 MiB');
+        ManifestBuilder::encode(['entries' => [], 'padding' => str_repeat('x', \Dgtlss\Capsule\Support\RestoreArchive::MAX_MANIFEST_BYTES)]);
+    }
+
+    public function test_stream_entry_preserves_database_format_without_private_source_fields(): void
+    {
+        $builder = new ManifestBuilder();
+        $builder->addStreamEntry('database/main.sqlite', 1, str_repeat('a', 64), [
+            'driver' => 'sqlite', 'format' => 'sqlite', 'connection' => 'main', 'source_file' => '/private/source',
+        ]);
+        $entry = $builder->build(true, 1, false)['entries'][0];
+        $this->assertSame('sqlite', $entry['format']);
+        $this->assertSame('sqlite', $entry['driver']);
+        $this->assertSame('main', $entry['connection']);
+        $this->assertArrayNotHasKey('source_file', $entry);
+    }
+
 }

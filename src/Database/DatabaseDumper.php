@@ -26,15 +26,14 @@ class DatabaseDumper
     {
         $connections = config('capsule.database.connections');
 
-        if ($connections === null) {
-            return [config('database.default')];
+        $connections = $connections === null ? [config('database.default')] : (is_string($connections) ? [$connections] : $connections);
+        $resolved = array_map(fn ($name) => $name === 'default' ? config('database.default') : $name, $connections);
+        foreach ($resolved as $name) {
+            if (!is_string($name) || !preg_match('/^[A-Za-z0-9_-]+$/D', $name)) {
+                throw new Exception('Database connection names must contain only letters, numbers, underscores and hyphens for portable recovery.');
+            }
         }
-
-        $connections = is_string($connections) ? [$connections] : $connections;
-
-        return array_map(function ($c) {
-            return $c === 'default' ? config('database.default') : $c;
-        }, $connections);
+        return array_values(array_unique($resolved));
     }
 
     public function dump(string $connection, string $dumpPath): void
@@ -80,7 +79,7 @@ class DatabaseDumper
         return match ($driver) {
             'mysql', 'mariadb' => $this->buildMysqlStreamCommand($config),
             'pgsql' => $this->buildPostgresStreamCommand($config),
-            'sqlite' => ['command' => sprintf('cat %s', escapeshellarg($config['database'])), 'cleanup' => null],
+            'sqlite' => $this->buildSqliteStreamCommand($config),
             default => throw new Exception("Unsupported database driver for streaming: {$driver}"),
         };
     }
@@ -164,103 +163,12 @@ class DatabaseDumper
 
     protected function dumpMysql(array $config, string $dumpPath): void
     {
-        $dumpCommand = $this->getMysqlDumpCommand();
-        $configFile = $this->buildMysqlConfigFile($config, $dumpCommand);
-
-        try {
-            $safeFlags = implode(' ', $this->buildMysqlFlags());
-            $tableArgs = $this->buildMysqlTableArgs($config['database']);
-
-            if ($tableArgs['useInclude']) {
-                $command = sprintf('%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1', $dumpCommand, escapeshellarg($configFile), $safeFlags, $tableArgs['extraFlags'], escapeshellarg($config['database']), $tableArgs['tablesArg'], escapeshellarg($dumpPath));
-            } else {
-                $command = sprintf('%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1', $dumpCommand, escapeshellarg($configFile), $safeFlags, $tableArgs['extraFlags'], $tableArgs['ignoreFlags'], escapeshellarg($config['database']), escapeshellarg($dumpPath));
-            }
-
-            $output = [];
-            $returnCode = 0;
-            exec($command, $output, $returnCode);
-
-            if ($returnCode !== 0) {
-                $outputText = trim(implode("\n", $output));
-                $retried = $this->retryMysqlWithoutRoutines($dumpCommand, $configFile, $config, $tableArgs, $dumpPath);
-
-                if (!$retried) {
-                    throw new Exception("MySQL dump failed with return code: {$returnCode}" . (!empty($outputText) ? "\nCommand output:\n{$outputText}" : ''));
-                }
-            }
-        } finally {
-            if (file_exists($configFile)) {
-                unlink($configFile);
-            }
-        }
-    }
-
-    protected function retryMysqlWithoutRoutines(string $dumpCommand, string $configFile, array $config, array $tableArgs, string $dumpPath): bool
-    {
-        $includeTriggers = (bool) config('capsule.database.include_triggers', true);
-        $includeRoutines = (bool) config('capsule.database.include_routines', false);
-
-        if (!$includeTriggers && !$includeRoutines) {
-            return false;
-        }
-
-        $fallbackFlags = implode(' ', ['--single-transaction', '--hex-blob', '--skip-triggers']);
-
-        if ($tableArgs['useInclude']) {
-            $retryCommand = sprintf('%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1', $dumpCommand, escapeshellarg($configFile), $fallbackFlags, $tableArgs['extraFlags'], escapeshellarg($config['database']), $tableArgs['tablesArg'], escapeshellarg($dumpPath));
-        } else {
-            $retryCommand = sprintf('%s --defaults-extra-file=%s %s %s %s %s > %s 2>&1', $dumpCommand, escapeshellarg($configFile), $fallbackFlags, $tableArgs['extraFlags'], $tableArgs['ignoreFlags'], escapeshellarg($config['database']), escapeshellarg($dumpPath));
-        }
-
-        $retryOutput = [];
-        $retryCode = 0;
-        exec($retryCommand, $retryOutput, $retryCode);
-
-        if ($retryCode === 0) {
-            \Illuminate\Support\Facades\Log::warning('MySQL dump succeeded after disabling routines/triggers', [
-                'database' => $config['database'] ?? null,
-            ]);
-            return true;
-        }
-
-        return false;
+        $this->runDumpToFile($this->buildMysqlStreamCommand($config), $dumpPath, 'MySQL');
     }
 
     protected function startMysqlDumpProcess(array $config, string $dumpPath)
     {
-        $dumpCommand = $this->getMysqlDumpCommand();
-        $configFile = $this->buildMysqlConfigFile($config, $dumpCommand);
-        $safeFlags = implode(' ', $this->buildMysqlFlags());
-        $tableArgs = $this->buildMysqlTableArgs($config['database']);
-        $extraFlags = trim($safeFlags . ' ' . $tableArgs['extraFlags']);
-
-        // Must match dumpMysql() / sequential path: include_tables / ignore-table / extra flags.
-        if ($tableArgs['useInclude']) {
-            $command = sprintf(
-                '%s --defaults-extra-file=%s %s %s %s > %s 2>&1; rm %s',
-                $dumpCommand,
-                escapeshellarg($configFile),
-                $extraFlags,
-                escapeshellarg($config['database']),
-                $tableArgs['tablesArg'],
-                escapeshellarg($dumpPath),
-                escapeshellarg($configFile)
-            );
-        } else {
-            $command = sprintf(
-                '%s --defaults-extra-file=%s %s %s %s > %s 2>&1; rm %s',
-                $dumpCommand,
-                escapeshellarg($configFile),
-                $extraFlags,
-                $tableArgs['ignoreFlags'],
-                escapeshellarg($config['database']),
-                escapeshellarg($dumpPath),
-                escapeshellarg($configFile)
-            );
-        }
-
-        return proc_open($command, [], $pipes);
+        return $this->startDumpToFile($this->buildMysqlStreamCommand($config), $dumpPath);
     }
 
     protected function buildMysqlStreamCommand(array $config): array
@@ -269,6 +177,7 @@ class DatabaseDumper
         $configFile = $this->buildMysqlConfigFile($config, $dumpCommand);
         $safeFlags = implode(' ', $this->buildMysqlFlags());
         $tableArgs = $this->buildMysqlTableArgs($config['database']);
+        $safeFlags = trim($safeFlags . ' ' . $tableArgs['extraFlags']);
 
         if ($tableArgs['useInclude']) {
             $command = sprintf('%s --defaults-extra-file=%s %s %s %s', $dumpCommand, escapeshellarg($configFile), $safeFlags, escapeshellarg($config['database']), $tableArgs['tablesArg']);
@@ -322,52 +231,12 @@ class DatabaseDumper
 
     protected function dumpPostgres(array $config, string $dumpPath): void
     {
-        $pgpassFile = $this->buildPgpassFile($config);
-
-        try {
-            $tableFlags = $this->buildPostgresTableFlags();
-            $command = sprintf(
-                'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s --no-owner --no-privileges --format=plain %s > %s 2>&1',
-                escapeshellarg($pgpassFile),
-                escapeshellarg($config['host']),
-                escapeshellarg($config['port'] ?? 5432),
-                escapeshellarg($config['username']),
-                escapeshellarg($config['database']),
-                $tableFlags,
-                escapeshellarg($dumpPath)
-            );
-
-            exec($command, $output, $returnCode);
-
-            if ($returnCode !== 0) {
-                throw new Exception("PostgreSQL dump failed with return code: {$returnCode}" . (!empty($output) ? "\nCommand output: " . implode("\n", $output) : ''));
-            }
-        } finally {
-            if (file_exists($pgpassFile)) {
-                unlink($pgpassFile);
-            }
-        }
+        $this->runDumpToFile($this->buildPostgresStreamCommand($config), $dumpPath, 'PostgreSQL');
     }
 
     protected function startPostgresDumpProcess(array $config, string $dumpPath)
     {
-        $pgpassFile = $this->buildPgpassFile($config);
-        $tableFlags = $this->buildPostgresTableFlags();
-
-        // Must match dumpPostgres(): same format and table include/exclude flags.
-        $command = sprintf(
-            'PGPASSFILE=%s pg_dump --host=%s --port=%s --username=%s --dbname=%s --no-owner --no-privileges --format=plain %s > %s 2>&1; rm %s',
-            escapeshellarg($pgpassFile),
-            escapeshellarg($config['host']),
-            escapeshellarg($config['port'] ?? 5432),
-            escapeshellarg($config['username']),
-            escapeshellarg($config['database']),
-            $tableFlags,
-            escapeshellarg($dumpPath),
-            escapeshellarg($pgpassFile)
-        );
-
-        return proc_open($command, [], $pipes);
+        return $this->startDumpToFile($this->buildPostgresStreamCommand($config), $dumpPath);
     }
 
     protected function buildPostgresStreamCommand(array $config): array
@@ -388,21 +257,131 @@ class DatabaseDumper
         return ['command' => $command, 'cleanup' => $pgpassFile];
     }
 
-    // ─── SQLite ─────────────────────────────────────────────────────────
-
-    protected function dumpSqlite(array $config, string $dumpPath): void
+    /**
+     * Keep stderr out of the SQL file, and always check the dump command itself.
+     * A failed dump must not be retried with fewer schema objects: that would
+     * silently produce a different backup from the one the user requested.
+     */
+    protected function runDumpToFile(array $streamInfo, string $dumpPath, string $driver): void
     {
-        if (!file_exists($config['database'])) {
-            throw new Exception("SQLite database file not found: {$config['database']}");
+        $stderr = tmpfile();
+        if ($stderr === false) {
+            $this->cleanupStream($streamInfo);
+            throw new Exception('Unable to create database dump error stream.');
         }
 
-        if (!copy($config['database'], $dumpPath)) {
-            throw new Exception("Failed to copy SQLite database from {$config['database']} to {$dumpPath}");
+        try {
+            $process = proc_open($streamInfo['command'], [
+                1 => ['file', $dumpPath, 'wb'],
+                2 => $stderr,
+            ], $pipes);
+            if (!is_resource($process)) {
+                throw new Exception("Unable to start {$driver} dump process.");
+            }
+
+            $returnCode = proc_close($process);
+            if ($returnCode !== 0) {
+                rewind($stderr);
+                $error = trim((string) stream_get_contents($stderr, 8192));
+                throw new Exception("{$driver} dump failed with return code: {$returnCode}" . ($error !== '' ? "\n{$error}" : ''));
+            }
+        } finally {
+            fclose($stderr);
+            $this->cleanupStream($streamInfo);
         }
     }
 
     /**
-     * SQLite is just a file copy -- handled synchronously even in parallel mode.
+     * The shell owns credential cleanup while the caller owns proc_close().
+     * Capture the dump exit status before cleanup so rm cannot mask a failure.
+     * Stderr is inherited separately and is never written into the SQL file.
+     */
+    protected function startDumpToFile(array $streamInfo, string $dumpPath)
+    {
+        $command = $streamInfo['command'];
+        if (!empty($streamInfo['cleanup'])) {
+            $cleanup = 'dump_status=$?; trap - EXIT; rm -f -- '
+                . escapeshellarg($streamInfo['cleanup']) . '; exit "$dump_status"';
+            $command = 'trap ' . escapeshellarg($cleanup) . ' EXIT; '
+                . "trap 'exit 143' TERM; trap 'exit 130' INT; " . $command;
+        }
+
+        try {
+            $process = proc_open($command, [1 => ['file', $dumpPath, 'wb']], $pipes);
+            if (!is_resource($process)) {
+                throw new Exception('Unable to start database dump process.');
+            }
+            return $process;
+        } catch (\Throwable $e) {
+            $this->cleanupStream($streamInfo);
+            throw $e;
+        }
+    }
+
+    protected function cleanupStream(array $streamInfo): void
+    {
+        if (!empty($streamInfo['cleanup']) && file_exists($streamInfo['cleanup'])) {
+            @unlink($streamInfo['cleanup']);
+        }
+    }
+
+    // ─── SQLite ─────────────────────────────────────────────────────────
+
+    protected function dumpSqlite(array $config, string $dumpPath): void
+    {
+        $source = $config['database'] ?? '';
+        if (!is_file($source)) {
+            throw new Exception("SQLite database file not found: {$source}");
+        }
+        if (realpath($source) === realpath($dumpPath)) {
+            throw new Exception('SQLite snapshot destination must differ from the source database.');
+        }
+
+        // VACUUM INTO reads a transactionally consistent view, including rows
+        // still in a live WAL. Copying only the main file loses those rows.
+        $snapshot = tempnam(dirname($dumpPath), '.capsule_sqlite_');
+        if ($snapshot === false) {
+            throw new Exception('Unable to create SQLite snapshot file.');
+        }
+
+        try {
+            chmod($snapshot, config('capsule.security.temp_file_permissions', 0600));
+            $database = new \PDO('sqlite:' . $source, null, null, [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION]);
+            $database->exec('PRAGMA busy_timeout = 5000');
+            $database->exec('VACUUM INTO ' . $database->quote($snapshot));
+            $database = null;
+            DumpValidator::validate($snapshot, 'sqlite');
+
+            if (!rename($snapshot, $dumpPath)) {
+                throw new Exception("Unable to move SQLite snapshot to {$dumpPath}");
+            }
+        } catch (\Throwable $e) {
+            throw new Exception('SQLite snapshot failed (requires SQLite 3.27 or newer): ' . $e->getMessage(), 0, $e);
+        } finally {
+            if (is_file($snapshot)) {
+                @unlink($snapshot);
+            }
+        }
+    }
+
+    protected function buildSqliteStreamCommand(array $config): array
+    {
+        $snapshot = tempnam(sys_get_temp_dir(), 'capsule_sqlite_');
+        if ($snapshot === false) {
+            throw new Exception('Unable to create SQLite streaming snapshot.');
+        }
+
+        try {
+            $this->dumpSqlite($config, $snapshot);
+            return ['command' => 'cat ' . escapeshellarg($snapshot), 'cleanup' => $snapshot];
+        } catch (\Throwable $e) {
+            @unlink($snapshot);
+            throw $e;
+        }
+    }
+
+    /**
+     * SQLite snapshots are created synchronously even in parallel mode.
      * @return null
      */
     protected function dumpSqliteSynchronously(array $config, string $dumpPath)
