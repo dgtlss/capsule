@@ -40,7 +40,8 @@ class VerifyScheduledCommand extends Command
                 'entries_checked' => $result->entries_checked,
                 'entries_failed' => $result->entries_failed,
                 'duration_seconds' => $result->duration_seconds,
-                'error' => $result->error_message,
+                'error' => $result->status === 'passed' ? null : $result->error_message,
+                'warnings' => $result->status === 'passed' && $result->error_message ? [$result->error_message] : [],
             ], JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE));
         } else {
             $statusLabel = match ($result->status) {
@@ -52,7 +53,11 @@ class VerifyScheduledCommand extends Command
             $this->line("Backup #{$result->backup_log_id}: {$statusLabel} ({$result->entries_checked} entries checked, {$result->duration_seconds}s)");
 
             if ($result->error_message) {
-                $this->error($result->error_message);
+                if ($result->status === 'passed') {
+                    $this->warn($result->error_message);
+                } else {
+                    $this->error($result->error_message);
+                }
             }
         }
 

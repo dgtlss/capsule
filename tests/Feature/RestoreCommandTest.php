@@ -84,7 +84,7 @@ class RestoreCommandTest extends TestCase
     #[DataProvider('unsafeNames')]
     public function test_unsafe_archive_names_are_rejected_before_any_writes(string $name): void
     {
-        $archive = $this->archive(['files/safe.txt' => 'safe', $name => 'escape']);
+        $archive = $this->archive(['files/safe.txt' => 'safe', $name => 'escape'], ['schema_version' => 2]);
         [$code, $result] = $this->restore($archive);
         $this->assertSame(1, $code);
         $this->assertSame('failed', $result['status']);

@@ -8,13 +8,14 @@ use Dgtlss\Capsule\Services\ChunkedBackupService;
 use Dgtlss\Capsule\Services\PolicyRunner;
 use Dgtlss\Capsule\Services\SimulationService;
 use Dgtlss\Capsule\Support\BackupReport;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 use Illuminate\Console\Command;
 
 class BackupCommand extends Command
 {
     protected $signature = 'capsule:backup 
     {--force : Force backup even if another is running} 
-    {--no-local : Stream backup directly to external storage without using local disk}
+    {--no-local : Stream without a local archive; encrypted output requires Capsule to decrypt (SQLite snapshots still use disk)}
     {--detailed : Verbose output with progress details}
     {--parallel : Enable parallel processing for multiple databases}
     {--compress= : Compression level 1-9 (defaults to config)}
@@ -60,6 +61,8 @@ class BackupCommand extends Command
 
                 // Resolve dependencies after applying overrides: storage captures its disk at construction.
                 $useChunkedBackup = (bool) $this->option('no-local');
+                $encrypted = (bool) $this->option('encrypt') || (bool) config('capsule.security.encrypt_backups', false);
+                $requiresCapsule = $useChunkedBackup && $encrypted;
                 $incremental = (bool) ($this->option('incremental') || config('capsule._policy_incremental', false));
                 if ($useChunkedBackup && $incremental) {
                     throw new \InvalidArgumentException('Incremental backups require local archive creation; remove --no-local.');
@@ -79,7 +82,10 @@ class BackupCommand extends Command
                     $service->setOutputCallback(fn ($message) => $this->info($message));
                 }
                 if (!$json) {
-                    $this->info($useChunkedBackup ? 'Starting chunked backup process (no local storage)...' : 'Starting backup process...');
+                    $this->info($useChunkedBackup ? 'Starting streamed backup (no local archive)...' : 'Starting backup process...');
+                    if ($requiresCapsule) {
+                        $this->warn('Capsule is required to decrypt this .capsule.enc backup. Keep a compatible Capsule copy and the password for recovery.');
+                    }
                     if ($this->option('policy')) {
                         $this->info('Using policy: ' . $this->option('policy'));
                     }
@@ -88,7 +94,16 @@ class BackupCommand extends Command
                 $success = $service->run((bool) $this->option('force'));
                 $duration = round(microtime(true) - $startTime, 2);
                 if ($json) {
-                    $payload = ['status' => $success ? 'success' : 'failed', 'duration_seconds' => $duration];
+                    $payload = ['status' => $success ? 'success' : 'failed', 'duration_seconds' => $duration,
+                        'archive_format' => $requiresCapsule ? EncryptedArchive::FORMAT : 'zip',
+                        'requires_capsule' => $requiresCapsule,
+                        'encryption' => $encrypted ? ($requiresCapsule ? 'sodium-secretstream' : 'zip-aes256') : 'none'];
+                    if ($requiresCapsule) {
+                        $payload['recovery_instruction'] = 'Capsule and the backup password are required to decrypt this .capsule.enc backup.';
+                    }
+                    if ($service instanceof ChunkedBackupService && $service->getLastArchiveMetadata() !== null) {
+                        $payload = array_merge($payload, $service->getLastArchiveMetadata());
+                    }
                     if (!$success) {
                         $payload['error'] = $service->getLastError();
                     }

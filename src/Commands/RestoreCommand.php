@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Database\DumpValidator;
 use Dgtlss\Capsule\Models\BackupLog;
+use Dgtlss\Capsule\Models\BackupSnapshot;
 use Dgtlss\Capsule\Services\AuditLogger;
 use Dgtlss\Capsule\Support\Helpers;
 use Dgtlss\Capsule\Support\RestoreArchive;
@@ -15,10 +16,11 @@ class RestoreCommand extends Command
 {
     protected $signature = 'capsule:restore
         {id? : Backup log ID to restore (defaults to latest)}
-        {--archive= : Explicit local ZIP archive; no backup log is required}
+        {--archive= : Local ZIP or Capsule encrypted backup; no backup log is required}
         {--disk= : Storage disk for an explicit archive object}
         {--path= : Storage object path; no backup log is required}
-        {--base-archive= : Local base archive for a portable incremental restore}
+        {--base-archive= : Local base archive for an incremental restore}
+        {--max-manifest-bytes= : Maximum manifest JSON bytes per archive (defaults to capsule.restore.max_manifest_bytes)}
         {--db-only : Only restore database dumps}
         {--files-only : Only restore files}
         {--target= : Target directory for files (default: application base path)}
@@ -36,15 +38,29 @@ class RestoreCommand extends Command
     protected array $archives = [];
     protected array $temporaryArchives = [];
     protected array $seenArchives = [];
+    protected array $archiveFormats = [];
+    protected array $warnings = [];
+    protected bool $warningsShown = false;
+    protected array $caseSensitiveDirectories = [];
+    protected int $maxManifestBytes = RestoreArchive::MAX_MANIFEST_BYTES;
 
     public function handle(): int
     {
-        $this->archives = $this->temporaryArchives = $this->seenArchives = [];
+        $this->archives = $this->temporaryArchives = $this->seenArchives = $this->archiveFormats = [];
+        $this->warnings = [];
+        $this->warningsShown = false;
+        $this->caseSensitiveDirectories = [];
         $backup = null;
         try {
             $this->validateOptions();
             [$localPath, $backup, $source] = $this->resolveSource();
-            $chain = $this->loadArchiveChain($localPath, true);
+            $expectedHash = $backup?->metadata['archive_sha256'] ?? null;
+            if ($expectedHash !== null && (!is_string($expectedHash) || !preg_match('/^[a-f0-9]{64}$/iD', $expectedHash)
+                || !hash_equals(strtolower($expectedHash), hash_file('sha256', $localPath)))) {
+                throw new RuntimeException('Backup checksum differs from its recorded checksum.');
+            }
+            $expectedFormat = RestoreArchive::formatExpectation($source['path'] ?? $localPath, $backup?->metadata ?? []);
+            $chain = $this->loadArchiveChain($localPath, true, $expectedFormat);
             $plan = $this->buildPlan($chain);
             if ($this->option('list')) {
                 return $this->showContents($chain, $backup, $source);
@@ -52,6 +68,7 @@ class RestoreCommand extends Command
             // Verify every archive and every destination before any import, overwrite,
             // directory creation or deletion. This also applies to dry runs.
             $this->validatePlan($plan);
+            $this->showWarnings();
             if (!$this->option('dry-run') && !$this->option('force')) {
                 if ($this->isJson()) {
                     throw new RuntimeException('Use --force to authorize a non-interactive JSON restore, or --dry-run to preview it.');
@@ -84,12 +101,15 @@ class RestoreCommand extends Command
             foreach ($this->temporaryArchives as $path) {
                 @unlink($path);
             }
-            $this->archives = $this->temporaryArchives = $this->seenArchives = [];
+            $this->archives = $this->temporaryArchives = $this->seenArchives = $this->archiveFormats = [];
         }
     }
 
     protected function validateOptions(): void
     {
+        $this->maxManifestBytes = RestoreArchive::manifestByteLimit(
+            $this->option('max-manifest-bytes') ?? config('capsule.restore.max_manifest_bytes', RestoreArchive::MAX_MANIFEST_BYTES)
+        );
         if (!in_array($this->option('format'), ['table', 'json'], true)) {
             throw new RuntimeException('Output format must be table or json.');
         }
@@ -161,6 +181,7 @@ class RestoreCommand extends Command
             throw new RuntimeException('Failed to create archive staging file.');
         }
         $this->temporaryArchives[] = $temporary;
+        $this->archiveFormats[$temporary] = RestoreArchive::formatExpectation($path);
         $output = fopen($temporary, 'wb');
         if ($output === false) {
             fclose($input);
@@ -179,7 +200,7 @@ class RestoreCommand extends Command
     }
 
     /** @return RestoreArchive[] Base first, then each incremental layer. */
-    protected function loadArchiveChain(string $path, bool $topLevel = false): array
+    protected function loadArchiveChain(string $path, bool $topLevel = false, ?string $expectedFormat = null): array
     {
         $digest = @hash_file('sha256', $path);
         if ($digest === false || isset($this->seenArchives[$digest]) || count($this->seenArchives) >= 64) {
@@ -187,9 +208,12 @@ class RestoreCommand extends Command
         }
         $this->seenArchives[$digest] = true;
         $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-        $archive = new RestoreArchive($path, $password);
+        $archive = new RestoreArchive($path, $password, $expectedFormat ?? $this->archiveFormats[$path] ?? null, $this->maxManifestBytes);
         $this->archives[] = $archive;
         $archive->verifyAndStage();
+        foreach ($archive->warnings() as $warning) {
+            $this->warnings[$warning] = $warning;
+        }
         $manifest = $archive->manifest();
         $type = $manifest['backup_type'] ?? 'full';
         if (!in_array($type, ['full', 'incremental'], true)) {
@@ -203,6 +227,9 @@ class RestoreCommand extends Command
         }
         $base = $manifest['base_archive'] ?? null;
         if (!is_array($base)) {
+            if (($manifest['schema_version'] ?? null) === 1 && !array_key_exists('base_archive', $manifest)) {
+                return array_merge($this->loadLegacyBase($manifest, $topLevel), [$archive]);
+            }
             throw new RuntimeException('Incremental archive has no portable base_archive reference.');
         }
         $expected = $base['sha256'] ?? null;
@@ -227,10 +254,64 @@ class RestoreCommand extends Command
         return array_merge($this->loadArchiveChain($basePath), [$archive]);
     }
 
+    /** Schema 1 stored a catalog ID, not a portable or checksum-bound base. */
+    protected function loadLegacyBase(array $manifest, bool $topLevel): array
+    {
+        $snapshotId = $manifest['base_snapshot_id'] ?? null;
+        if (!is_int($snapshotId) || $snapshotId < 1) {
+            throw new RuntimeException('Legacy incremental archive has no valid base_snapshot_id.');
+        }
+        if (!empty($manifest['deleted_files'])) {
+            throw new RuntimeException('Legacy incremental archives did not record deletions; unexpected deletion records are unsafe.');
+        }
+        $expectedFormat = null;
+        if ($topLevel && $this->option('base-archive')) {
+            $basePath = $this->option('base-archive');
+            if (!is_file($basePath) || !is_readable($basePath)) {
+                throw new RuntimeException('The supplied base archive is not readable.');
+            }
+            $expectedFormat = RestoreArchive::formatExpectation($basePath);
+        } else {
+            try {
+                $snapshot = BackupSnapshot::with('backupLog')->find($snapshotId);
+            } catch (\Throwable $e) {
+                throw new RuntimeException('Legacy incremental recovery needs its backup catalog or an explicit --base-archive full backup.', 0, $e);
+            }
+            $backup = $snapshot?->backupLog;
+            if (!$snapshot || $snapshot->type !== 'full' || !$backup || $backup->status !== 'success') {
+                throw new RuntimeException('Legacy incremental base snapshot has no successful full backup; supply the original full backup with --base-archive.');
+            }
+            $metadata = $backup->metadata ?? [];
+            $disk = $metadata['storage']['disk'] ?? $metadata['disk'] ?? config('capsule.default_disk', 'local');
+            $path = $metadata['storage']['path'] ?? $backup->file_path;
+            if (!is_string($disk) || $disk === '' || !is_string($path) || $path === '') {
+                throw new RuntimeException('Legacy incremental base backup has no usable storage reference.');
+            }
+            $basePath = $this->downloadArchive($disk, $path);
+            $expected = $metadata['archive_sha256'] ?? null;
+            if ($expected !== null && (!is_string($expected) || !preg_match('/^[a-f0-9]{64}$/iD', $expected)
+                || !hash_equals(strtolower($expected), hash_file('sha256', $basePath)))) {
+                throw new RuntimeException('Legacy incremental base archive differs from its recorded checksum.');
+            }
+            $expectedFormat = RestoreArchive::formatExpectation($path, $metadata);
+        }
+        $chain = $this->loadArchiveChain($basePath, false, $expectedFormat);
+        if (count($chain) !== 1 || ($chain[0]->manifest()['backup_type'] ?? 'full') !== 'full') {
+            throw new RuntimeException('Legacy incremental recovery requires its original full base archive.');
+        }
+        $warning = 'Legacy incremental manifest has no historical base archive checksum; the selected base identity cannot be verified against the incremental.';
+        $this->warnings[$warning] = $warning;
+        $warning = 'Legacy incremental recovery overlays the recorded changes on the full base. Historical deletions were not recorded, so deleted files may remain; this is not an exact point-in-time snapshot.';
+        $this->warnings[$warning] = $warning;
+        return $chain;
+    }
+
     protected function buildPlan(array $chain): array
     {
         $files = $databases = $deletions = [];
         foreach ($chain as $archive) {
+            $manifest = $archive->manifest();
+            $layerDatabases = [];
             foreach ($archive->deletions() as $name) {
                 unset($files[$name]);
                 $deletions[$name] = $name;
@@ -240,9 +321,28 @@ class RestoreCommand extends Command
                     $files[$name] = $entry;
                     unset($deletions[$name]);
                 } elseif (preg_match('#^database/([^/]+)\.(sql|sqlite)$#D', $name, $match)) {
-                    $entry['connection'] = $this->option('connection') ?: ($entry['connection'] ?? $match[1]);
+                    $sourceConnection = $entry['connection'] ?? $match[1];
+                    if (!isset($entry['connection']) && ($manifest['schema_version'] ?? null) === 1
+                        && ($manifest['capsule']['chunked'] ?? false) === true
+                        && preg_match('/^(.+)_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$/D', $match[1], $legacy)) {
+                        $connections = $manifest['database']['connections'] ?? [];
+                        if (!is_array($connections) || !in_array($legacy[1], $connections, true)) {
+                            throw new RuntimeException('Legacy timestamped database dump does not match a recorded connection.');
+                        }
+                        $sourceConnection = $legacy[1];
+                    }
+                    if (!is_string($sourceConnection) || !preg_match('/^[A-Za-z0-9_-]+$/D', $sourceConnection)) {
+                        throw new RuntimeException('Invalid database connection name in manifest.');
+                    }
+                    if (isset($layerDatabases[$sourceConnection])) {
+                        throw new RuntimeException('Multiple database dumps resolve to the same restore target.');
+                    }
+                    $layerDatabases[$sourceConnection] = true;
+                    $entry['connection'] = $this->option('connection') ?: $sourceConnection;
                     $entry['format'] = $entry['format'] ?? ($match[2] === 'sqlite' ? 'sqlite' : null);
-                    $databases[$name] = $entry;
+                    // Each layer contains complete database dumps. Keep only the
+                    // newest dump for a source connection, including old timestamps.
+                    $databases[$sourceConnection] = $entry;
                 }
             }
         }
@@ -264,24 +364,17 @@ class RestoreCommand extends Command
     {
         $writes = $deletions = $portablePaths = [];
         foreach ($plan['files'] as $name => $entry) {
-            $writes[$this->targetPath($name)] = true;
+            $legacy = ($entry['legacy_paths'] ?? false) === true;
+            $writes[$this->targetPath($name, $legacy)] = $legacy;
         }
         foreach ($plan['deletions'] as $name) {
             $deletions[$this->targetPath($name)] = true;
         }
-        foreach (array_merge(array_keys($writes), array_keys($deletions)) as $path) {
-            $key = strtolower($path);
-            if (isset($portablePaths[$key])) {
-                throw new RuntimeException("Conflicting restore destinations: {$path}");
-            }
-            $portablePaths[$key] = true;
-        }
         // Historical deletions may be parents/children of new files. Only writes
         // describe the final tree, so validate their mutual conflicts separately.
-        $portableWrites = array_change_key_case($writes, CASE_LOWER);
         foreach (array_keys($writes) as $path) {
-            for ($parent = dirname(strtolower($path)); $parent !== dirname($parent); $parent = dirname($parent)) {
-                if (isset($portableWrites[$parent])) {
+            for ($parent = dirname($path); $parent !== dirname($parent); $parent = dirname($parent)) {
+                if (array_key_exists($parent, $writes)) {
                     throw new RuntimeException('Restore plan contains conflicting file and directory destinations.');
                 }
             }
@@ -292,6 +385,25 @@ class RestoreCommand extends Command
         }
         foreach (array_keys($deletions) as $path) {
             $this->assertPlannedDestination($path, true, $deletions);
+        }
+        // Include directory components: A/x and a/y also need a filesystem that
+        // preserves historical case distinctions, even though their leaves differ.
+        foreach ($writes + array_fill_keys(array_keys($deletions), false) as $path => $legacy) {
+            for ($current = $path; $current !== dirname($current); $current = dirname($current)) {
+                $key = strtolower($current);
+                $portablePaths[$key][$current] = ($portablePaths[$key][$current] ?? true) && $legacy;
+            }
+        }
+        foreach ($portablePaths as $paths) {
+            if (count($paths) < 2) {
+                continue;
+            }
+            if (in_array(false, $paths, true)) {
+                throw new RuntimeException('Conflicting restore destinations: ' . implode(', ', array_keys($paths)));
+            }
+            foreach (array_keys($paths) as $path) {
+                $this->assertCaseSensitiveFilesystem($path);
+            }
         }
         $databaseTargets = [];
         foreach ($plan['databases'] as $entry) {
@@ -327,9 +439,16 @@ class RestoreCommand extends Command
         }
     }
 
-    protected function targetPath(string $name): string
+    protected function targetPath(string $name, bool $legacy = false): string
     {
-        RestoreArchive::assertSafeName($name);
+        RestoreArchive::assertSafeName($name, !$legacy);
+        if ($legacy && PHP_OS_FAMILY === 'Windows') {
+            try {
+                RestoreArchive::assertSafeName($name);
+            } catch (\Throwable $e) {
+                throw new RuntimeException('This historical filename requires a compatible Unix target filesystem; restore there without renaming archive entries: ' . $name, 0, $e);
+            }
+        }
         if (!str_starts_with($name, 'files/') || strlen($name) <= 6) {
             throw new RuntimeException("Invalid restore file path: {$name}");
         }
@@ -351,6 +470,66 @@ class RestoreCommand extends Command
             }
         }
         return rtrim($prefix . implode('/', $components), '/') . '/' . substr($name, 6);
+    }
+
+    /** Prove case distinctions on the actual target filesystem using private files. */
+    protected function assertCaseSensitiveFilesystem(string $path): void
+    {
+        $directory = dirname($path);
+        while (!is_dir($directory) && $directory !== dirname($directory)) {
+            $directory = dirname($directory);
+        }
+        if (isset($this->caseSensitiveDirectories[$directory])) {
+            return;
+        }
+        $message = 'Historical case-distinct filenames require a case-sensitive target filesystem. Choose a compatible writable target directory: ' . $directory;
+        $probe = $alternate = null;
+        $probeCreated = $alternateCreated = false;
+        $lower = $upper = null;
+        $mask = null;
+        try {
+            if (!is_dir($directory) || !is_writable($directory)) {
+                throw new RuntimeException($message);
+            }
+            $suffix = bin2hex(random_bytes(16));
+            $probe = $directory . '/.capsule_case_' . $suffix;
+            $alternate = $directory . '/.CAPSULE_case_' . $suffix;
+            $mask = umask(0077);
+            $lower = @fopen($probe, 'x+b');
+            if ($lower === false) {
+                throw new RuntimeException($message);
+            }
+            $probeCreated = true;
+            $upper = @fopen($alternate, 'x+b');
+            if ($upper === false) {
+                throw new RuntimeException($message);
+            }
+            $alternateCreated = true;
+            umask($mask);
+            $mask = null;
+            if (fwrite($lower, 'lower') !== 5 || fwrite($upper, 'upper') !== 5
+                || !fflush($lower) || !fflush($upper) || !rewind($lower) || !rewind($upper)
+                || fread($lower, 5) !== 'lower' || fread($upper, 5) !== 'upper') {
+                throw new RuntimeException($message);
+            }
+            $this->caseSensitiveDirectories[$directory] = true;
+        } finally {
+            if ($mask !== null) {
+                umask($mask);
+            }
+            if (is_resource($lower)) {
+                fclose($lower);
+            }
+            if (is_resource($upper)) {
+                fclose($upper);
+            }
+            if ($alternateCreated) {
+                @unlink($alternate);
+            }
+            if ($probeCreated) {
+                @unlink($probe);
+            }
+        }
     }
 
     protected function assertSafeDestination(string $path): void
@@ -475,7 +654,7 @@ class RestoreCommand extends Command
             $counts['files_deleted']++;
         }
         foreach ($plan['files'] as $name => $entry) {
-            $path = $this->targetPath($name);
+            $path = $this->targetPath($name, ($entry['legacy_paths'] ?? false) === true);
             if ($verbose) {
                 $this->progress("File {$name}");
             }
@@ -528,6 +707,7 @@ class RestoreCommand extends Command
         if ($this->isJson()) {
             $this->result($result);
         } else {
+            $this->showWarnings();
             foreach ($entries as $entry) {
                 $this->line(Helpers::formatBytes($entry['size']) . '  ' . $entry['path']);
             }
@@ -553,10 +733,24 @@ class RestoreCommand extends Command
 
     protected function result(array $result, ?string $message = null, bool $error = false): void
     {
+        if ($this->warnings) {
+            $result['warnings'] = array_values($this->warnings);
+        }
         if ($this->isJson()) {
             $this->line(json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR));
         } elseif ($message !== null) {
+            $this->showWarnings();
             $error ? $this->error($message) : $this->info($message);
+        }
+    }
+
+    protected function showWarnings(): void
+    {
+        if (!$this->isJson() && !$this->warningsShown) {
+            foreach ($this->warnings as $warning) {
+                $this->warn($warning);
+            }
+            $this->warningsShown = true;
         }
     }
 

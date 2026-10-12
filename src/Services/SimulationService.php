@@ -13,7 +13,7 @@ class SimulationService
 {
     protected DatabaseDumper $databaseDumper;
 
-    public function __construct(DatabaseDumper $databaseDumper = null)
+    public function __construct(?DatabaseDumper $databaseDumper = null)
     {
         $this->databaseDumper = $databaseDumper ?? new DatabaseDumper();
     }

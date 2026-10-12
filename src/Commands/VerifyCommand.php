@@ -46,6 +46,9 @@ class VerifyCommand extends Command
             foreach ($results as $result) {
                 if ($result['status'] === 'passed') {
                     $this->info("Backup #{$result['id']}: verification passed ({$result['entries_checked']} entries).");
+                    foreach ($result['warnings'] ?? [] as $warning) {
+                        $this->warn($warning);
+                    }
                     if (isset($result['local_path'])) {
                         $this->line('Kept downloaded file at: ' . $result['local_path']);
                     }
@@ -72,6 +75,10 @@ class VerifyCommand extends Command
                 'status' => $result['failures'] === 0 ? 'passed' : 'failed',
                 'entries_checked' => $result['checked'],
                 'disk' => $result['disk'],
+                'archive_format' => $result['archive_format'] ?? 'zip',
+                'requires_capsule' => $result['requires_capsule'] ?? false,
+                'warnings' => $result['warnings'] ?? [],
+                'checksums_complete' => $result['checksums_complete'] ?? true,
             ];
             if ($result['failures'] !== 0) {
                 $record['error'] = $result['error_summary'];

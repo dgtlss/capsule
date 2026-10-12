@@ -70,6 +70,17 @@ class BackupReliabilityTest extends TestCase
         $this->assertSame([], Storage::disk(config('capsule.default_disk'))->allFiles());
     }
 
+    public function test_nul_password_is_not_silently_shortened_by_native_libzip(): void
+    {
+        config(['capsule.security.backup_password' => "prefix\0suffix", 'capsule.security.encrypt_backups' => true]);
+        foreach ([BackupService::class, \Dgtlss\Capsule\Services\ChunkedBackupService::class] as $class) {
+            $service = app($class);
+            $this->assertFalse($service->run());
+            $this->assertStringContainsString('NUL bytes', $service->getLastError());
+            $this->assertSame([], Storage::disk(config('capsule.default_disk'))->allFiles());
+        }
+    }
+
     public function test_encrypted_archive_really_requires_password(): void
     {
         if (!ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256, true)) {

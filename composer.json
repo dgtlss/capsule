@@ -18,7 +18,9 @@
         "illuminate/mail": "^12.0|^13.0",
         "guzzlehttp/guzzle": "^7.0",
         "league/flysystem": "^3.0",
-        "ext-zip": "*"
+        "ext-zip": "*",
+        "ext-sodium": "*",
+        "ext-zlib": "*"
     },
     "suggest": {
         "league/flysystem-aws-s3-v3": "Required for S3/DigitalOcean Spaces storage (^3.0)",
@@ -52,5 +54,8 @@
     "prefer-stable": true,
     "scripts": {
         "test": "@php vendor/bin/phpunit"
-    }
+    },
+    "bin": [
+        "bin/capsule-decrypt"
+    ]
 }

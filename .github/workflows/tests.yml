@@ -27,7 +27,7 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: ${{ matrix.php }}
-          extensions: zip, mbstring, dom, pdo_sqlite, sqlite3
+          extensions: zip, sodium, zlib, mbstring, dom, pdo_sqlite, sqlite3
           coverage: none
           tools: composer:v2
       - name: Resolve the selected framework and test runner

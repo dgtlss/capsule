@@ -1,0 +1,63 @@
+#!/usr/bin/env php
+<?php
+
+use Dgtlss\Capsule\Support\BackupDecryption;
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Exception\ExceptionInterface;
+use Symfony\Component\Console\Input\ArgvInput;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+use Symfony\Component\Console\Output\ConsoleOutput;
+
+// Composer's generated proxy supplies the correct consumer autoloader. The
+// fallbacks also support running the package checkout or installed file itself.
+$autoload = $_composer_autoload_path ?? null;
+if (!is_string($autoload) || !is_file($autoload)) {
+    foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $candidate) {
+        if (is_file($candidate)) {
+            $autoload = $candidate;
+            break;
+        }
+    }
+}
+if (!is_string($autoload) || !is_file($autoload)) {
+    fwrite(STDERR, "Install dgtlss/capsule with Composer before running capsule-decrypt.\n");
+    exit(1);
+}
+require $autoload;
+
+$input = new ArgvInput();
+$output = new ConsoleOutput();
+if (BackupDecryption::rejectPasswordArguments($input, $output)) {
+    exit(1);
+}
+
+$command = new Command('decrypt');
+$command->setDescription('Capsule required to decrypt .capsule.enc; result is a normal ZIP.')
+    ->setHelp(BackupDecryption::HELP)
+    ->addArgument('source', InputArgument::REQUIRED, 'Local .capsule.enc backup file')
+    ->addOption('output', null, InputOption::VALUE_REQUIRED, 'New local ZIP file to create (never overwritten)')
+    ->addOption('password-stdin', null, InputOption::VALUE_NONE, 'Read one password line from redirected standard input')
+    ->addOption('format', null, InputOption::VALUE_REQUIRED, 'Output format (text|json)', 'text')
+    ->setCode(static fn (InputInterface $input, OutputInterface $output): int => BackupDecryption::runConsole($input, $output));
+
+$application = new Application('Capsule decrypt');
+if (method_exists($application, 'addCommand')) {
+    $application->addCommand($command);
+} else {
+    $application->add($command);
+}
+$application->setDefaultCommand('decrypt', true);
+$application->setAutoExit(false);
+$application->setCatchExceptions(false);
+try {
+    $exitCode = $application->run($input, $output);
+} catch (ExceptionInterface) {
+    // A mistyped option, unknown option name, or extra positional argument may
+    // contain a password. Suppress the parser's original message and trace.
+    $exitCode = BackupDecryption::reportInvalidArguments($input, $output);
+}
+exit($exitCode);

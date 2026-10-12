@@ -16,6 +16,7 @@ class ChunkedBackupSafetyTest extends TestCase
         parent::setUp();
         config([
             'capsule.storage.retries' => 0,
+            'capsule.security.backup_password' => '',
             'capsule.storage.backoff_ms' => 0,
             'capsule.files.enabled' => true,
             'capsule.retention.cleanup_enabled' => false,
@@ -50,7 +51,7 @@ class ChunkedBackupSafetyTest extends TestCase
         $this->assertSame([$backup->file_path], Storage::disk('capsule-test')->files('backups'));
     }
 
-    public function test_encryption_fails_before_chunks_and_same_instance_resets_for_later_runs(): void
+    public function test_missing_encryption_password_fails_before_chunks_and_same_instance_resets_for_later_runs(): void
     {
         $root = $this->sourceDirectory();
         file_put_contents($root . '/first.txt', 'first');
@@ -59,7 +60,7 @@ class ChunkedBackupSafetyTest extends TestCase
         $service = app(ChunkedBackupService::class);
         $service->setEncryption(true);
         $this->assertFalse($service->run());
-        $this->assertStringContainsString('Encrypted streaming backups are not supported', $service->getLastError());
+        $this->assertStringContainsString('password', $service->getLastError());
         $this->assertSame([], Storage::disk('capsule-test')->allFiles('backups'));
         $service->setEncryption(false);
         $this->assertTrue($service->run(), $service->getLastError() ?? 'Backup failed.');
@@ -130,7 +131,7 @@ class ChunkedBackupSafetyTest extends TestCase
         $service = app(ChunkedBackupService::class);
         $service->setEncryption(true);
         $this->assertFalse($service->run());
-        $this->assertStringContainsString('Encrypted streaming backups are not supported', $service->getLastError());
+        $this->assertStringContainsString('password', $service->getLastError());
     }
 
     public function test_streaming_replicas_are_complete_and_recorded_in_metadata(): void

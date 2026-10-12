@@ -6,18 +6,32 @@ use Illuminate\Contracts\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Log;
 use Dgtlss\Capsule\Support\RestoreArchive;
+use Dgtlss\Capsule\Security\EncryptedChunkCodec;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 use Exception;
 
 class StorageManager
 {
     protected Filesystem $disk;
     protected string $backupPath;
+    protected ?EncryptedChunkCodec $chunkCodec = null;
+    protected ?array $lastArchiveFingerprint = null;
 
     public function __construct()
     {
         $diskName = config('capsule.default_disk', 'local');
         $this->disk = $this->resolveDisk($diskName);
         $this->backupPath = config('capsule.backup_path', 'backups');
+    }
+
+    public function setChunkCodec(?EncryptedChunkCodec $codec): void
+    {
+        $this->chunkCodec = $codec;
+    }
+
+    public function getLastArchiveFingerprint(): ?array
+    {
+        return $this->lastArchiveFingerprint;
     }
 
     protected function resolveDisk(string $name): Filesystem
@@ -42,6 +56,34 @@ class StorageManager
             $path = $this->storeStream($stream, basename($filePath));
             $this->replicateToAdditionalDisks($filePath, basename($filePath));
             return $path;
+        } finally {
+            fclose($stream);
+        }
+    }
+
+    /** Persist one bounded capture chunk; encryption happens before any storage call. */
+    public function storeChunkData(#[\SensitiveParameter] string $plaintext, string $fileName): array
+    {
+        $payload = $this->chunkCodec ? $this->chunkCodec->encrypt($plaintext, $this->getPrefixedPath($fileName)) : $plaintext;
+        $stream = fopen('php://memory', 'w+b');
+        if ($stream === false) {
+            throw new Exception('Cannot buffer backup chunk.');
+        }
+        try {
+            $offset = 0;
+            while ($offset < strlen($payload)) {
+                $written = fwrite($stream, substr($payload, $offset));
+                if ($written === false || $written === 0) {
+                    throw new Exception('Cannot buffer backup chunk.');
+                }
+                $offset += $written;
+            }
+            $this->storeStream($stream, $fileName);
+            return [
+                'size' => strlen($plaintext), 'sha256' => hash('sha256', $plaintext),
+                'encrypted' => $this->chunkCodec !== null,
+                'stored_size' => strlen($payload), 'stored_sha256' => hash('sha256', $payload),
+            ];
         } finally {
             fclose($stream);
         }
@@ -192,10 +234,18 @@ class StorageManager
         return $this->storeArchive($entries, $finalFileName, 1);
     }
 
-    public function collateChunksAdvanced(array $chunks, string $finalFileName, int $compressionLevel = 1, bool $encrypt = false, string $password = ''): string
+    public function collateChunksAdvanced(array $chunks, string $finalFileName, int $compressionLevel = 1, bool $encrypt = false, #[\SensitiveParameter] string $password = ''): string
     {
         if ($encrypt) {
-            throw new Exception('Encrypted streaming backups are not supported. Use regular backup mode without --no-local to create an encrypted archive.');
+            EncryptedArchive::validatePassword($password);
+            if ($this->chunkCodec === null) {
+                throw new Exception('Encrypted archive replay requires authenticated capture chunks and their password context.');
+            }
+            foreach ($chunks as $chunk) {
+                if (($chunk['encrypted'] ?? null) !== true) {
+                    throw new Exception('Encrypted archive replay requires authenticated capture chunks; plaintext chunks are not accepted.');
+                }
+            }
         }
         $groups = [];
         foreach ($chunks as $chunk) {
@@ -225,17 +275,21 @@ class StorageManager
                 }
             }
         };
-        return $this->storeArchive($entries, $finalFileName, $compressionLevel);
+        return $this->storeArchive($entries, $finalFileName, $compressionLevel, $encrypt ? $password : null);
     }
 
     /** All payloads stay bounded; only ZIP directory and chunk metadata scale with entry count. */
-    protected function storeArchive(callable $entries, string $fileName, int $compressionLevel): string
+    protected function storeArchive(callable $entries, string $fileName, int $compressionLevel, #[\SensitiveParameter] ?string $password = null): string
     {
+        $this->lastArchiveFingerprint = null;
         $zip64Entries = [];
-        $factory = function () use ($entries, $compressionLevel, &$zip64Entries) {
-            return $this->zipBytes($entries, max(1, min(9, $compressionLevel)), $zip64Entries);
+        $envelope = $password === null ? null : new EncryptedArchive($password);
+        $factory = function () use ($entries, $compressionLevel, &$zip64Entries, &$envelope) {
+            $zip = $this->zipBytes($entries, max(1, min(9, $compressionLevel)), $zip64Entries);
+            return $envelope === null ? $zip : $envelope->encrypt($zip);
         };
         $stream = ReplayableArchiveStream::open($factory);
+        $newObjects = [];
         try {
             // The first pass calculates size and hash. The wrapper then exposes its exact size
             // to adapters such as S3 and regenerates the same bytes for each upload retry.
@@ -244,16 +298,43 @@ class StorageManager
                 // Very large incompressible entries can grow past 4 GiB in deflate.
                 // The prepass discovers those before anything is uploaded; replay once
                 // with their ZIP64 local headers to calculate the final fingerprint.
+                // ZIP64 changes the plaintext ZIP plan. Never reuse encryption
+                // state for changed bytes, even though this prepass is private.
+                if ($envelope !== null) {
+                    $envelope->close();
+                    $envelope = new EncryptedArchive($password);
+                }
                 $expected = $this->fingerprint($stream);
             }
             $remotePath = $this->getPrefixedPath($fileName);
-            $this->writeVerified($this->disk, $remotePath, $stream, $expected);
+            $targets = [$this->disk];
             foreach ((array) config('capsule.additional_disks', []) as $diskName) {
-                $this->writeVerified($this->resolveDisk($diskName), $remotePath, $stream, $expected);
+                $targets[] = $this->resolveDisk($diskName);
             }
+            foreach ($targets as $disk) {
+                if (!$disk->exists($remotePath)) {
+                    $newObjects[] = [$disk, $remotePath];
+                }
+                $this->writeVerified($disk, $remotePath, $stream, $expected);
+            }
+            $this->lastArchiveFingerprint = $expected;
             return $remotePath;
+        } catch (\Throwable $failure) {
+            // A failed put can leave a truncated object. Delete only paths that
+            // did not exist before this publication; keep every source chunk.
+            foreach ($newObjects as [$disk, $path]) {
+                try {
+                    if ($disk->delete($path) === false) {
+                        Log::warning('Could not remove incomplete backup archive.', ['path' => $path]);
+                    }
+                } catch (\Throwable $ignored) {
+                    Log::warning('Could not remove incomplete backup archive.', ['path' => $path]);
+                }
+            }
+            throw $failure;
         } finally {
             fclose($stream);
+            $envelope?->close();
         }
     }
 
@@ -270,6 +351,10 @@ class StorageManager
     {
         foreach ($chunks as $chunk) {
             $path = $this->getPrefixedPath($chunk['name']);
+            if (!empty($chunk['encrypted'])) {
+                yield from $this->readEncryptedChunk($chunk, $path);
+                continue;
+            }
             $stream = $this->disk->readStream($path);
             if (!is_resource($stream)) {
                 throw new Exception("Cannot read backup chunk: {$path}");
@@ -296,6 +381,38 @@ class StorageManager
                 (isset($chunk['sha256']) && !hash_equals($chunk['sha256'], $checksum))) {
                 throw new Exception("Backup chunk integrity check failed: {$path}");
             }
+        }
+    }
+
+    protected function readEncryptedChunk(array $chunk, string $path): \Generator
+    {
+        if ($this->chunkCodec === null) {
+            throw new Exception('Encrypted backup chunk requires its password context.');
+        }
+        $expectedSize = $chunk['stored_size'] ?? null;
+        if (!is_int($expectedSize) || $expectedSize < 1 || $expectedSize > EncryptedChunkCodec::MAX_PLAINTEXT_BYTES + EncryptedChunkCodec::OVERHEAD_BYTES) {
+            throw new Exception('Invalid encrypted chunk size.');
+        }
+        $stream = $this->disk->readStream($path);
+        if (!is_resource($stream)) {
+            throw new Exception('Cannot read encrypted backup chunk.');
+        }
+        try {
+            $ciphertext = stream_get_contents($stream, $expectedSize + 1);
+            if ($ciphertext === false || strlen($ciphertext) !== $expectedSize ||
+                !hash_equals($chunk['stored_sha256'] ?? '', hash('sha256', $ciphertext))) {
+                throw new Exception('Encrypted backup chunk integrity check failed.');
+            }
+        } finally {
+            fclose($stream);
+        }
+        $plaintext = $this->chunkCodec->decrypt($ciphertext, $path);
+        unset($ciphertext);
+        if (strlen($plaintext) !== $chunk['size'] || !hash_equals($chunk['sha256'], hash('sha256', $plaintext))) {
+            throw new Exception('Decrypted backup chunk integrity check failed.');
+        }
+        for ($offset = 0; $offset < strlen($plaintext); $offset += 65536) {
+            yield substr($plaintext, $offset, 65536);
         }
     }
 

@@ -9,6 +9,8 @@ use Dgtlss\Capsule\Events\{BackupStarting, DatabaseDumpStarting, DatabaseDumpCom
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Security\EncryptedChunkCodec;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 use Dgtlss\Capsule\Support\BackupContext;
 use Dgtlss\Capsule\Support\FileSelection;
 use Dgtlss\Capsule\Support\Lock;
@@ -33,8 +35,11 @@ class ChunkedBackupService
     protected bool $parallel = false;
     protected int $compressionLevel = 1;
     protected bool $encryption = false;
+    protected ?EncryptedChunkCodec $chunkCodec = null;
+    protected ?string $runPassword = null;
     protected bool $verification = false;
     protected ?string $lastError = null;
+    protected ?array $lastArchiveMetadata = null;
     protected ?string $tag = null;
     protected $outputCallback = null;
 
@@ -89,6 +94,17 @@ class ChunkedBackupService
         $this->outputCallback = $callback;
     }
 
+    public function __debugInfo(): array
+    {
+        return ['backup_id' => $this->backupId, 'chunks_count' => count($this->chunkMetadata),
+            'encryption_active' => $this->runPassword !== null];
+    }
+
+    public function getLastArchiveMetadata(): ?array
+    {
+        return $this->lastArchiveMetadata;
+    }
+
     public function getLastError(): ?string
     {
         return $this->lastError;
@@ -104,6 +120,7 @@ class ChunkedBackupService
     public function run(bool $force = false): bool
     {
         $this->lastError = null;
+        $this->lastArchiveMetadata = null;
         $lock = null;
         try {
             if (!$force) {
@@ -119,6 +136,13 @@ class ChunkedBackupService
             Log::error('Chunked backup failed: ' . $e->getMessage(), ['exception' => $e]);
             return false;
         } finally {
+            $this->storageManager->setChunkCodec(null);
+            $this->chunkCodec?->close();
+            $this->chunkCodec = null;
+            if ($this->runPassword !== null && function_exists('sodium_memzero')) {
+                sodium_memzero($this->runPassword);
+            }
+            $this->runPassword = null;
             if ($lock) {
                 try { $lock->release(); } catch (\Throwable $e) { Log::warning('Could not release backup lock.', ['exception' => $e]); }
             }
@@ -149,6 +173,17 @@ class ChunkedBackupService
         try {
             // Validate encryption before creating any remote chunk or exposing plaintext.
             $this->validateConfiguration();
+            if ($context->encryption) {
+                $this->runPassword = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
+                $this->chunkCodec = new EncryptedChunkCodec($this->runPassword);
+                $this->storageManager->setChunkCodec($this->chunkCodec);
+                $metadata['chunk_encryption'] = $this->chunkCodec->metadata();
+                $metadata['archive_encryption'] = EncryptedArchive::FORMAT;
+                $metadata['archive_format'] = EncryptedArchive::FORMAT;
+                $metadata['requires_capsule'] = true;
+                $metadata['recovery_instruction'] = 'Capsule and the backup password are required to decrypt this .capsule.enc backup.';
+                $backupLog->metadata = $metadata;
+            }
             if (config('capsule.database.enabled', true)) {
                 $failed = $this->probeDatabaseConnections();
                 if ($failed !== []) {
@@ -166,6 +201,10 @@ class ChunkedBackupService
             $this->createChunkedBackup();
             event(new ArchiveFinalizing($context));
             $finalPath = $this->collateChunks();
+            $this->lastArchiveMetadata = ['path' => $finalPath,
+                'archive_format' => $this->runPassword !== null ? EncryptedArchive::FORMAT : 'zip',
+                'requires_capsule' => $this->runPassword !== null,
+                'recovery_instruction' => $this->runPassword !== null ? 'Capsule and the backup password are required to decrypt this .capsule.enc backup.' : null];
             $context->remotePath = $finalPath;
             event(new BackupUploaded($context, $finalPath));
             $backupLog->completed_at = now();
@@ -176,6 +215,7 @@ class ChunkedBackupService
                 'chunks_count' => count($this->chunkMetadata),
                 'chunked_method' => 'bounded_zip64_stream',
                 'verification' => 'sha256_readback',
+                'archive_sha256' => $this->storageManager->getLastArchiveFingerprint()['sha256'] ?? null,
             ]);
             if ($persisted) {
                 try { $backupLog->save(); } catch (\Throwable $e) { Log::warning('Failed to persist success BackupLog update', ['exception' => $e]); }
@@ -230,7 +270,10 @@ class ChunkedBackupService
     protected function validateConfiguration(): void
     {
         if ($this->encryption || (bool) config('capsule.security.encrypt_backups', false)) {
-            throw new Exception('Encrypted streaming backups are not supported. Use regular backup mode without --no-local to create an encrypted archive.');
+            EncryptedArchive::validatePassword(config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD') ?? '');
+            if (!extension_loaded('sodium')) {
+                throw new Exception('Encrypted streaming backups require the sodium extension.');
+            }
         }
         $chunkSize = (int) config('capsule.chunked_backup.chunk_size', 10485760);
         if ($chunkSize < 1 || $chunkSize > 67108864) {
@@ -432,7 +475,7 @@ class ChunkedBackupService
         }
     }
 
-    protected function appendChunkData(string $data, string &$buffer, string $baseName, int &$index, int $chunkSize, string $prefix): void
+    protected function appendChunkData(#[\SensitiveParameter] string $data, #[\SensitiveParameter] string &$buffer, string $baseName, int &$index, int $chunkSize, string $prefix): void
     {
         if ($chunkSize < 1) {
             throw new Exception('Streaming chunk_size must be positive.');
@@ -473,35 +516,20 @@ class ChunkedBackupService
         return true;
     }
 
-    protected function uploadChunkDirectly(string $data, string $baseName, int $chunkIndex, string $tempPrefix): void
+    protected function uploadChunkDirectly(#[\SensitiveParameter] string $data, string $baseName, int $chunkIndex, string $tempPrefix): void
     {
         // Object names are run-scoped and opaque; no connection, filename, or host leaks.
         $chunkName = 'capsule_chunk_' . $this->backupId . '_' . hash('sha256', $baseName) . '.part' . $chunkIndex;
-        $stream = fopen('php://memory', 'w+b');
-        try {
-            $offset = 0;
-            while ($offset < strlen($data)) {
-                $written = fwrite($stream, substr($data, $offset));
-                if ($written === false || $written === 0) {
-                    throw new Exception('Cannot buffer backup chunk.');
-                }
-                $offset += $written;
-            }
-            rewind($stream);
-            $this->storageManager->storeStream($stream, $chunkName);
-            $this->chunkMetadata[] = [
-                'name' => $chunkName, 'index' => $chunkIndex, 'base_name' => $baseName,
-                'size' => strlen($data), 'sha256' => hash('sha256', $data),
-            ];
-        } finally {
-            fclose($stream);
-        }
+        $stored = $this->storageManager->storeChunkData($data, $chunkName);
+        $this->chunkMetadata[] = array_merge($stored, [
+            'name' => $chunkName, 'index' => $chunkIndex, 'base_name' => $baseName,
+        ]);
     }
 
     protected function collateChunks(): string
     {
-        $name = 'backup_' . now()->format('Y-m-d_H-i-s') . '_' . $this->backupId . '.zip';
-        $manifest = $this->manifestBuilder->build(true, $this->compressionLevel, false);
+        $name = 'backup_' . now()->format('Y-m-d_H-i-s') . '_' . $this->backupId . ($this->runPassword !== null ? EncryptedArchive::EXTENSION : '.zip');
+        $manifest = $this->manifestBuilder->build(true, $this->compressionLevel, $this->runPassword !== null);
         $json = ManifestBuilder::encode($manifest);
         $index = 0;
         $buffer = '';
@@ -509,7 +537,7 @@ class ChunkedBackupService
         if ($buffer !== '') {
             $this->uploadChunkDirectly($buffer, 'manifest.json', $index, 'capsule_chunk_');
         }
-        return $this->storageManager->collateChunksAdvanced($this->chunkMetadata, $name, $this->compressionLevel);
+        return $this->storageManager->collateChunksAdvanced($this->chunkMetadata, $name, $this->compressionLevel, $this->runPassword !== null, $this->runPassword ?? '');
     }
 
     protected function getRemoteFileSize(string $fileName): int

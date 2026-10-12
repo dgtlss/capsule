@@ -6,6 +6,7 @@ use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Models\VerificationLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Support\RestoreArchive;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
 
@@ -33,7 +34,7 @@ class IntegrityMonitor
                 'status' => $result['failures'] === 0 ? 'passed' : 'failed',
                 'entries_checked' => $result['checked'],
                 'entries_failed' => $result['failures'],
-                'error_message' => $result['failures'] > 0 ? $result['error_summary'] : null,
+                'error_message' => $result['failures'] > 0 ? $result['error_summary'] : (($result['warnings'] ?? []) !== [] ? implode(' ', $result['warnings']) : null),
                 'duration_seconds' => round(microtime(true) - $startTime, 2),
                 'trigger' => $trigger,
             ]);
@@ -145,7 +146,7 @@ class IntegrityMonitor
                 || !hash_equals(strtolower($expectedHash), hash_file('sha256', $tmpPath)))) {
                 throw new \RuntimeException('Backup checksum differs from its recorded checksum.');
             }
-            $result = $this->verifyArchive($tmpPath);
+            $result = $this->verifyArchive($tmpPath, RestoreArchive::formatExpectation($backup->file_path, $backup->metadata ?? []));
             $result['disk'] = $diskName;
             if ($keep) {
                 $result['local_path'] = $tmpPath;
@@ -169,16 +170,21 @@ class IntegrityMonitor
         }
     }
 
-    protected function verifyArchive(string $localPath): array
+    protected function verifyArchive(string $localPath, ?string $expectedFormat = null): array
     {
         $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-        $archive = new RestoreArchive($localPath, $password);
+        $archive = new RestoreArchive($localPath, $password, $expectedFormat,
+            RestoreArchive::manifestByteLimit(config('capsule.restore.max_manifest_bytes', RestoreArchive::MAX_MANIFEST_BYTES)));
         try {
             $archive->verifyOnly();
             return [
                 'checked' => count($archive->entries()),
                 'failures' => 0,
                 'error_summary' => null,
+                'archive_format' => EncryptedArchive::isEncryptedFile($localPath) ? EncryptedArchive::FORMAT : 'zip',
+                'requires_capsule' => EncryptedArchive::isEncryptedFile($localPath),
+                'warnings' => $archive->warnings(),
+                'checksums_complete' => count(array_filter($archive->entries(), static fn ($entry) => ($entry['integrity'] ?? 'sha256') !== 'sha256')) === 0,
             ];
         } finally {
             $archive->close();

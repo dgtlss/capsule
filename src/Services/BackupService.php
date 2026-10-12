@@ -52,10 +52,10 @@ class BackupService
 
     public function __construct(
         Application $app,
-        StorageManager $storageManager = null,
-        NotificationManager $notificationManager = null,
-        DatabaseDumper $databaseDumper = null,
-        ManifestBuilder $manifestBuilder = null,
+        ?StorageManager $storageManager = null,
+        ?NotificationManager $notificationManager = null,
+        ?DatabaseDumper $databaseDumper = null,
+        ?ManifestBuilder $manifestBuilder = null,
     ) {
         $this->app = $app;
         $this->storageManager = $storageManager ?? new StorageManager();
@@ -592,7 +592,7 @@ class BackupService
         }
         if ($this->encryptionEnabled()) {
             $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-            if (!is_string($password) || $password === '' || !$zip->setPassword($password) ||
+            if (!is_string($password) || $password === '' || str_contains($password, "\0") || !$zip->setPassword($password) ||
                 !$zip->setEncryptionName($entryName, ZipArchive::EM_AES_256)) {
                 throw new Exception("Cannot encrypt archive entry: {$entryName}");
             }
@@ -644,6 +644,9 @@ class BackupService
             $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
             if (!is_string($password) || $password === '') {
                 throw new Exception('Backup encryption requires a non-empty password.');
+            }
+            if (str_contains($password, "\0")) {
+                throw new Exception('Backup encryption passwords cannot contain NUL bytes.');
             }
             if (!method_exists(ZipArchive::class, 'setEncryptionName') || !defined('ZipArchive::EM_AES_256') ||
                 (method_exists(ZipArchive::class, 'isEncryptionMethodSupported') && !ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256, true))) {

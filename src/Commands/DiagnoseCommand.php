@@ -331,7 +331,7 @@ class DiagnoseCommand extends Command
         }
 
         // Check required extensions
-        $extensions = ['zip', 'json'];
+        $extensions = ['zip', 'json', 'zlib', 'sodium'];
         foreach ($extensions as $ext) {
             if (extension_loaded($ext)) {
                 $this->info("  ✅ {$ext} extension loaded");

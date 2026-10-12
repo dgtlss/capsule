@@ -22,6 +22,8 @@ class BackupReport
             'compressed_size_formatted' => Helpers::formatBytes($backupLog->file_size ?? 0),
             'storage_disk' => config('capsule.default_disk', 'local'),
             'path' => $backupLog->file_path,
+            'archive_format' => $backupLog->metadata['archive_format'] ?? 'zip',
+            'requires_capsule' => (bool) ($backupLog->metadata['requires_capsule'] ?? false),
         ];
 
         if ($metric) {
@@ -97,6 +99,9 @@ class BackupReport
         }
 
         $rows[] = ['Storage', $report['storage_disk']];
+        if (!empty($report['requires_capsule'])) {
+            $rows[] = ['Recovery', 'Capsule + password required to decrypt'];
+        }
 
         if (isset($report['throughput'])) {
             $rows[] = ['Throughput', $report['throughput']];

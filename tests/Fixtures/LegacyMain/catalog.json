@@ -1,0 +1,589 @@
+{
+    "source_commit": "543a2ea9534eaf6df6d0e5710e972f518adc2306",
+    "records": {
+        "regular-plain-files": {
+            "sha256": "861215722d7d3a764b864f33315479462a4974b276e3383e33709310a44202fc",
+            "chunked": false,
+            "database": false,
+            "password_case": "plain",
+            "catalog": {
+                "id": 1,
+                "started_at": "2025-01-02T03:04:05.000000Z",
+                "completed_at": "2025-01-02T03:04:05.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-05.zip",
+                "file_size": 1811,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:05.000000Z",
+                "updated_at": "2025-01-02T03:04:05.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-plain-database": {
+            "sha256": "8141cb404d0feb139628faf55218402be5a656c6d33b15818102d19d23fb975c",
+            "chunked": false,
+            "database": true,
+            "password_case": "plain",
+            "catalog": {
+                "id": 2,
+                "started_at": "2025-01-02T03:04:06.000000Z",
+                "completed_at": "2025-01-02T03:04:06.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-06.zip",
+                "file_size": 2206,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:06.000000Z",
+                "updated_at": "2025-01-02T03:04:06.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-aes-files": {
+            "sha256": "009a7fe97b1b4c47753ebb0fec91c2e1b1e4f0a0d42c1b327cd86debe809c324",
+            "chunked": false,
+            "database": false,
+            "password_case": "aes",
+            "catalog": {
+                "id": 3,
+                "started_at": "2025-01-02T03:04:07.000000Z",
+                "completed_at": "2025-01-02T03:04:07.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-07.zip",
+                "file_size": 2114,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:07.000000Z",
+                "updated_at": "2025-01-02T03:04:07.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-aes-database": {
+            "sha256": "43e2daa6120e91d1a6fae87f7482767dcad5f381b2368a6b649b159da4733c5c",
+            "chunked": false,
+            "database": true,
+            "password_case": "aes",
+            "catalog": {
+                "id": 4,
+                "started_at": "2025-01-02T03:04:08.000000Z",
+                "completed_at": "2025-01-02T03:04:08.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-08.zip",
+                "file_size": 2558,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:08.000000Z",
+                "updated_at": "2025-01-02T03:04:08.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-zero-files": {
+            "sha256": "b1c7f2f23968afa71e07d3f445f6410a3c6f80aa05fb432c7a522b7b8de112b8",
+            "chunked": false,
+            "database": false,
+            "password_case": "zero",
+            "catalog": {
+                "id": 5,
+                "started_at": "2025-01-02T03:04:09.000000Z",
+                "completed_at": "2025-01-02T03:04:09.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-09.zip",
+                "file_size": 1814,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:09.000000Z",
+                "updated_at": "2025-01-02T03:04:09.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-zero-database": {
+            "sha256": "dc19a2af4ccbf68fcfefd2de4ea6a38ddd5d526c49f697bd535d9013d89851b4",
+            "chunked": false,
+            "database": true,
+            "password_case": "zero",
+            "catalog": {
+                "id": 6,
+                "started_at": "2025-01-02T03:04:10.000000Z",
+                "completed_at": "2025-01-02T03:04:10.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-10.zip",
+                "file_size": 2208,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:10.000000Z",
+                "updated_at": "2025-01-02T03:04:10.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-nul-files": {
+            "sha256": "f7c759e151f7fb78f82b8e4dc55046d756aa13e7ea569379a124d2e055c285ca",
+            "chunked": false,
+            "database": false,
+            "password_case": "nul",
+            "catalog": {
+                "id": 7,
+                "started_at": "2025-01-02T03:04:11.000000Z",
+                "completed_at": "2025-01-02T03:04:11.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-11.zip",
+                "file_size": 2114,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:11.000000Z",
+                "updated_at": "2025-01-02T03:04:11.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-nul-database": {
+            "sha256": "9c9a70036b9312ef9639fb0a7af5162157d1138df8e6a37932a9139d7480fa6f",
+            "chunked": false,
+            "database": true,
+            "password_case": "nul",
+            "catalog": {
+                "id": 8,
+                "started_at": "2025-01-02T03:04:12.000000Z",
+                "completed_at": "2025-01-02T03:04:12.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-12.zip",
+                "file_size": 2558,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T03:04:12.000000Z",
+                "updated_at": "2025-01-02T03:04:12.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-plain-files": {
+            "sha256": "a98204fbf8de96af7bfb8f6f5d0dab97fd676d6f944ea394c37a94aa2c950664",
+            "chunked": true,
+            "database": false,
+            "password_case": "plain",
+            "catalog": {
+                "id": 9,
+                "started_at": "2025-01-02T03:04:13.000000Z",
+                "completed_at": "2025-01-02T03:04:13.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-13.zip",
+                "file_size": 1496,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f25dd022.62195852",
+                    "chunked": true,
+                    "chunks_count": 3,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "4.83ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:13.000000Z",
+                "updated_at": "2025-01-02T03:04:13.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-plain-database": {
+            "sha256": "ec6cad896209c3565c9317e22308fb737b27ba07ddccf2093c9d8ee8b7033ce7",
+            "chunked": true,
+            "database": true,
+            "password_case": "plain",
+            "catalog": {
+                "id": 10,
+                "started_at": "2025-01-02T03:04:14.000000Z",
+                "completed_at": "2025-01-02T03:04:14.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-14.zip",
+                "file_size": 1873,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f25fc6a3.05817017",
+                    "chunked": true,
+                    "chunks_count": 4,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "3.62ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:14.000000Z",
+                "updated_at": "2025-01-02T03:04:14.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-aes-files": {
+            "sha256": "bd383403a504100e3bef85a6ae21926ba3e5e7f2dfe492bab441960276306e4b",
+            "chunked": true,
+            "database": false,
+            "password_case": "aes",
+            "catalog": {
+                "id": 11,
+                "started_at": "2025-01-02T03:04:15.000000Z",
+                "completed_at": "2025-01-02T03:04:15.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-15.zip",
+                "file_size": 1743,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f2619541.23936587",
+                    "chunked": true,
+                    "chunks_count": 3,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "5.04ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:15.000000Z",
+                "updated_at": "2025-01-02T03:04:15.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-aes-database": {
+            "sha256": "142d467cb133c9b107077266a8930ea5822467349fd2896545c3773d8b33a72f",
+            "chunked": true,
+            "database": true,
+            "password_case": "aes",
+            "catalog": {
+                "id": 12,
+                "started_at": "2025-01-02T03:04:16.000000Z",
+                "completed_at": "2025-01-02T03:04:16.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-16.zip",
+                "file_size": 2170,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f2640122.50726768",
+                    "chunked": true,
+                    "chunks_count": 4,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "7.75ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:16.000000Z",
+                "updated_at": "2025-01-02T03:04:16.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-zero-files": {
+            "sha256": "faace60f1c0b0be6d5a927fdd821b1f67b1fa827b2cdc543bfe8407840e60573",
+            "chunked": true,
+            "database": false,
+            "password_case": "zero",
+            "catalog": {
+                "id": 13,
+                "started_at": "2025-01-02T03:04:17.000000Z",
+                "completed_at": "2025-01-02T03:04:17.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-17.zip",
+                "file_size": 1494,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f26778a5.10072378",
+                    "chunked": true,
+                    "chunks_count": 3,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "1.53ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:17.000000Z",
+                "updated_at": "2025-01-02T03:04:17.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-zero-database": {
+            "sha256": "cd5a3482105836f9551a22f014fb7cda8616d18746c450f0b86aee087f293c46",
+            "chunked": true,
+            "database": true,
+            "password_case": "zero",
+            "catalog": {
+                "id": 14,
+                "started_at": "2025-01-02T03:04:18.000000Z",
+                "completed_at": "2025-01-02T03:04:18.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-18.zip",
+                "file_size": 1869,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f2686710.29384919",
+                    "chunked": true,
+                    "chunks_count": 4,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "3.19ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:18.000000Z",
+                "updated_at": "2025-01-02T03:04:18.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-nul-files": {
+            "sha256": "f1f95efa35ca0bb6583fecd6d31f0a86c57396073ba6824b6004a5d0c94aad15",
+            "chunked": true,
+            "database": false,
+            "password_case": "nul",
+            "catalog": {
+                "id": 15,
+                "started_at": "2025-01-02T03:04:19.000000Z",
+                "completed_at": "2025-01-02T03:04:19.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-19.zip",
+                "file_size": 1744,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f269e804.67269044",
+                    "chunked": true,
+                    "chunks_count": 3,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "4.55ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:19.000000Z",
+                "updated_at": "2025-01-02T03:04:19.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-nul-database": {
+            "sha256": "0bb0ba13c57f51cc1dfe318e483aa0af05b3dbd0e37228bfb7c2f7db21aebd69",
+            "chunked": true,
+            "database": true,
+            "password_case": "nul",
+            "catalog": {
+                "id": 16,
+                "started_at": "2025-01-02T03:04:20.000000Z",
+                "completed_at": "2025-01-02T03:04:20.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_03-04-20.zip",
+                "file_size": 2170,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f26c4af4.08934694",
+                    "chunked": true,
+                    "chunks_count": 4,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "7.65ms"
+                    }
+                },
+                "created_at": "2025-01-02T03:04:20.000000Z",
+                "updated_at": "2025-01-02T03:04:20.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-posix-files": {
+            "sha256": "dfefd31f8671c294ed27e75d5b7039f3f619f355a0498be2f4bfb76d7b1c7e2e",
+            "chunked": false,
+            "database": false,
+            "password_case": "plain",
+            "catalog": {
+                "id": 17,
+                "started_at": "2025-01-02T04:00:00.000000Z",
+                "completed_at": "2025-01-02T04:00:00.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-02_04-00-00.zip",
+                "file_size": 2026,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-02T04:00:00.000000Z",
+                "updated_at": "2025-01-02T04:00:00.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "incremental-base": {
+            "sha256": "17ed5bc578b86fbce0f1613301af61ecd9899d82bb513378aa92fe8160ded95c",
+            "chunked": false,
+            "database": false,
+            "password_case": "plain",
+            "catalog": {
+                "id": 18,
+                "started_at": "2025-01-03T00:00:00.000000Z",
+                "completed_at": "2025-01-03T00:00:00.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-03_00-00-00.zip",
+                "file_size": 1418,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-03T00:00:00.000000Z",
+                "updated_at": "2025-01-03T00:00:00.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "incremental-delta": {
+            "sha256": "71d468e54185ae9742db6c631e021355b02aba3cd3b4fef4ec2978a82b20a7ce",
+            "chunked": false,
+            "database": false,
+            "password_case": "plain",
+            "catalog": {
+                "id": 19,
+                "started_at": "2025-01-03T00:01:00.000000Z",
+                "completed_at": "2025-01-03T00:01:00.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-03_00-01-00.zip",
+                "file_size": 909,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-03T00:01:00.000000Z",
+                "updated_at": "2025-01-03T00:01:00.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-default-plain-database": {
+            "sha256": "dfc51a6053e7812f20e5710b10dbd705ccad9b6245287690d270c2dae14e248d",
+            "chunked": false,
+            "database": true,
+            "password_case": "plain",
+            "catalog": {
+                "id": 1,
+                "started_at": "2025-01-04T00:00:16.000000Z",
+                "completed_at": "2025-01-04T00:00:16.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-04_00-00-16.zip",
+                "file_size": 3995,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-04T00:00:16.000000Z",
+                "updated_at": "2025-01-04T00:00:16.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "regular-default-aes-database": {
+            "sha256": "52e0ac05f80191a97e58284a70f21fe00ebff3776920644b869952e30995e2ae",
+            "chunked": false,
+            "database": true,
+            "password_case": "aes",
+            "catalog": {
+                "id": 2,
+                "started_at": "2025-01-04T00:00:17.000000Z",
+                "completed_at": "2025-01-04T00:00:17.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-04_00-00-17.zip",
+                "file_size": 4720,
+                "error_message": null,
+                "metadata": null,
+                "created_at": "2025-01-04T00:00:17.000000Z",
+                "updated_at": "2025-01-04T00:00:17.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-default-plain-database": {
+            "sha256": "2c5546ad452c0a75a941a2fa385e7004a9cef3a0e8f5dc34e02a811685a75df1",
+            "chunked": true,
+            "database": true,
+            "password_case": "plain",
+            "catalog": {
+                "id": 3,
+                "started_at": "2025-01-04T00:00:18.000000Z",
+                "completed_at": "2025-01-04T00:00:18.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-04_00-00-18.zip",
+                "file_size": 4224,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f27baea6.67536368",
+                    "chunked": true,
+                    "chunks_count": 5,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "4.45ms"
+                    }
+                },
+                "created_at": "2025-01-04T00:00:18.000000Z",
+                "updated_at": "2025-01-04T00:00:18.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        },
+        "streamed-default-aes-database": {
+            "sha256": "402534491c99f8be1e6da6d97db3676b97e906d1424f7f3ded8d6ff1a4d621b6",
+            "chunked": true,
+            "database": true,
+            "password_case": "aes",
+            "catalog": {
+                "id": 4,
+                "started_at": "2025-01-04T00:00:19.000000Z",
+                "completed_at": "2025-01-04T00:00:19.000000Z",
+                "status": "success",
+                "file_path": "backups/backup_2025-01-04_00-00-19.zip",
+                "file_size": 4662,
+                "error_message": null,
+                "metadata": {
+                    "backup_id": "backup_6acc98f27d8158.75757107",
+                    "chunked": true,
+                    "chunks_count": 5,
+                    "chunked_method": "direct_streaming",
+                    "memory_stats": {
+                        "memory_delta": "0 B",
+                        "peak_delta": "0 B",
+                        "time_delta": "8.02ms"
+                    }
+                },
+                "created_at": "2025-01-04T00:00:19.000000Z",
+                "updated_at": "2025-01-04T00:00:19.000000Z",
+                "tag": null
+            },
+            "old_restore_verified": true
+        }
+    },
+    "incremental_snapshots": [
+        {
+            "id": 10,
+            "backup_log_id": 18,
+            "type": "full",
+            "base_snapshot_id": null,
+            "file_index": "{\"/tmp/capsule-legacy-input-75d7cee47f52/source/empty.txt\":{\"size\":0,\"mtime\":1791793394},\"/tmp/capsule-legacy-input-75d7cee47f52/source/hello.txt\":{\"size\":27,\"mtime\":1791793394},\"/tmp/capsule-legacy-input-75d7cee47f52/source/nested/binary.bin\":{\"size\":256,\"mtime\":1791793394}}",
+            "total_files": 3,
+            "total_size": 283,
+            "created_at": "2025-01-03T00:00:00.000000Z",
+            "updated_at": "2025-01-03T00:00:00.000000Z"
+        },
+        {
+            "id": 11,
+            "backup_log_id": 19,
+            "type": "incremental",
+            "base_snapshot_id": 10,
+            "file_index": "{\"/tmp/capsule-legacy-input-75d7cee47f52/source/added.txt\":{\"size\":19,\"mtime\":1791793394},\"/tmp/capsule-legacy-input-75d7cee47f52/source/hello.txt\":{\"size\":35,\"mtime\":1791793394},\"/tmp/capsule-legacy-input-75d7cee47f52/source/nested/binary.bin\":{\"size\":256,\"mtime\":1791793394}}",
+            "total_files": 3,
+            "total_size": 310,
+            "created_at": "2025-01-03T00:01:00.000000Z",
+            "updated_at": "2025-01-03T00:01:00.000000Z"
+        }
+    ]
+}

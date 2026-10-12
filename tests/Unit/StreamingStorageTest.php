@@ -192,11 +192,65 @@ class StreamingStorageTest extends TestCase
         }
     }
 
-    public function test_encrypted_streaming_rejects_before_any_storage_access(): void
+    public function test_large_encrypted_collation_keeps_payload_memory_bounded(): void
+    {
+        $password = 'bounded Capsule encryption test password';
+        $codec = new \Dgtlss\Capsule\Security\EncryptedChunkCodec($password);
+        $manager = app(StorageManager::class);
+        $manager->setChunkCodec($codec);
+        $chunks = [];
+        $expected = hash_init('sha256');
+        try {
+            for ($index = 0; $index < 64; $index++) {
+                $block = random_bytes(524288);
+                $name = 'encrypted-memory-' . $index;
+                $stored = $manager->storeChunkData($block, $name);
+                $chunks[] = array_merge($stored, ['name' => $name, 'index' => $index,
+                    'base_name' => 'db_large', 'entry_name' => 'database/large.sql']);
+                hash_update($expected, $block);
+            }
+            unset($block);
+            if (function_exists('memory_reset_peak_usage')) {
+                memory_reset_peak_usage();
+            }
+            $baseline = memory_get_usage(true);
+            $path = $manager->collateChunksAdvanced($chunks, 'encrypted-large.capsule.enc', 1, true, $password);
+            // The KDF's fixed native allocation happens before this collation
+            // measurement. The writer must not retain the 32 MiB payload.
+            $this->assertLessThan(20 * 1048576, memory_get_peak_usage(true) - $baseline);
+            $decrypted = $this->testPath('encrypted-large-decrypted.zip');
+            $input = fopen(Storage::disk('capsule-test')->path($path), 'rb');
+            $output = fopen($decrypted, 'wb');
+            try {
+                \Dgtlss\Capsule\Security\EncryptedArchive::decrypt($input, $output, $password);
+            } finally {
+                fclose($input);
+                fclose($output);
+            }
+            $zip = new ZipArchive();
+            $this->assertTrue($zip->open($decrypted));
+            try {
+                $stream = $zip->getStream('database/large.sql');
+                $this->assertIsResource($stream);
+                $actual = hash_init('sha256');
+                $this->assertSame(32 * 1048576, hash_update_stream($actual, $stream));
+                $this->assertSame('', fread($stream, 1));
+                fclose($stream);
+                $this->assertSame(hash_final($expected), hash_final($actual));
+            } finally {
+                $zip->close();
+            }
+        } finally {
+            $manager->setChunkCodec(null);
+            $codec->close();
+        }
+    }
+
+    public function test_missing_encryption_password_rejects_before_any_storage_access(): void
     {
         $disk = Mockery::mock(Filesystem::class);
-        $this->expectExceptionMessage('Encrypted streaming backups are not supported');
-        $this->manager($disk)->collateChunksAdvanced([], 'encrypted.zip', 1, true, 'secret');
+        $this->expectExceptionMessage('password');
+        $this->manager($disk)->collateChunksAdvanced([], 'encrypted.zip', 1, true, '');
     }
 
     public function test_s3_adapter_reads_are_streamed_without_changing_user_configuration(): void
@@ -217,6 +271,70 @@ class StreamingStorageTest extends TestCase
         $chunks = $this->writeChunks($wire, 127, 'files_unsafe', 'framed-v2');
         $this->expectExceptionMessage('Unsafe archive path');
         app(StorageManager::class)->collateChunksAdvanced($chunks, 'unsafe.zip');
+    }
+
+    public function test_encrypted_replay_rejects_plaintext_capture_chunks_before_storage_access(): void
+    {
+        $disk = Mockery::mock(Filesystem::class);
+        $manager = $this->manager($disk);
+        $codec = new \Dgtlss\Capsule\Security\EncryptedChunkCodec('test password');
+        $manager->setChunkCodec($codec);
+        try {
+            $this->expectExceptionMessage('plaintext chunks are not accepted');
+            $manager->collateChunksAdvanced([['encrypted' => false]], 'archive.capsule.enc', 1, true, 'test password');
+        } finally {
+            $manager->setChunkCodec(null);
+            $codec->close();
+        }
+    }
+
+    public function test_encrypted_replay_requires_authenticated_chunk_context(): void
+    {
+        $disk = Mockery::mock(Filesystem::class);
+        $this->expectExceptionMessage('authenticated capture chunks and their password context');
+        $this->manager($disk)->collateChunksAdvanced([], 'archive.capsule.enc', 1, true, 'test password');
+    }
+
+    public function test_zip64_plan_change_uses_fresh_encryption_state_before_publication(): void
+    {
+        $manager = new class extends StorageManager {
+            public array $headers = [];
+            protected function zipBytes(callable $entries, int $compressionLevel, array &$zip64Entries = []): \Generator
+            {
+                if ($zip64Entries === []) {
+                    $zip64Entries['simulated-large-entry'] = true;
+                    yield 'first ZIP plan';
+                } else {
+                    yield 'final ZIP64 plan';
+                }
+            }
+            protected function fingerprint($stream): array
+            {
+                rewind($stream);
+                $this->headers[] = fread($stream, 64);
+                return parent::fingerprint($stream);
+            }
+            public function storeTestArchive(): string
+            {
+                return $this->storeArchive(static fn () => [], 'zip64-plan.capsule.enc', 1, 'test password');
+            }
+        };
+        $path = $manager->storeTestArchive();
+        $stored = Storage::disk('capsule-test')->get($path);
+        $this->assertCount(2, $manager->headers);
+        $this->assertNotSame($manager->headers[0], $manager->headers[1]);
+        $this->assertSame($manager->headers[1], substr($stored, 0, 64));
+        $input = $this->stream($stored);
+        $output = fopen('php://memory', 'w+b');
+        try {
+            \Dgtlss\Capsule\Security\EncryptedArchive::decrypt($input, $output, 'test password');
+            rewind($output);
+            $this->assertSame('final ZIP64 plan', stream_get_contents($output));
+            $this->assertSame(['size' => strlen($stored), 'sha256' => hash('sha256', $stored)], $manager->getLastArchiveFingerprint());
+        } finally {
+            fclose($input);
+            fclose($output);
+        }
     }
 
     public function test_backup_prefix_uses_directory_boundary(): void

@@ -348,8 +348,16 @@ return [
     |
     */
 
+    // Reader budget only. Raise explicitly for trusted historical manifests on a
+    // recovery host with enough RAM; decoded JSON can need several times this size.
+    'restore' => [
+        'max_manifest_bytes' => 16 * 1024 * 1024,
+    ],
+
     'security' => [
-        // Enable backup encryption (requires CAPSULE_BACKUP_PASSWORD)
+        // Enable backup encryption (requires CAPSULE_BACKUP_PASSWORD).
+        // With --no-local this writes .capsule.enc: Capsule is REQUIRED to decrypt.
+        // Regular encrypted backups remain native AES ZIPs staged on local disk.
         'encrypt_backups' => env('CAPSULE_ENCRYPT_BACKUPS', false),
 
         // Backup encryption password

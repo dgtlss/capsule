@@ -12,6 +12,7 @@ use Dgtlss\Capsule\Commands\VerifyScheduledCommand;
 use Dgtlss\Capsule\Commands\ListCommand;
 use Dgtlss\Capsule\Commands\InspectCommand;
 use Dgtlss\Capsule\Commands\DownloadCommand;
+use Dgtlss\Capsule\Commands\DecryptCommand;
 use Dgtlss\Capsule\Commands\HealthCommand;
 use Dgtlss\Capsule\Commands\RestoreCommand;
 use Dgtlss\Capsule\Database\DatabaseDumper;
@@ -78,6 +79,7 @@ class CapsuleServiceProvider extends ServiceProvider
                 HealthCommand::class,
                 RestoreCommand::class,
                 DownloadCommand::class,
+                DecryptCommand::class,
                 VerifyScheduledCommand::class,
             ]);
         }

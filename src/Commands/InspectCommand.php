@@ -5,7 +5,8 @@ namespace Dgtlss\Capsule\Commands;
 use Dgtlss\Capsule\Models\BackupLog;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Storage;
-use ZipArchive;
+use Dgtlss\Capsule\Support\RestoreArchive;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 
 class InspectCommand extends Command
 {
@@ -15,13 +16,13 @@ class InspectCommand extends Command
     public function handle(): int
     {
         $temporary = null;
-        $zip = null;
+        $archive = null;
         try {
             $log = BackupLog::find((int) $this->argument('id'));
             if (!$log || $log->status !== 'success' || !$log->file_path) {
                 throw new \RuntimeException('Backup not found or not successful.');
             }
-            $diskName = $log->metadata['storage']['disk'] ?? config('capsule.default_disk', 'local');
+            $diskName = $log->metadata['storage']['disk'] ?? $log->metadata['disk'] ?? config('capsule.default_disk', 'local');
             $disk = Storage::disk($diskName);
             if (!$disk->exists($log->file_path)) {
                 throw new \RuntimeException('Backup file not found in storage.');
@@ -43,20 +44,23 @@ class InspectCommand extends Command
             if ($bytes === false || $bytes !== $disk->size($log->file_path)) {
                 throw new \RuntimeException('Incomplete archive download.');
             }
-            $zip = new ZipArchive();
-            if ($zip->open($temporary, ZipArchive::CHECKCONS) !== true) {
-                $zip = null;
-                throw new \RuntimeException('Failed to open ZIP.');
+            $expectedHash = $log->metadata['archive_sha256'] ?? null;
+            if ($expectedHash !== null && (!is_string($expectedHash) || !preg_match('/^[a-f0-9]{64}$/iD', $expectedHash)
+                || !hash_equals(strtolower($expectedHash), hash_file('sha256', $temporary)))) {
+                throw new \RuntimeException('Backup checksum differs from its recorded checksum.');
             }
             $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-            if (is_string($password) && $password !== '') $zip->setPassword($password);
-            $raw = $zip->getFromName('manifest.json');
-            if ($raw === false) {
-                throw new \RuntimeException('Manifest is missing or the archive password is incorrect.');
-            }
-            $manifest = json_decode($raw, true, 512, JSON_THROW_ON_ERROR);
+            $requiresCapsule = EncryptedArchive::isEncryptedFile($temporary);
+            $archive = new RestoreArchive($temporary, $password, RestoreArchive::formatExpectation($log->file_path, $log->metadata ?? []),
+                RestoreArchive::manifestByteLimit(config('capsule.restore.max_manifest_bytes', RestoreArchive::MAX_MANIFEST_BYTES)));
+            $archive->verifyOnly();
+            $manifest = $archive->manifest();
             $result = ['id' => $log->id, 'status' => 'success', 'size' => $log->file_size,
-                'disk' => $diskName, 'path' => $log->file_path, 'manifest' => $manifest];
+                'disk' => $diskName, 'path' => $log->file_path, 'manifest' => $manifest,
+                'archive_format' => $requiresCapsule ? EncryptedArchive::FORMAT : 'zip',
+                'requires_capsule' => $requiresCapsule,
+                'warnings' => $archive->warnings(),
+                'checksums_complete' => count(array_filter($archive->entries(), static fn ($entry) => ($entry['integrity'] ?? 'sha256') !== 'sha256')) === 0];
             if ($this->option('format') === 'json') {
                 $this->line(json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
             } else {
@@ -72,7 +76,7 @@ class InspectCommand extends Command
             }
             return self::FAILURE;
         } finally {
-            if ($zip !== null) $zip->close();
+            if ($archive !== null) $archive->close();
             if ($temporary) @unlink($temporary);
         }
     }
