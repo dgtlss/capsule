@@ -35,7 +35,7 @@ class FileSelection
     }
 
     /** @return array<string, string> Archive path => absolute source path. */
-    public static function files(): array
+    public static function files(?BackupContext $context = null): array
     {
         $files = [];
         $portableNames = [];
@@ -48,7 +48,7 @@ class FileSelection
             }
             $filters[] = $filter;
         }
-        $context = new BackupContext('files');
+        $context ??= new BackupContext('normal');
         foreach (self::roots() as $id => $path) {
             $root = realpath($path);
             if ($root === false || !is_readable($root)) {

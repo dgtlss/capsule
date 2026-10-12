@@ -198,7 +198,7 @@ class ChunkedBackupService
             }
             event(new BackupStarting($context));
             $this->executeSteps((array) config('capsule.extensibility.pre_steps', []), $context, 'pre');
-            $this->createChunkedBackup();
+            $this->createChunkedBackup($context);
             event(new ArchiveFinalizing($context));
             $finalPath = $this->collateChunks();
             $this->lastArchiveMetadata = ['path' => $finalPath,
@@ -311,10 +311,9 @@ class ChunkedBackupService
         }
     }
 
-    protected function createChunkedBackup(): void
+    protected function createChunkedBackup(BackupContext $context): void
     {
         $timestamp = now()->format('Y-m-d_H-i-s');
-        $context = new BackupContext('chunked');
 
         if (config('capsule.database.enabled')) {
             $this->log('Creating chunked database backup...');
@@ -326,7 +325,7 @@ class ChunkedBackupService
         if (config('capsule.files.enabled')) {
             $this->log('Creating chunked file backup...');
             event(new FilesCollectStarting($context));
-            $this->createChunkedFileBackup($timestamp);
+            $this->createChunkedFileBackup($timestamp, $context);
             event(new FilesCollectCompleted($context));
         }
     }
@@ -428,14 +427,14 @@ class ChunkedBackupService
         }
     }
 
-    protected function createChunkedFileBackup(string $timestamp): void
+    protected function createChunkedFileBackup(string $timestamp, BackupContext $context): void
     {
         $chunkSize = (int) config('capsule.chunked_backup.chunk_size', 10485760);
         $baseName = 'files_' . bin2hex(random_bytes(8));
         $index = 0;
         $buffer = '';
         $start = count($this->chunkMetadata);
-        foreach (FileSelection::files() as $archivePath => $filePath) {
+        foreach (FileSelection::files($context) as $archivePath => $filePath) {
             $relative = substr($archivePath, strlen('files/'));
             $stream = @fopen($filePath, 'rb');
             if ($stream === false) {

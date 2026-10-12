@@ -4,7 +4,7 @@ namespace Dgtlss\Capsule\Support;
 
 class BackupContext
 {
-    public string $mode; // normal|chunked
+    public string $mode; // normal|chunked|incremental|simulation
     public bool $verbose = false;
     public int $compressionLevel = 1;
     public bool $encryption = false;

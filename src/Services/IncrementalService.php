@@ -17,10 +17,10 @@ class IncrementalService
      *
      * @param bool $computeHashes  Full SHA-256 per file (slower but exact)
      */
-    public function buildCurrentIndex(bool $computeHashes = false): array
+    public function buildCurrentIndex(bool $computeHashes = false, ?BackupContext $context = null): array
     {
         $index = [];
-        foreach (FileSelection::files() as $archivePath => $source) {
+        foreach (FileSelection::files($context ?? new BackupContext('incremental')) as $archivePath => $source) {
             $index[$archivePath] = $this->fileEntry($source, true);
             $index[$archivePath]['source'] = $source;
         }
@@ -96,9 +96,12 @@ class IncrementalService
      */
     public function getLatestFullSnapshot(): ?BackupSnapshot
     {
-        $snapshots = BackupSnapshot::where('type', 'full')
+        // Historical indexes can each be large. Check bounded batches of metadata
+        // first, and only load the index for the base that will actually be used.
+        $snapshots = BackupSnapshot::select(['id', 'backup_log_id'])
+            ->where('type', 'full')
             ->whereHas('backupLog', fn ($q) => $q->where('status', 'success'))
-            ->with('backupLog')->orderByDesc('id')->get();
+            ->with('backupLog')->lazyByIdDesc(100);
         foreach ($snapshots as $snapshot) {
             $metadata = $snapshot->backupLog->metadata ?? [];
             if (($metadata['schema_version'] ?? 1) !== 2 ||
@@ -111,7 +114,12 @@ class IncrementalService
             if (!\Illuminate\Support\Facades\Storage::disk($metadata['storage']['disk'])->exists($snapshot->backupLog->file_path)) {
                 continue;
             }
-            return $snapshot;
+            $base = BackupSnapshot::find($snapshot->id);
+            if ($base === null) {
+                continue;
+            }
+            $base->setRelation('backupLog', $snapshot->backupLog);
+            return $base;
         }
         return null;
     }

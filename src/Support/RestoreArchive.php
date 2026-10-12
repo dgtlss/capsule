@@ -300,7 +300,12 @@ class RestoreArchive
         $this->entries = [];
         foreach ($declared as $name => $entry) {
             $path = $stage ? $this->stagingDirectory . '/' . count($this->entries) : null;
-            $output = $stage ? fopen($path, 'xb') : null;
+            $mask = umask(0077);
+            try {
+                $output = $stage ? fopen($path, 'xb') : null;
+            } finally {
+                umask($mask);
+            }
             if ($output === false) {
                 throw new RuntimeException('Unable to stage archive contents.');
             }

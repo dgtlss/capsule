@@ -285,7 +285,8 @@ class RetentionService
     private function dependencies(Collection $all): array
     {
         $parents = [];
-        $snapshots = BackupSnapshot::all()->keyBy('id');
+        // Retention needs dependency edges, never the historical file indexes.
+        $snapshots = BackupSnapshot::get(['id', 'backup_log_id', 'base_snapshot_id'])->keyBy('id');
         foreach ($snapshots as $snapshot) {
             if ($snapshot->base_snapshot_id && ($base = $snapshots->get($snapshot->base_snapshot_id))) {
                 $parents[$snapshot->backup_log_id][] = $base->backup_log_id;

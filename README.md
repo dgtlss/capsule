@@ -213,6 +213,8 @@ php artisan capsule:restore --force
 
 For `.capsule.enc`, restoration requires compatible Capsule and the password. It first authenticates and decrypts into a private temporary ZIP, then validates the full archive manifest, paths, and payload checksums before changing files or importing databases. This requires local space for the decrypted ZIP and restore staging; `--no-local` is a backup option, not a disk-free recovery guarantee. Temporary plaintext is removed on handled failures. Standard and legacy AES ZIPs remain readable through the existing restore path. Invalid paths, symlink destinations, unreadable encrypted entries, and failed database imports return a nonzero exit code. JSON mode requires `--force` for a restore that changes data.
 
+Restoring over an existing file preserves its ordinary read/write/execute permissions, but strips set-id and sticky bits. New files use `0666 & ~umask` (normally `0644`); archive attributes do not grant execute or special permissions. Plaintext staging stays private until atomic publication. Ownership and ACLs are not restored from the archive. Recorded incremental case-only renames are supported on a probed case-sensitive target filesystem; simultaneous conflicting names still fail validation before destination changes.
+
 Schema 2 archives keep each configured file root separate: `files/root-0/...`, `files/root-1/...`, or `files/<configured-name>/...`. `--target` receives these root directories; without it, they are restored beneath the application base path. Review `--list` and `--dry-run` before moving restored files into production. New backups retain a 16 MiB manifest cap. Readers default to the same budget; an explicit [larger historical manifest budget](#larger-historical-manifests) can be configured for trusted older archives without relaxing validation. Supported legacy schema 1 archives retain their original unnamespaced layout. Their recorded SHA-256 values are still checked, with narrowly scoped, warned compatibility handling for old streamed database members that never had historical checksums. Archives without a valid manifest are rejected. See [older-backup compatibility](#compatibility-with-older-backups) for integrity and incremental limitations.
 
 ### Compatibility with Older Backups
@@ -344,7 +346,12 @@ php artisan capsule:diagnose --detailed
 
 # Attempt to fix common issues (e.g., publish missing config)
 php artisan capsule:diagnose --fix
+
+# One JSON document, including detailed checks, fixes and failure results
+php artisan capsule:diagnose --format=json --detailed --fix
 ```
+
+JSON includes boolean `checks`, `overall_status`, and sanitized `errors` for checks that could not complete. The exit code is nonzero if any check fails; repair commands do not print progress into the JSON output.
 
 ### Health
 
@@ -812,6 +819,8 @@ Register custom file filters and pipeline steps:
 ```php
 public function shouldInclude(string $absolutePath, BackupContext $context): bool;
 ```
+
+Filters and lifecycle events receive the same operation context used by pipeline steps, including option flags and pre-step metadata. Its mode is `normal` for regular/full and regular/incremental backups, or `chunked` for `--no-local`. Direct `IncrementalService::buildCurrentIndex()` calls without a supplied context use `incremental`.
 
 Built-in filters: `MaxFileSizeFilter`, `ExtensionFilter`, `PatternFilter`.
 

@@ -388,7 +388,7 @@ class RestoreCommand extends Command
         }
         // Include directory components: A/x and a/y also need a filesystem that
         // preserves historical case distinctions, even though their leaves differ.
-        foreach ($writes + array_fill_keys(array_keys($deletions), false) as $path => $legacy) {
+        foreach ($writes as $path => $legacy) {
             for ($current = $path; $current !== dirname($current); $current = dirname($current)) {
                 $key = strtolower($current);
                 $portablePaths[$key][$current] = ($portablePaths[$key][$current] ?? true) && $legacy;
@@ -403,6 +403,22 @@ class RestoreCommand extends Command
             }
             foreach (array_keys($paths) as $path) {
                 $this->assertCaseSensitiveFilesystem($path);
+            }
+        }
+        // Deletions describe historical names, not simultaneous final writes.
+        // A recorded Name -> name transition is valid once Name has been removed,
+        // but requires a filesystem that preserves both spellings (including
+        // directory components). Keep final-write collision checks above strict.
+        foreach (array_keys($deletions) as $path) {
+            for ($current = $path; $current !== dirname($current); $current = dirname($current)) {
+                $portablePaths[strtolower($current)][$current] = true;
+            }
+        }
+        foreach ($portablePaths as $paths) {
+            if (count($paths) > 1) {
+                foreach (array_keys($paths) as $path) {
+                    $this->assertCaseSensitiveFilesystem($path);
+                }
             }
         }
         $databaseTargets = [];
@@ -482,7 +498,7 @@ class RestoreCommand extends Command
         if (isset($this->caseSensitiveDirectories[$directory])) {
             return;
         }
-        $message = 'Historical case-distinct filenames require a case-sensitive target filesystem. Choose a compatible writable target directory: ' . $directory;
+        $message = 'Case-distinct filenames and recorded case-only renames require a case-sensitive target filesystem. Choose a compatible writable target directory: ' . $directory;
         $probe = $alternate = null;
         $probeCreated = $alternateCreated = false;
         $lower = $upper = null;
@@ -669,27 +685,54 @@ class RestoreCommand extends Command
                     throw new RuntimeException("Failed creating restore directory: {$directory}");
                 }
                 $this->assertSafeDestination($path);
-                $temporary = tempnam($directory, '.capsule_');
-                if ($temporary === false) {
-                    throw new RuntimeException("Unable to stage restored file: {$name}");
-                }
-                try {
-                    if (!@copy($entry['staged_path'], $temporary)) {
-                        throw new RuntimeException("Failed writing restored file: {$name}");
-                    }
-                    $this->assertSafeDestination($path);
-                    if (!@rename($temporary, $path)) {
-                        throw new RuntimeException("Failed replacing restored file: {$name}");
-                    }
-                } finally {
-                    if (file_exists($temporary)) {
-                        @unlink($temporary);
-                    }
-                }
+                $this->publishRestoredFile($entry['staged_path'], $path, $name);
             }
             $counts['files_restored']++;
         }
         return $counts;
+    }
+
+    /** Publish atomically with useful final permissions, keeping staging private. */
+    protected function publishRestoredFile(string $source, string $path, string $name): void
+    {
+        // A same-filesystem private directory allows us to set final permissions
+        // before the atomic rename without exposing unpublished plaintext.
+        $staging = dirname($path) . '/.capsule_' . bin2hex(random_bytes(16));
+        $mask = umask(0077);
+        try {
+            $created = @mkdir($staging, 0700);
+        } finally {
+            umask($mask);
+        }
+        if (!$created) {
+            throw new RuntimeException("Unable to stage restored file: {$name}");
+        }
+        $temporary = null;
+        try {
+            $temporary = tempnam($staging, 'file_');
+            if ($temporary === false) {
+                throw new RuntimeException("Unable to stage restored file: {$name}");
+            }
+            if (!@copy($source, $temporary)) {
+                throw new RuntimeException("Failed writing restored file: {$name}");
+            }
+            $this->assertSafeDestination($path);
+            // Preserve an existing target's ordinary access/execute bits, never
+            // set-id/sticky bits. Archives do not grant permissions to new files.
+            $permissions = is_file($path) ? @fileperms($path) : (0666 & ~$mask);
+            if ($permissions === false || !@chmod($temporary, $permissions & 0777)) {
+                throw new RuntimeException("Failed setting restored file permissions: {$name}");
+            }
+            $this->assertSafeDestination($path);
+            if (!@rename($temporary, $path)) {
+                throw new RuntimeException("Failed replacing restored file: {$name}");
+            }
+        } finally {
+            if (is_string($temporary) && file_exists($temporary)) {
+                @unlink($temporary);
+            }
+            @rmdir($staging);
+        }
     }
 
     protected function showContents(array $chain, ?BackupLog $backup, array $source): int

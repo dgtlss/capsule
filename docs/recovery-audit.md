@@ -29,6 +29,18 @@ This document maps the twenty recovery-audit findings to the implementation and 
 | 19 | Dormant promises | Removed unused concurrent-upload, legacy key-management and S3-lifecycle implementations/configuration | No internal callers found; full suite guards remaining paths |
 | 20 | Mixed JSON and human output | Structured command results with failure exit codes and separated progress | Command JSON regressions, including restore success/failure |
 
+## Follow-up functional review fixes
+
+The five follow-up findings are covered without changing the archive encryption formats or historical fixtures:
+
+- **Custom filters:** file selection and lifecycle events share the actual operation `BackupContext`, including pre-step metadata and encryption/verification/compression flags. Normal incremental runs retain `normal`; standalone index calls default to `incremental`. `FileFilterContextTest` covers all operation paths, including encrypted round trips.
+- **Restored permissions:** replacements preserve existing ordinary permission bits, stripping special bits. New files use `0666 & ~umask`; executable permissions are never granted from archive attributes. Private extraction and same-filesystem publication staging remain inaccessible until atomic publication. This is not ownership/ACL restoration. `RestoreFileTransitionsTest` covers modes, umasks and failed-copy preservation.
+- **Case-only incremental renames:** explicit historical deletions no longer count as simultaneous final writes. Final aliases still fail validation; recorded transitions require a probed case-sensitive filesystem, and symlink/containment checks remain enforced. Root/nested and multi-layer transitions are tested before changes to existing targets.
+- **Snapshot history memory:** retention reads dependency IDs only. Incremental base selection traverses metadata in batches of 100 and loads only the chosen full index after eligibility checks. `SnapshotHistoryLoadingTest` verifies SQL projections, large-history memory bounds, short-circuiting, policy/disk/path/schema eligibility and storage failures.
+- **Diagnose JSON:** success, failure, detailed checks and `--fix` emit one complete JSON document. Unexpected per-check errors become sanitized structured failures and do not stop remaining checks. `DiagnoseJsonTest` also guards readable table output.
+
+Independent follow-up functional review found no additional blockers; its focused/regression run passed 103 tests / 697 assertions on PHP 8.4.24. It covers these ordinary functional changes only. The incomplete cryptographic/security review remains a manual prerequisite before merge or release.
+
 ## Recovery compatibility and behavior changes
 
 - **Breaking compatibility change:** Laravel 10/11 and PHP 8.1 are no longer supported. Required versions are Laravel 12 with PHP 8.2+, or Laravel 13 with PHP 8.3+. The remaining CI matrix keeps Composer security enforcement enabled; no release/version bump is made by this PR.
@@ -79,7 +91,7 @@ These compatibility paths preserve documented, recoverable historical outputs; t
 
 ## Current-change verification status
 
-- **Final local suite:** PHP 8.4.24 / Laravel 13.35.0 / PHPUnit 11.5.57 passed **668 tests / 10,697 assertions**, with two skips: optional Spatie Health is not installed locally, and compiled-in sodium cannot be unloaded for the missing-extension subprocess test. Disabled-function failure checks still run. PHP syntax, whitespace, Composer validation and installed-platform checks pass; Composer audit reports no advisories or abandoned packages. The existing explicit package-version field produces a recommendation warning.
+- **Final local suite:** PHP 8.4.24 / Laravel 13.35.0 / PHPUnit 11.5.57 passed **721 tests / 11,120 assertions**, with two skips: optional Spatie Health is not installed locally, and compiled-in sodium cannot be unloaded for the missing-extension subprocess test. Disabled-function failure checks still run. PHP syntax, whitespace, Composer validation and installed-platform checks pass; Composer audit reports no advisories or abandoned packages. The existing explicit package-version field produces a recommendation warning.
 - **Native AES compatibility:** The reader authenticates each AES member through a separate native `FL_COMPRESSED` stream before decompression, then validates decoded size/CRC/manifest hashes. This prevents early DEFLATE EOF from hiding an authentication-footer error on some libzip builds. Regressions cover AES-128/192/256, stored/deflated members, empty files, and command modes before destination writes.
 - **Exact-commit CI:** Consult the [PR checks](https://github.com/dgtlss/capsule/pull/4/checks) and final PR validation report for the published commit across all seven combinations. The local results above are not a claim that CI has passed.
 - **Independent security review: incomplete.** The review identified a format-dispatch gap, which was fixed and received focused regression coverage. The review stopped before completion; those checks do not establish that all encryption/recovery paths were reviewed. A manual security review is required before merge or release. No professional cryptographic audit is claimed.

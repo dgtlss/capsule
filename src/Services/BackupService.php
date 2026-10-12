@@ -219,7 +219,7 @@ class BackupService
 
         try {
             $this->log('Creating backup archive...');
-            $localBackupPath = $this->createBackup();
+            $localBackupPath = $this->createBackup($context);
             $context->localArchivePath = $localBackupPath;
             
             $fileSize = filesize($localBackupPath);
@@ -362,7 +362,7 @@ class BackupService
         return $failures;
     }
 
-    protected function createBackup(): string
+    protected function createBackup(BackupContext $context): string
     {
         $runId = now()->format('Y-m-d_H-i-s') . '_' . bin2hex(random_bytes(16));
         $this->stagingDirectory = sys_get_temp_dir() . '/capsule-' . bin2hex(random_bytes(16));
@@ -377,13 +377,13 @@ class BackupService
         $closed = false;
         try {
             if (config('capsule.database.enabled')) {
-                event(new DatabaseDumpStarting(new BackupContext('normal')));
+                event(new DatabaseDumpStarting($context));
                 $this->addDatabaseToBackup($zip, $runId);
-                event(new DatabaseDumpCompleted(new BackupContext('normal')));
+                event(new DatabaseDumpCompleted($context));
             }
             if (config('capsule.files.enabled')) {
-                event(new FilesCollectStarting(new BackupContext('normal')));
-                $this->currentFileIndex = $this->incrementalService->buildCurrentIndex(true);
+                event(new FilesCollectStarting($context));
+                $this->currentFileIndex = $this->incrementalService->buildCurrentIndex(true, $context);
                 $baseSnapshot = $this->incremental ? $this->incrementalService->getLatestFullSnapshot() : null;
                 if ($baseSnapshot) {
                     $diff = $this->incrementalService->diff($this->currentFileIndex, $baseSnapshot);
@@ -400,7 +400,7 @@ class BackupService
                 } else {
                     $this->addSpecificFilesToBackup($zip, array_keys($this->currentFileIndex));
                 }
-                event(new FilesCollectCompleted(new BackupContext('normal')));
+                event(new FilesCollectCompleted($context));
             }
             $manifest = $this->manifestBuilder->build(false, $this->compressionLevel, $this->encryptionEnabled());
             $manifest['backup_type'] = $this->backupType;
@@ -410,7 +410,7 @@ class BackupService
                 throw new Exception('Cannot add backup manifest.');
             }
             $this->applyCompressionAndEncryption($zip, 'manifest.json');
-            event(new ArchiveFinalizing(new BackupContext('normal')));
+            event(new ArchiveFinalizing($context));
             $closed = $zip->close();
             if (!$closed) {
                 throw new Exception('Failed to finalize ZIP archive.');
