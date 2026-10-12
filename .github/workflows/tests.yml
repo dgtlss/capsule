@@ -38,4 +38,7 @@ jobs:
         if: matrix.laravel == '13.*' && matrix.php == '8.4'
         run: composer require --dev "spatie/laravel-health:^1.0" --prefer-dist --no-interaction --no-progress
       - run: composer validate --no-check-publish
+      - run: composer audit --locked
+      - name: Report archive and crypto runtime versions
+        run: php --ri zip && php --ri sodium
       - run: composer test

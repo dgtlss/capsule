@@ -149,21 +149,23 @@ class RestoreAuthenticationTest extends TestCase
 
     public static function commandCorruptionCases(): iterable
     {
-        foreach (['manifest.json', 'files/unselected.txt', 'files/empty.txt'] as $name) {
-            foreach ([[], ['--only' => ['selected.txt']], ['--list' => true], ['--dry-run' => true]] as $options) {
-                yield $name . ' ' . json_encode($options) => [$name, $options];
+        foreach ([ZipArchive::CM_STORE, ZipArchive::CM_DEFLATE] as $compression) {
+            foreach (['manifest.json', 'files/unselected.txt', 'files/empty.txt'] as $name) {
+                foreach ([[], ['--only' => ['selected.txt']], ['--list' => true], ['--dry-run' => true]] as $options) {
+                    yield $compression . ' ' . $name . ' ' . json_encode($options) => [$name, $options, $compression];
+                }
             }
         }
     }
 
     #[DataProvider('commandCorruptionCases')]
-    public function test_command_authenticates_all_members_before_any_destination_changes(string $name, array $options): void
+    public function test_command_authenticates_all_members_before_any_destination_changes(string $name, array $options, int $compression): void
     {
         $target = $this->testPath('target');
         mkdir($target);
         file_put_contents($target . '/selected.txt', 'original destination');
         $path = $this->nativeArchive(['database/testing.sql' => 'SELECT 1;', 'files/selected.txt' => 'replacement',
-            'files/unselected.txt' => 'unselected valid plaintext', 'files/empty.txt' => '']);
+            'files/unselected.txt' => 'unselected valid plaintext', 'files/empty.txt' => ''], compression: $compression);
         $this->tamperAuthentication($path, $name);
         $command = new AuthenticationRecordingRestoreCommand();
         $command->setLaravel($this->app);

@@ -384,6 +384,11 @@ class RestoreArchive
         if ($stat === false || !is_int($stat['crc'] ?? null)) {
             throw new RuntimeException("Cannot read archive checksum: {$name}");
         }
+        $aes = in_array($stat['encryption_method'] ?? ZipArchive::EM_NONE,
+            [ZipArchive::EM_AES_128, ZipArchive::EM_AES_192, ZipArchive::EM_AES_256], true);
+        if ($aes) {
+            $this->authenticateNativeAesMember($name, $stat);
+        }
         $crc = hash_init('crc32b');
         $input = $this->readZipStream($name, fn () => $this->zip->getStream($name));
         if ($input === false) {
@@ -414,13 +419,47 @@ class RestoreArchive
             // WinZip AES AE-2 deliberately stores CRC=0 and is authenticated by
             // libzip at EOF instead. Plain ZIP and ZipCrypto still require CRC.
             $actualCrc = hash_final($crc);
-            $aes = in_array($stat['encryption_method'] ?? ZipArchive::EM_NONE,
-                [ZipArchive::EM_AES_128, ZipArchive::EM_AES_192, ZipArchive::EM_AES_256], true);
             if ((!$aes || $stat['crc'] !== 0) && !hash_equals(sprintf('%08x', $stat['crc'] & 0xffffffff), $actualCrc)) {
                 throw new RuntimeException("Cannot read {$name}; the archive is corrupt or its password is incorrect.");
             }
         } finally {
             fclose($input);
+        }
+    }
+
+    protected function authenticateNativeAesMember(string $name, array $stat): void
+    {
+        if (!is_int($stat['comp_size'] ?? null) || $stat['comp_size'] < 0) {
+            throw new RuntimeException("Cannot read archive compressed size: {$name}");
+        }
+        // Some libzip decompressors finish at the end of the compressed payload
+        // without asking the AES layer to authenticate its footer. FL_COMPRESSED
+        // bypasses decompression, but still decrypts/authenticates natively; do
+        // not use FL_ENCRYPTED, which would bypass that authentication entirely.
+        // getStreamName's flags argument is available from our PHP 8.2 minimum.
+        $input = $this->readZipStream($name, fn () => $this->zip->getStreamName($name, ZipArchive::FL_COMPRESSED));
+        if ($input === false) {
+            throw new RuntimeException("Cannot read {$name}; the archive is corrupt or its password is incorrect.");
+        }
+        try {
+            $size = 0;
+            while (true) {
+                // Read again after the final bytes, even when feof() is already
+                // true: native AES can report a bad tag on that final read.
+                $chunk = $this->readZipStream($name, static fn () => fread($input, 1024 * 1024));
+                if ($chunk === false || ($chunk === '' && !feof($input))) {
+                    throw new RuntimeException("Failed authenticating archive member: {$name}");
+                }
+                if ($chunk === '') {
+                    break;
+                }
+                $size += strlen($chunk);
+                if ($size > $stat['comp_size']) {
+                    throw new RuntimeException("Archive compressed size mismatch: {$name}");
+                }
+            }
+        } finally {
+            $this->readZipStream($name, static fn () => fclose($input));
         }
     }
 

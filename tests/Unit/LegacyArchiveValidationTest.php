@@ -227,17 +227,19 @@ class LegacyArchiveValidationTest extends TestCase
     public static function corruptionCases(): iterable
     {
         foreach ([false, true] as $stage) {
-            yield 'plain stored CRC, stage ' . (int) $stage => [false, ZipArchive::CM_STORE, $stage];
-            foreach ([ZipArchive::CM_STORE, ZipArchive::CM_DEFLATE] as $compression) {
-                yield 'native AES authentication, compression ' . $compression . ', stage ' . (int) $stage => [true, $compression, $stage];
+            yield 'plain stored CRC, stage ' . (int) $stage => [false, ZipArchive::CM_STORE, $stage, ZipArchive::EM_NONE];
+            foreach ([ZipArchive::EM_AES_128, ZipArchive::EM_AES_192, ZipArchive::EM_AES_256] as $encryption) {
+                foreach ([ZipArchive::CM_STORE, ZipArchive::CM_DEFLATE] as $compression) {
+                    yield 'native AES ' . $encryption . ', compression ' . $compression . ', stage ' . (int) $stage => [true, $compression, $stage, $encryption];
+                }
             }
         }
     }
 
     #[DataProvider('corruptionCases')]
-    public function test_checksumless_database_still_requires_zip_crc_and_native_aes_authentication(bool $encrypted, int $compression, bool $stage): void
+    public function test_checksumless_database_still_requires_zip_crc_and_native_aes_authentication(bool $encrypted, int $compression, bool $stage, int $encryption): void
     {
-        $path = $this->archive([self::DATABASE => str_repeat('SELECT 1;', 100)], $this->legacyManifest(), $encrypted, $compression);
+        $path = $this->archive([self::DATABASE => str_repeat('SELECT 1;', 100)], $this->legacyManifest(), $encrypted, $compression, $encryption);
         $this->corruptMember($path, self::DATABASE, $encrypted);
         $archive = new LegacyValidationRestoreArchive($path, $encrypted ? self::PASSWORD : null);
         try {
@@ -248,6 +250,11 @@ class LegacyArchiveValidationTest extends TestCase
             $this->assertSame([], $archive->manifest());
             $this->assertSame([], $archive->entries());
             $this->assertSame([], $archive->warnings());
+            if ($encrypted) {
+                // The native compressed-stream pass must reject the bad tag
+                // before decoded plaintext reaches the staging consumer.
+                $this->assertArrayNotHasKey(self::DATABASE, $archive->consumedMembers);
+            }
             if ($stage) {
                 $this->assertNotNull($archive->stagingBeforeClose);
                 $this->assertDirectoryDoesNotExist($archive->stagingBeforeClose);
@@ -306,7 +313,8 @@ class LegacyArchiveValidationTest extends TestCase
         ];
     }
 
-    private function archive(array $members, array $manifest, bool $encrypted = false, int $compression = ZipArchive::CM_STORE): string
+    private function archive(array $members, array $manifest, bool $encrypted = false, int $compression = ZipArchive::CM_STORE,
+        int $encryption = ZipArchive::EM_AES_256): string
     {
         $path = $this->testPath(bin2hex(random_bytes(8)) . '.zip');
         $zip = new ZipArchive();
@@ -316,7 +324,7 @@ class LegacyArchiveValidationTest extends TestCase
             $this->assertTrue($zip->addFromString($name, $contents));
             $this->assertTrue($zip->setCompressionName($name, $compression));
             if ($encrypted) {
-                $this->assertTrue($zip->setEncryptionName($name, ZipArchive::EM_AES_256, self::PASSWORD));
+                $this->assertTrue($zip->setEncryptionName($name, $encryption, self::PASSWORD));
             }
         }
         $this->assertTrue($zip->close());
@@ -364,6 +372,15 @@ class LegacyArchiveValidationTest extends TestCase
 class LegacyValidationRestoreArchive extends RestoreArchive
 {
     public ?string $stagingBeforeClose = null;
+    public array $consumedMembers = [];
+
+    protected function readMember(string $name, int $expectedSize, callable $consume): void
+    {
+        parent::readMember($name, $expectedSize, function (#[\SensitiveParameter] string $chunk) use ($name, $consume): void {
+            $this->consumedMembers[$name] = true;
+            $consume($chunk);
+        });
+    }
 
     public function close(): void
     {

@@ -6,6 +6,8 @@ The stream contains a compressed ZIP encrypted by PHP's native sodium extension.
 
 Standard `php artisan capsule:backup --encrypt` is unchanged: it uses local staging and native `ZipArchive`/libzip to create an AES-encrypted ZIP. Standard and legacy AES ZIPs still use the existing restore path and an AES-capable ZIP reader for manual extraction. They have a different password KDF and expose ZIP member names and sizes. The stronger streaming format does not retroactively change those archives. [Historical backup compatibility](recovery-audit.md#historical-backup-compatibility) covers real old regular and `--no-local` ZIPs, including AES, legacy password behavior, unchecksummed streamed database members, old incrementals, and Unix filenames. These cases retain explicit warnings where the old writer omitted integrity or deletion information.
 
+For native AES ZIP recovery, Capsule first drains a decrypted compressed member stream through its authentication footer, then reads and validates the decoded payload. This adds an extra bounded read/decryption pass so early decompressor EOF cannot hide a bad tag on some libzip builds. It uses the public PHP 8.2+ `ZipArchive::getStreamName` API; no custom ZIP cryptography or newer-libzip-only format is introduced.
+
 ## Standalone decryption and disaster recovery
 
 The installed Composer package supplies `vendor/bin/capsule-decrypt`. It loads the package's dependencies but does **not** boot Laravel. You do not need the original Laravel application, its database, the backup catalog, or the original storage account after downloading the final file. You do need PHP, the required extensions, a compatible Capsule package and installed dependencies, the encrypted file, and its password.
