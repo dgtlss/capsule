@@ -4,352 +4,83 @@ namespace Dgtlss\Capsule\Commands;
 
 use Dgtlss\Capsule\Events\CleanupCompleted;
 use Dgtlss\Capsule\Events\CleanupStarting;
-use Dgtlss\Capsule\Models\BackupLog;
-use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Notifications\NotificationManager;
+use Dgtlss\Capsule\Services\RetentionService;
 use Dgtlss\Capsule\Support\Helpers;
+use Dgtlss\Capsule\Support\Lock;
 use Illuminate\Console\Command;
 
 class CleanupCommand extends Command
 {
-    protected $signature = 'capsule:cleanup 
-    {--dry-run : Show what would be deleted without actually deleting} 
-    {--days= : Override retention days from config}
-    {--failed : Also clean up failed backup records}
-    {--storage : Clean up orphaned files in storage}
+    protected $signature = 'capsule:cleanup
+    {--dry-run : Show what would be deleted without actually deleting}
+    {--days= : Override retention days and ignore count-based retention}
+    {--policy= : Clean only backups created by this named policy}
+    {--failed : Also clean up failed and stale backup records}
+    {--storage : Clean up orphaned files in recorded storage locations}
     {--detailed : Verbose output}
     {--format=table : Output format (table|json)}';
-    
+
     protected $description = 'Clean up old backup files according to retention policy';
 
-    public function handle(): int
+    public function handle(RetentionService $retention): int
     {
-        $this->info('Starting cleanup process...');
-
-        $daysOption = $this->option('days');
-        $retentionDays = $daysOption !== null ? (int) $daysOption : config('capsule.retention.days', 30);
-        $retentionCount = config('capsule.retention.count', 10);
-        $maxStorageMb = (int) (config('capsule.retention.max_storage_mb') ?? 0);
-        $minKeep = (int) config('capsule.retention.min_keep', 3);
-        $isDryRun = $this->option('dry-run');
-        $cleanFailed = $this->option('failed');
-        $cleanStorage = $this->option('storage');
-        $verbose = $this->option('detailed');
-
-        if ($daysOption !== null) {
-            $this->info("Using command override: {$retentionDays} days (ignoring config and count-based retention)");
-        } else {
-            $this->info("Retention policy: {$retentionDays} days, maximum {$retentionCount} backups");
-        }
-
-        if ($isDryRun) {
-            $this->warn('DRY RUN MODE - No files will be deleted');
-        }
-
-        event(new CleanupStarting($isDryRun));
-
-        $totalDeleted = 0;
-        $totalSize = 0;
-
-        // Clean up successful backups (time/count based)
-        $result = $this->cleanupSuccessfulBackups($retentionDays, $retentionCount, $isDryRun, $verbose);
-        $totalDeleted += $result['count'];
-        $totalSize += $result['size'];
-
-        // Enforce budget if configured
-        if ($maxStorageMb > 0) {
-            $result = $this->enforceStorageBudget($maxStorageMb, $minKeep, $isDryRun, $verbose);
-            $totalDeleted += $result['count'];
-            $totalSize += $result['size'];
-        }
-
-        // Clean up failed backups if requested
-        if ($cleanFailed) {
-            $result = $this->cleanupFailedBackups($retentionDays, $isDryRun, $verbose);
-            $totalDeleted += $result['count'];
-            $totalSize += $result['size'];
-        }
-
-        // Clean up orphaned storage files if requested
-        if ($cleanStorage) {
-            $result = $this->cleanupOrphanedFiles($isDryRun, $verbose);
-            $totalDeleted += $result['count'];
-            $totalSize += $result['size'];
-        }
-
-        $format = $this->option('format');
-        if ($format === 'json') {
-            $this->line(json_encode([
-                'dry_run' => (bool) $isDryRun,
-                'deleted_count' => $totalDeleted,
-                'deleted_size_bytes' => $totalSize,
-            ], JSON_PRETTY_PRINT));
-        } else {
-            if ($totalDeleted === 0) {
-                $this->info('No items to clean up.');
-            } else {
-                $action = $isDryRun ? 'Would delete' : 'Deleted';
-                $this->info("{$action} {$totalDeleted} items ({Helpers::formatBytes($totalSize)}) total");
-            }
-        }
-
-        event(new CleanupCompleted($totalDeleted, $totalSize, $isDryRun));
-
-        if (!$isDryRun && $totalDeleted > 0) {
-            $notificationManager = new NotificationManager();
-            $notificationManager->sendCleanupNotification($totalDeleted, $totalSize);
-        }
-
-        return self::SUCCESS;
-    }
-
-    protected function enforceStorageBudget(int $maxStorageMb, int $minKeep, bool $isDryRun, bool $verbose): array
-    {
-        $storageManager = new StorageManager();
-        $currentFiles = BackupLog::where('status', 'success')
-            ->orderBy('created_at', 'desc')
-            ->get(['id', 'file_path', 'file_size', 'created_at']);
-
-        if ($currentFiles->isEmpty()) {
-            return ['count' => 0, 'size' => 0];
-        }
-
-        $totalBytes = (int) $currentFiles->sum('file_size');
-        $budgetBytes = $maxStorageMb * 1024 * 1024;
-        if ($verbose) {
-            $this->info('📊 Storage usage: ' . Helpers::formatBytes($totalBytes) . ' / ' . Helpers::formatBytes($budgetBytes));
-        }
-
-        if ($totalBytes <= $budgetBytes) {
-            if ($verbose) $this->info('✅ Within budget; no budget-based pruning needed');
-            return ['count' => 0, 'size' => 0];
-        }
-
-        // Start pruning from oldest while respecting min_keep
-        $deletedCount = 0;
-        $deletedSize = 0;
-        $toConsider = $currentFiles->sortBy('created_at')->values();
-
-        foreach ($toConsider as $index => $backup) {
-            $remaining = $currentFiles->count() - ($deletedCount + 1);
-            if ($remaining < $minKeep) {
-                // Stop if we would drop below min_keep
-                break;
-            }
-
-            $size = (int) ($backup->file_size ?? 0);
-            if ($verbose) {
-                $this->line("- Pruning (budget): " . $backup->created_at->format('Y-m-d H:i:s') . ' (' . Helpers::formatBytes($size) . ')');
-            }
-
-            if (!$isDryRun) {
-                if (!empty($backup->file_path)) {
-                    try {
-                        $fileName = basename($backup->file_path);
-                        $storageManager->delete($fileName);
-                    } catch (\Exception $e) {
-                        $this->warn("  Failed to delete storage file: {$e->getMessage()}");
-                    }
-                }
-                $backup->delete();
-            }
-
-            $deletedCount++;
-            $deletedSize += $size;
-            $totalBytes -= $size;
-
-            if ($totalBytes <= $budgetBytes) {
-                break;
-            }
-        }
-
-        if ($deletedCount > 0) {
-            $action = $isDryRun ? 'Would delete (budget)' : 'Deleted (budget)';
-            $this->info("{$action} {$deletedCount} items (" . Helpers::formatBytes($deletedSize) . ")");
-        } else if ($verbose) {
-            $this->info('No items pruned by budget (respecting min_keep).');
-        }
-
-        return ['count' => $deletedCount, 'size' => $deletedSize];
-    }
-
-    protected function cleanupSuccessfulBackups(int $retentionDays, int $retentionCount, bool $isDryRun, bool $verbose): array
-    {
-        if ($verbose) {
-            $this->info('🔍 Scanning successful backups...');
-        }
-
-        if ($this->option('days') !== null) {
-            $oldBackups = BackupLog::where('status', 'success')
-                ->where('created_at', '<', now()->subDays($retentionDays))
-                ->get();
-        } else {
-            $keepIds = BackupLog::where('status', 'success')
-                ->orderBy('created_at', 'desc')
-                ->limit($retentionCount)
-                ->pluck('id')
-                ->toArray();
-
-            $oldBackups = BackupLog::where('status', 'success')
-                ->where('created_at', '<', now()->subDays($retentionDays))
-                ->when(!empty($keepIds), function ($q) use ($keepIds) {
-                    $q->whereNotIn('id', $keepIds);
-                })
-                ->get();
-        }
-
-        if ($oldBackups->isEmpty()) {
-            if ($verbose) {
-                $this->info('No successful backups to clean up.');
-            }
-            return ['count' => 0, 'size' => 0];
-        }
-
-        $this->info("Found {$oldBackups->count()} successful backups to clean up:");
-
-        $deletedCount = 0;
-        $deletedSize = 0;
-        $storageManager = new StorageManager();
-
-        foreach ($oldBackups as $backup) {
-            $size = $backup->file_size ?? 0;
-            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({Helpers::formatBytes($size)})");
-
-            if (!$isDryRun) {
-                if ($backup->file_path) {
-                    try {
-                        $fileName = basename($backup->file_path);
-                        $storageManager->delete($fileName);
-                        if ($verbose) {
-                            $this->line("  Deleted from storage: {$fileName}");
-                        }
-                    } catch (\Exception $e) {
-                        $this->warn("  Failed to delete storage file: {$e->getMessage()}");
-                    }
-                }
-                $backup->delete();
-                $deletedCount++;
-                $deletedSize += $size;
-            }
-        }
-
-        if ($isDryRun) {
-            $totalSize = $oldBackups->sum('file_size');
-            $this->info("Would delete {$oldBackups->count()} successful backups ({Helpers::formatBytes($totalSize)})");
-        } else {
-            $this->info("Deleted {$deletedCount} successful backups ({Helpers::formatBytes($deletedSize)})");
-        }
-
-        return ['count' => $deletedCount, 'size' => $deletedSize];
-    }
-
-    protected function cleanupFailedBackups(int $retentionDays, bool $isDryRun, bool $verbose): array
-    {
-        if ($verbose) {
-            $this->info('🔍 Scanning failed backups...');
-        }
-
-        $staleTimeout = (int) config('capsule.lock.timeout_seconds', 900);
-        $failedBackups = BackupLog::where(function ($q) use ($retentionDays, $staleTimeout) {
-            $q->where('status', 'failed')
-              ->where('created_at', '<', now()->subDays($retentionDays));
-        })->orWhere(function ($q) use ($staleTimeout) {
-            $q->where('status', 'running')
-              ->where('started_at', '<', now()->subSeconds($staleTimeout));
-        })->get();
-
-        if ($failedBackups->isEmpty()) {
-            if ($verbose) {
-                $this->info('No failed backups to clean up.');
-            }
-            return ['count' => 0, 'size' => 0];
-        }
-
-        $this->info("Found {$failedBackups->count()} failed backup records to clean up:");
-
-        $deletedCount = 0;
-
-        foreach ($failedBackups as $backup) {
-            $label = $backup->status === 'running' ? 'stale' : 'failed';
-            $this->line("- {$backup->created_at->format('Y-m-d H:i:s')} ({$label}: {$backup->error_message})");
-
-            if (!$isDryRun) {
-                $backup->delete();
-                $deletedCount++;
-            }
-        }
-
-        if ($isDryRun) {
-            $this->info("Would delete {$failedBackups->count()} failed backup records");
-        } else {
-            $this->info("Deleted {$deletedCount} failed backup records");
-        }
-
-        return ['count' => $deletedCount, 'size' => 0];
-    }
-
-    protected function cleanupOrphanedFiles(bool $isDryRun, bool $verbose): array
-    {
-        if ($verbose) {
-            $this->info('🔍 Scanning for orphaned storage files...');
-        }
-
-        $storageManager = new StorageManager();
-        $backupPath = config('capsule.backup_path', 'backups');
-        
+        $json = $this->option('format') === 'json';
+        $dryRun = (bool) $this->option('dry-run');
+        $lock = null;
+        $result = ['count' => 0, 'size' => 0, 'errors' => []];
         try {
-            $allFiles = $storageManager->listFiles($backupPath);
-        } catch (\Exception $e) {
-            $this->error("Failed to list storage files: {$e->getMessage()}");
-            return ['count' => 0, 'size' => 0];
-        }
-
-        $knownFiles = BackupLog::whereNotNull('file_path')
-            ->pluck('file_path')
-            ->map(function ($path) {
-                return basename($path);
-            })
-            ->toArray();
-
-        $orphanedFiles = array_diff($allFiles, $knownFiles);
-
-        if (empty($orphanedFiles)) {
-            if ($verbose) {
-                $this->info('No orphaned files found in storage.');
+            if (!in_array($this->option('format'), ['table', 'json'], true)) {
+                throw new \InvalidArgumentException('Output format must be table or json.');
             }
-            return ['count' => 0, 'size' => 0];
-        }
-
-        $this->info("Found " . count($orphanedFiles) . " orphaned files in storage:");
-
-        $deletedCount = 0;
-        $deletedSize = 0;
-
-        foreach ($orphanedFiles as $filename) {
-            try {
-                $size = $storageManager->size($filename);
-                $this->line("- {$filename} ({Helpers::formatBytes($size)})");
-
-                if (!$isDryRun) {
-                    $storageManager->delete($filename);
-                    $deletedCount++;
-                    $deletedSize += $size;
-                    if ($verbose) {
-                        $this->line("  Deleted orphaned file: {$filename}");
-                    }
+            $days = $this->option('days');
+            if ($days !== null && !ctype_digit((string) $days)) {
+                throw new \InvalidArgumentException('Retention days must be a nonnegative integer.');
+            }
+            $lock = Lock::acquire('capsule:backup');
+            if ($lock === null) {
+                throw new \RuntimeException('Another backup or cleanup is currently running.');
+            }
+            event(new CleanupStarting($dryRun));
+            $result = $retention->cleanup([
+                'days' => $days === null ? null : (int) $days,
+                'policy' => $this->option('policy'),
+                'dry_run' => $dryRun,
+                'failed' => (bool) $this->option('failed'),
+                'storage' => (bool) $this->option('storage'),
+                'output' => !$json && $this->option('detailed') ? fn ($message) => $this->line($message) : null,
+            ]);
+            event(new CleanupCompleted($result['count'], $result['size'], $dryRun));
+            if (!$dryRun && $result['count'] > 0) {
+                app(NotificationManager::class)->sendCleanupNotification($result['count'], $result['size']);
+            }
+        } catch (\Throwable $e) {
+            $result['errors'][] = $e->getMessage();
+        } finally {
+            if ($lock !== null) {
+                try {
+                    $lock->release();
+                } catch (\Throwable $e) {
+                    $result['errors'][] = 'Failed to release cleanup lock: ' . $e->getMessage();
                 }
-            } catch (\Exception $e) {
-                $this->warn("  Failed to process {$filename}: {$e->getMessage()}");
             }
         }
 
-        if ($isDryRun) {
-            $this->info("Would delete " . count($orphanedFiles) . " orphaned files ({Helpers::formatBytes($deletedSize)})");
+        if ($json) {
+            $this->line(json_encode([
+                'status' => $result['errors'] === [] ? 'success' : 'failed',
+                'dry_run' => $dryRun,
+                'deleted_count' => $result['count'],
+                'deleted_size_bytes' => $result['size'],
+                'errors' => $result['errors'],
+            ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         } else {
-            $this->info("Deleted {$deletedCount} orphaned files ({Helpers::formatBytes($deletedSize)})");
+            $action = $dryRun ? 'Would delete' : 'Deleted';
+            $this->info("{$action} {$result['count']} items (" . Helpers::formatBytes($result['size']) . ') total');
+            foreach ($result['errors'] as $error) {
+                $this->error($error);
+            }
         }
-
-        return ['count' => $deletedCount, 'size' => $deletedSize];
+        return $result['errors'] === [] ? self::SUCCESS : self::FAILURE;
     }
-
 }

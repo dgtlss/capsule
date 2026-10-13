@@ -6,10 +6,13 @@ use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Database\DumpValidator;
 use Dgtlss\Capsule\Services\AuditLogger;
 use Dgtlss\Capsule\Models\BackupLog;
+use Dgtlss\Capsule\Security\EncryptionPasswordVerifier;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Support\BackupContext;
 use Dgtlss\Capsule\Support\Helpers;
+use Dgtlss\Capsule\Support\FileSelection;
+use Dgtlss\Capsule\Support\Lock;
 use Dgtlss\Capsule\Support\ManifestBuilder;
 use Dgtlss\Capsule\Contracts\FileFilterInterface;
 use Dgtlss\Capsule\Contracts\StepInterface;
@@ -44,13 +47,16 @@ class BackupService
     protected array $currentFileIndex = [];
     protected string $backupType = 'full';
     protected ?int $baseSnapshotId = null;
+    protected ?array $baseArchive = null;
+    protected array $deletedFiles = [];
+    protected ?string $stagingDirectory = null;
 
     public function __construct(
         Application $app,
-        StorageManager $storageManager = null,
-        NotificationManager $notificationManager = null,
-        DatabaseDumper $databaseDumper = null,
-        ManifestBuilder $manifestBuilder = null,
+        ?StorageManager $storageManager = null,
+        ?NotificationManager $notificationManager = null,
+        ?DatabaseDumper $databaseDumper = null,
+        ?ManifestBuilder $manifestBuilder = null,
     ) {
         $this->app = $app;
         $this->storageManager = $storageManager ?? new StorageManager();
@@ -114,10 +120,38 @@ class BackupService
         }
     }
 
-    public function run(): bool
+    public function run(bool $force = false): bool
+    {
+        $this->lastError = null;
+        $this->lastRemotePath = null;
+        $this->lastFileSize = null;
+        $this->backupLogPersisted = false;
+        $this->manifestBuilder->reset();
+        $this->currentFileIndex = [];
+        $this->baseArchive = null;
+        $this->deletedFiles = [];
+        $this->backupType = 'full';
+        $this->baseSnapshotId = null;
+        $lock = null;
+        try {
+            if (!$force && !($lock = Lock::acquire('capsule:backup'))) {
+                throw new Exception('Another backup or cleanup operation is already running.');
+            }
+            return $this->runBackup();
+        } catch (\Throwable $e) {
+            $this->lastError = $e->getMessage();
+            Log::error('Backup failed: ' . $e->getMessage());
+            return false;
+        } finally {
+            if ($lock) {
+                $lock->release();
+            }
+        }
+    }
+
+    protected function runBackup(): bool
     {
         $this->applyPerformanceLimits();
-        $this->registerSignalHandlers();
         $this->validateConfiguration();
         
         // Preflight: ensure DB is reachable if DB backup is enabled
@@ -186,16 +220,16 @@ class BackupService
 
         try {
             $this->log('Creating backup archive...');
-            $localBackupPath = $this->createBackup();
+            $localBackupPath = $this->createBackup($context);
             $context->localArchivePath = $localBackupPath;
             
             $fileSize = filesize($localBackupPath);
             
-            // Verify backup integrity if requested
-            if ($this->verification) {
-                $this->log('🔍 Verifying backup integrity...');
-                $this->verifyBackup($localBackupPath);
-            }
+            // Never publish a ZIP whose payload differs from its manifest.
+            $this->verifyBackup($localBackupPath);
+            $passwordHash = $this->encryptionEnabled() ? EncryptionPasswordVerifier::create(
+                config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD'),
+            ) : null;
 
             $this->log("Uploading backup to storage (" . Helpers::formatBytes($fileSize) . ")...");
             $remotePath = $this->storageManager->store($localBackupPath);
@@ -208,6 +242,16 @@ class BackupService
             $backupLog->status = 'success';
             $backupLog->file_path = $remotePath;
             $backupLog->file_size = $fileSize;
+            $backupLog->metadata = [
+                'schema_version' => 2,
+                'storage' => ['disk' => config('capsule.default_disk', 'local'), 'backup_path' => config('capsule.backup_path', 'backups'), 'additional_disks' => (array) config('capsule.additional_disks', [])],
+                'policy' => config('capsule._policy_name'),
+                'retention' => (array) config('capsule.retention', []),
+                'archive_sha256' => hash_file('sha256', $localBackupPath),
+                'encryption_password_hash' => $passwordHash,
+                'backup_type' => $this->backupType,
+                'base_archive' => $this->baseArchive,
+            ];
             $this->lastFileSize = $fileSize;
             if ($this->backupLogPersisted) {
                 try {
@@ -232,7 +276,7 @@ class BackupService
                     try { $backupLog->save(); } catch (\Throwable $e) { }
                 }
 
-                if (config('capsule.files.enabled') && !empty($this->currentFileIndex)) {
+                if (config('capsule.files.enabled')) {
                     try {
                         $this->incrementalService->saveSnapshot($backupLog, $this->currentFileIndex, $this->backupType, $this->baseSnapshotId);
                     } catch (\Throwable $e) {
@@ -241,9 +285,10 @@ class BackupService
                 }
             }
 
-            if (config('capsule.default_disk') !== 'local') {
-                $this->log('🧹 Cleaning up local backup file...');
-                unlink($localBackupPath);
+            // StorageManager has verified the persisted object; staging is never the destination.
+            unlink($localBackupPath);
+            if ($this->stagingDirectory) {
+                @rmdir($this->stagingDirectory);
             }
 
             // Run retention cleanup only if DB available
@@ -270,7 +315,8 @@ class BackupService
             $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
 
             return true;
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
+            $this->lastError = $e->getMessage();
             $backupLog->completed_at = now();
             $backupLog->status = 'failed';
             $backupLog->error_message = $e->getMessage();
@@ -290,11 +336,13 @@ class BackupService
                 'details' => ['error' => $e->getMessage(), 'tag' => $this->tag],
             ]);
 
-            $this->notificationManager->sendFailureNotification($backupLog, $e);
-            event(new BackupFailed($context, $e));
-
-            // Execute post-steps (failure) – still run to allow cleanup steps
-            $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
+            try {
+                $this->notificationManager->sendFailureNotification($backupLog, $e instanceof Exception ? $e : new Exception($e->getMessage(), 0, $e));
+                event(new BackupFailed($context, $e));
+                $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
+            } catch (\Throwable $observerError) {
+                Log::warning('Backup failure observer also failed', ['exception' => $observerError]);
+            }
 
             return false;
         }
@@ -319,107 +367,76 @@ class BackupService
         return $failures;
     }
 
-    protected function createBackup(): string
+    protected function createBackup(BackupContext $context): string
     {
-        $timestamp = now()->format('Y-m-d_H-i-s');
-        $backupDir = storage_path('app/backups');
-        
-        if (!is_dir($backupDir)) {
-            $this->log('📁 Creating backup directory...');
-            mkdir($backupDir, 0755, true);
+        $runId = now()->format('Y-m-d_H-i-s') . '_' . bin2hex(random_bytes(16));
+        $this->stagingDirectory = sys_get_temp_dir() . '/capsule-' . bin2hex(random_bytes(16));
+        if (!mkdir($this->stagingDirectory, 0700, true)) {
+            throw new Exception('Cannot create a private backup staging directory.');
         }
-
-        $backupPath = $backupDir . "/backup_{$timestamp}.zip";
-        $this->log("📦 Creating ZIP archive: backup_{$timestamp}.zip");
+        $backupPath = $this->stagingDirectory . "/backup_{$runId}.zip";
         $zip = new ZipArchive();
-
-        if ($zip->open($backupPath, ZipArchive::CREATE) !== TRUE) {
-            throw new Exception("Cannot create backup archive: {$backupPath}");
+        if ($zip->open($backupPath, ZipArchive::CREATE | ZipArchive::EXCL) !== true) {
+            throw new Exception('Cannot create backup archive.');
         }
-
-        $tempFiles = [];
-
-        if (config('capsule.database.enabled')) {
-            $this->log('🗄️  Adding database to backup...');
-            event(new DatabaseDumpStarting(new BackupContext('normal')));
-            $tempFiles = array_merge($tempFiles, $this->addDatabaseToBackup($zip, $timestamp));
-            event(new DatabaseDumpCompleted(new BackupContext('normal')));
-        }
-
-        $this->backupType = 'full';
-        $this->baseSnapshotId = null;
-        $this->currentFileIndex = [];
-
-        if (config('capsule.files.enabled')) {
-            event(new FilesCollectStarting(new BackupContext('normal')));
-
-            if ($this->incremental) {
-                $baseSnapshot = $this->incrementalService->getLatestFullSnapshot();
+        $closed = false;
+        try {
+            if (config('capsule.database.enabled')) {
+                event(new DatabaseDumpStarting($context));
+                $this->addDatabaseToBackup($zip, $runId);
+                event(new DatabaseDumpCompleted($context));
+            }
+            if (config('capsule.files.enabled')) {
+                event(new FilesCollectStarting($context));
+                $this->currentFileIndex = $this->incrementalService->buildCurrentIndex(true, $context);
+                $baseSnapshot = $this->incremental ? $this->incrementalService->getLatestFullSnapshot($this->encryptionEnabled()) : null;
                 if ($baseSnapshot) {
-                    $this->log('Scanning files for changes (incremental)...');
-                    $this->currentFileIndex = $this->incrementalService->buildCurrentIndex();
                     $diff = $this->incrementalService->diff($this->currentFileIndex, $baseSnapshot);
-                    $changedFiles = $this->incrementalService->getChangedFiles($diff);
-
-                    $this->log("   Changed: " . count($diff['added']) . " added, " . count($diff['modified']) . " modified, " . count($diff['removed']) . " removed");
-                    $this->log("   Unchanged: " . $diff['unchanged_count'] . " files skipped");
-
-                    if (!empty($changedFiles)) {
-                        $this->addSpecificFilesToBackup($zip, $changedFiles);
-                    }
-
+                    $this->addSpecificFilesToBackup($zip, $this->incrementalService->getChangedFiles($diff));
                     $this->backupType = 'incremental';
                     $this->baseSnapshotId = $baseSnapshot->id;
+                    $base = $baseSnapshot->backupLog;
+                    $this->baseArchive = [
+                        'disk' => $base->metadata['storage']['disk'],
+                        'path' => $base->file_path,
+                        'sha256' => $base->metadata['archive_sha256'],
+                    ];
+                    $this->deletedFiles = array_keys($diff['removed']);
                 } else {
-                    $this->log('No base snapshot found, running full file backup...');
-                    $this->currentFileIndex = $this->incrementalService->buildCurrentIndex();
-                    $this->addFilesToBackup($zip);
+                    $this->addSpecificFilesToBackup($zip, array_keys($this->currentFileIndex));
                 }
-            } else {
-                $this->log('Adding files to backup...');
-                $this->currentFileIndex = $this->incrementalService->buildCurrentIndex();
-                $this->addFilesToBackup($zip);
+                event(new FilesCollectCompleted($context));
             }
-
-            event(new FilesCollectCompleted(new BackupContext('normal')));
-        }
-
-        $this->log('Writing manifest...');
-        $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
-        $manifest = $this->manifestBuilder->build(false, $this->compressionLevel, $encryptionEnabled);
-        $manifest['backup_type'] = $this->backupType;
-        if ($this->baseSnapshotId) {
-            $manifest['base_snapshot_id'] = $this->baseSnapshotId;
-        }
-        $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        $zip->addFromString('manifest.json', $manifestJson);
-        $this->applyCompressionAndEncryption($zip, 'manifest.json');
-
-        $this->log('🔄 Finalizing ZIP archive...');
-        event(new ArchiveFinalizing(new BackupContext('normal')));
-        
-        // Use a callback to show progress during closing
-        $startTime = microtime(true);
-        $result = $zip->close();
-        $closeTime = round(microtime(true) - $startTime, 2);
-        
-        if (!$result) {
-            throw new Exception("Failed to finalize ZIP archive. Error: " . $zip->getStatusString());
-        }
-        
-        $this->log("✅ ZIP archive finalized in {$closeTime} seconds");
-
-        // Clean up temporary files after ZIP is closed
-        if (!empty($tempFiles)) {
-            $this->log('🧹 Cleaning up temporary database files...');
-            foreach ($tempFiles as $tempFile) {
-                if (file_exists($tempFile)) {
-                    unlink($tempFile);
-                }
+            $manifest = $this->manifestBuilder->build(false, $this->compressionLevel, $this->encryptionEnabled());
+            $manifest['backup_type'] = $this->backupType;
+            $manifest['base_archive'] = $this->baseArchive;
+            $manifest['deleted_files'] = $this->deletedFiles;
+            if (!$zip->addFromString('manifest.json', ManifestBuilder::encode($manifest))) {
+                throw new Exception('Cannot add backup manifest.');
+            }
+            $this->applyCompressionAndEncryption($zip, 'manifest.json');
+            event(new ArchiveFinalizing($context));
+            $closed = $zip->close();
+            if (!$closed) {
+                throw new Exception('Failed to finalize ZIP archive.');
+            }
+            chmod($backupPath, 0600);
+            return $backupPath;
+        } catch (\Throwable $e) {
+            if (!$closed) {
+                @$zip->close();
+            }
+            @unlink($backupPath);
+            throw $e;
+        } finally {
+            // This private directory contains only this run's database snapshots.
+            foreach (glob($this->stagingDirectory . '/db_*') ?: [] as $temporary) {
+                @unlink($temporary);
+            }
+            if (!file_exists($backupPath)) {
+                @rmdir($this->stagingDirectory);
             }
         }
-
-        return $backupPath;
     }
 
     protected function addDatabaseToBackup(ZipArchive $zip, string $timestamp): array
@@ -441,18 +458,22 @@ class BackupService
 
         foreach ($connections as $connection) {
             $this->log("   Dumping database: {$connection}");
-            $dumpPath = storage_path("app/backups/db_{$connection}_{$timestamp}.sql");
+            $dumpPath = $this->stagingDirectory . '/db_' . hash('sha256', $connection) . '.sql';
             $this->databaseDumper->dump($connection, $dumpPath);
 
             $driver = config("database.connections.{$connection}.driver", 'unknown');
             DumpValidator::validate($dumpPath, $driver);
 
             $dumpSize = filesize($dumpPath);
-            $entryName = "database/{$connection}.sql";
+            $entryName = 'database/' . $connection . ($driver === 'sqlite' ? '.sqlite' : '.sql');
             $this->log("   Adding {$entryName} (" . Helpers::formatBytes($dumpSize) . ") to archive");
-            $zip->addFile($dumpPath, $entryName);
+            if (!$zip->addFile($dumpPath, $entryName)) {
+                throw new Exception("Cannot add database dump: {$connection}");
+            }
             $this->applyCompressionAndEncryption($zip, $entryName);
-            $this->manifestBuilder->addEntry($entryName, $dumpPath);
+            $this->manifestBuilder->addStreamEntry($entryName, $dumpSize, hash_file('sha256', $dumpPath), [
+                'connection' => $connection, 'driver' => $driver, 'format' => $driver === 'sqlite' ? 'sqlite' : 'sql',
+            ]);
             $this->metricsCollector->addDatabaseDump($dumpSize);
             $tempFiles[] = $dumpPath;
         }
@@ -462,155 +483,61 @@ class BackupService
 
     protected function addDatabasesParallel(ZipArchive $zip, array $connections, string $timestamp): array
     {
-        $this->log("   Using parallel processing for database dumps");
-        $tempFiles = [];
         $processes = [];
-
-        foreach ($connections as $connection) {
-            $this->log("   Starting parallel dump: {$connection}");
-            $dumpPath = storage_path("app/backups/db_{$connection}_{$timestamp}.sql");
-            $tempFiles[] = $dumpPath;
-
-            $process = $this->databaseDumper->startDumpProcess($connection, $dumpPath);
-            $processes[$connection] = ['process' => $process, 'path' => $dumpPath];
-        }
-
-        foreach ($processes as $connectionName => $processInfo) {
-            if ($processInfo['process'] === null) {
-                continue; // SQLite -- already done synchronously
-            }
-
-            $this->log("   Waiting for {$connectionName} dump to complete...");
-            $returnCode = proc_close($processInfo['process']);
-
-            if ($returnCode !== 0) {
-                throw new Exception("Parallel database dump failed for connection: {$connectionName}");
-            }
-
-            $dumpSize = filesize($processInfo['path']);
-            $entryName = "database/{$connectionName}.sql";
-            $this->log("   Adding {$entryName} (" . Helpers::formatBytes($dumpSize) . ") to archive");
-            $zip->addFile($processInfo['path'], $entryName);
-            $this->applyCompressionAndEncryption($zip, $entryName);
-            $this->manifestBuilder->addEntry($entryName, $processInfo['path']);
-        }
-
-        return $tempFiles;
-    }
-
-    protected function addSpecificFilesToBackup(ZipArchive $zip, array $absolutePaths): void
-    {
-        $basePaths = config('capsule.files.paths', []);
-
-        foreach ($absolutePaths as $filePath) {
-            if (!is_file($filePath)) {
-                continue;
-            }
-
-            $relativePath = $filePath;
-            foreach ($basePaths as $basePath) {
-                $normalizedBase = rtrim($basePath, '/');
-                if (strpos($filePath, $normalizedBase . '/') === 0) {
-                    $relativePath = 'files/' . substr($filePath, strlen($normalizedBase) + 1);
-                    break;
+        $tempFiles = [];
+        try {
+            foreach ($connections as $connection) {
+                $dumpPath = $this->stagingDirectory . '/db_' . hash('sha256', $connection) . '.sql';
+                $tempFiles[] = $dumpPath;
+                $process = $this->databaseDumper->startDumpProcess($connection, $dumpPath);
+                if ($process !== null && !is_resource($process)) {
+                    throw new Exception("Cannot start database dump: {$connection}");
                 }
+                $processes[$connection] = ['process' => $process, 'path' => $dumpPath];
             }
-
-            if ($relativePath === $filePath) {
-                $relativePath = 'files/' . basename($filePath);
-            }
-
-            $fileSize = (int) filesize($filePath);
-            $zip->addFile($filePath, $relativePath);
-            $this->applyCompressionAndEncryption($zip, $relativePath);
-            $this->manifestBuilder->addEntry($relativePath, $filePath);
-            $this->metricsCollector->addFile($filePath, $fileSize);
-        }
-
-        $this->log("   Added " . count($absolutePaths) . " changed file(s) to incremental backup");
-    }
-
-    protected function addFilesToBackup(ZipArchive $zip): void
-    {
-        $paths = config('capsule.files.paths', []);
-        $excludePaths = config('capsule.files.exclude_paths', []);
-        $filters = $this->resolveFileFilters();
-
-        $this->log("   📁 Processing " . count($paths) . " file path(s)...");
-        $this->log("   🚫 Excluding " . count($excludePaths) . " path(s)...");
-
-        foreach ($paths as $path) {
-            if (is_dir($path)) {
-                $this->log("   📂 Scanning directory: " . basename($path));
-                $this->addDirectoryToZip($zip, $path, $excludePaths, 'files/', $filters);
-            } elseif (is_file($path)) {
-                $fileSize = filesize($path);
-                $relative = 'files/' . basename($path);
-                if (!$this->passesFilters($path, $filters)) {
-                    continue;
+            foreach ($processes as $connection => &$info) {
+                if (is_resource($info['process'])) {
+                    $code = proc_close($info['process']);
+                    $info['process'] = null;
+                    if ($code !== 0) {
+                        throw new Exception("Parallel database dump failed: {$connection} (exit {$code})");
+                    }
                 }
-                $this->log("   Adding file: " . basename($path) . " (" . Helpers::formatBytes($fileSize) . ")");
-                $zip->addFile($path, $relative);
-                $this->applyCompressionAndEncryption($zip, $relative);
-                $this->manifestBuilder->addEntry($relative, $path);
-                $this->metricsCollector->addFile($path, $fileSize);
+                DumpValidator::validate($info['path'], config("database.connections.{$connection}.driver", 'unknown'));
+                $driver = config("database.connections.{$connection}.driver", 'unknown');
+                $entry = 'database/' . $connection . ($driver === 'sqlite' ? '.sqlite' : '.sql');
+                if (!$zip->addFile($info['path'], $entry)) {
+                    throw new Exception("Cannot add database dump: {$connection}");
+                }
+                $this->applyCompressionAndEncryption($zip, $entry);
+                $this->manifestBuilder->addStreamEntry($entry, filesize($info['path']), hash_file('sha256', $info['path']), [
+                    'connection' => $connection, 'driver' => $driver, 'format' => $driver === 'sqlite' ? 'sqlite' : 'sql',
+                ]);
+                $this->metricsCollector->addDatabaseDump(filesize($info['path']));
+            }
+            unset($info);
+            return $tempFiles;
+        } finally {
+            unset($info);
+            foreach ($processes as $info) {
+                if (is_resource($info['process'])) {
+                    proc_close($info['process']);
+                }
             }
         }
     }
 
-    protected function addDirectoryToZip(ZipArchive $zip, string $dir, array $excludePaths, string $zipPath = 'files/', array $filters = []): void
+    protected function addSpecificFilesToBackup(ZipArchive $zip, array $archivePaths): void
     {
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::SELF_FIRST
-        );
-
-        $fileCount = 0;
-        $totalSize = 0;
-        
-        foreach ($iterator as $file) {
-            $filePath = $file->getRealPath();
-            
-            // Skip files where getRealPath() fails (broken symlinks, etc.)
-            if ($filePath === false || empty($filePath)) {
-                continue;
+        foreach ($archivePaths as $archivePath) {
+            $entry = $this->currentFileIndex[$archivePath];
+            $source = $entry['source'];
+            if (!is_file($source) || !$zip->addFile($source, $archivePath)) {
+                throw new Exception("Cannot add backup file: {$source}");
             }
-            
-            if ($this->shouldExcludePath($filePath, $excludePaths)) {
-                continue;
-            }
-            if ($file->isFile() && !$this->passesFilters($filePath, $filters)) {
-                continue;
-            }
-
-            // Calculate relative path correctly
-            $normalizedDir = rtrim($dir, '/');
-            $relativeFile = substr($filePath, strlen($normalizedDir) + 1);
-            $relativePath = $zipPath . $relativeFile;
-
-            if ($file->isDir()) {
-                $zip->addEmptyDir($relativePath);
-                $this->metricsCollector->addDirectory();
-            } else {
-                // Add file with immediate compression to reduce memory usage
-                $zip->addFile($filePath, $relativePath);
-                $this->applyCompressionAndEncryption($zip, $relativePath);
-                $this->manifestBuilder->addEntry($relativePath, $filePath);
-
-                $fileSize = $file->getSize();
-                $totalSize += $fileSize;
-                $fileCount++;
-                $this->metricsCollector->addFile($filePath, $fileSize);
-                
-                // Show progress every 100 files to avoid spam
-                if ($fileCount % 100 === 0) {
-                    $this->log("   Added {$fileCount} files (" . Helpers::formatBytes($totalSize) . ")...");
-                }
-            }
-        }
-        
-        if ($fileCount > 0) {
-            $this->log("   Completed: {$fileCount} files (" . Helpers::formatBytes($totalSize) . ") from " . basename($dir));
+            $this->applyCompressionAndEncryption($zip, $archivePath);
+            $this->manifestBuilder->addStreamEntry($archivePath, $entry['size'], $entry['hash']);
+            $this->metricsCollector->addFile($source, $entry['size']);
         }
     }
 
@@ -658,30 +585,24 @@ class BackupService
         }
     }
 
+    protected function encryptionEnabled(): bool
+    {
+        return $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
+    }
+
     protected function applyCompressionAndEncryption(ZipArchive $zip, string $entryName): void
     {
-        // Compression per-entry
-        if (method_exists($zip, 'setCompressionName')) {
-            // CM_DEFLATE with specified level
-            @$zip->setCompressionName($entryName, ZipArchive::CM_DEFLATE, $this->compressionLevel);
+        if (!$zip->setCompressionName($entryName, ZipArchive::CM_DEFLATE, $this->compressionLevel)) {
+            throw new Exception("Cannot compress archive entry: {$entryName}");
         }
-
-        // Encryption per-entry if enabled
-        $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
-        if ($encryptionEnabled) {
+        if ($this->encryptionEnabled()) {
             $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-            if (!empty($password)) {
-                // Set archive password once
-                @$zip->setPassword($password);
-                // Encrypt this entry
-                if (method_exists($zip, 'setEncryptionName')) {
-                    // Suppress warnings if not supported by libzip
-                    @$zip->setEncryptionName($entryName, ZipArchive::EM_AES_256);
-                }
+            if (!is_string($password) || $password === '' || str_contains($password, "\0") || !$zip->setPassword($password) ||
+                !$zip->setEncryptionName($entryName, ZipArchive::EM_AES_256)) {
+                throw new Exception("Cannot encrypt archive entry: {$entryName}");
             }
         }
     }
-
 
     protected function shouldExcludePath(string $path, array $excludePaths): bool
     {
@@ -714,35 +635,29 @@ class BackupService
 
     protected function cleanup(): void
     {
-        if (!config('capsule.retention.cleanup_enabled', true)) {
-            return;
+        if (config('capsule.retention.cleanup_enabled', true)) {
+            $result = (new RetentionService())->cleanup(['scope' => RetentionService::currentScope()]);
+            foreach ($result['errors'] ?? [] as $error) {
+                Log::warning('Retention cleanup failed', ['error' => $error]);
+            }
         }
-
-        $retentionDays = config('capsule.retention.days', 30);
-        $retentionCount = config('capsule.retention.count', 10);
-
-        $keepIds = BackupLog::where('status', 'success')
-            ->orderBy('created_at', 'desc')
-            ->limit($retentionCount)
-            ->pluck('id')
-            ->toArray();
-
-        BackupLog::where('status', 'success')
-            ->where('created_at', '<', now()->subDays($retentionDays))
-            ->when(!empty($keepIds), function ($q) use ($keepIds) {
-                $q->whereNotIn('id', $keepIds);
-            })
-            ->eachById(function (BackupLog $backup) {
-                if ($backup->file_path) {
-                    $fileName = basename($backup->file_path);
-                    $this->storageManager->delete($fileName);
-                }
-                $backup->delete();
-            });
     }
 
     protected function validateConfiguration(): void
     {
+        if ($this->encryptionEnabled()) {
+            $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
+            if (!is_string($password) || $password === '') {
+                throw new Exception('Backup encryption requires a non-empty password.');
+            }
+            if (str_contains($password, "\0")) {
+                throw new Exception('Backup encryption passwords cannot contain NUL bytes.');
+            }
+            if (!method_exists(ZipArchive::class, 'setEncryptionName') || !defined('ZipArchive::EM_AES_256') ||
+                (method_exists(ZipArchive::class, 'isEncryptionMethodSupported') && !ZipArchive::isEncryptionMethodSupported(ZipArchive::EM_AES_256, true))) {
+                throw new Exception('AES-256 ZIP encryption is not supported by this PHP/libzip installation.');
+            }
+        }
         // Check if database or files backup is enabled
         $dbEnabled = config('capsule.database.enabled', true);
         $filesEnabled = config('capsule.files.enabled', true);
@@ -828,34 +743,33 @@ class BackupService
 
     protected function verifyBackup(string $backupPath): void
     {
-        $startTime = microtime(true);
-        
-        // Check if file exists and is readable
-        if (!file_exists($backupPath) || !is_readable($backupPath)) {
-            throw new Exception("Backup file verification failed: file not found or not readable");
-        }
-
-        // Verify ZIP archive integrity
         $zip = new ZipArchive();
-        $result = $zip->open($backupPath, ZipArchive::CHECKCONS);
-        
-        if ($result !== TRUE) {
-            $errorMessage = match($result) {
-                ZipArchive::ER_NOZIP => 'Not a valid ZIP archive',
-                ZipArchive::ER_INCONS => 'ZIP archive is inconsistent',
-                ZipArchive::ER_CRC => 'CRC error in ZIP archive',
-                ZipArchive::ER_MEMORY => 'Memory allocation failure',
-                ZipArchive::ER_READ => 'Read error',
-                default => "ZIP verification failed with code: {$result}"
-            };
-            throw new Exception("Backup verification failed: {$errorMessage}");
+        if ($zip->open($backupPath, ZipArchive::CHECKCONS) !== true) {
+            throw new Exception('Backup ZIP integrity check failed.');
         }
-
-        $numFiles = $zip->numFiles;
-        $zip->close();
-
-        $verifyTime = round(microtime(true) - $startTime, 2);
-        $this->log("   Backup verified: {$numFiles} files, integrity check passed ({$verifyTime}s)");
+        try {
+            if ($this->encryptionEnabled()) {
+                $zip->setPassword(config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD'));
+            }
+            $manifest = json_decode($zip->getFromName('manifest.json') ?: '', true, 512, JSON_THROW_ON_ERROR);
+            foreach ($manifest['entries'] as $entry) {
+                $stream = $zip->getStream($entry['path']);
+                if ($stream === false) {
+                    throw new Exception("Cannot read archived entry: {$entry['path']}");
+                }
+                try {
+                    $hash = hash_init('sha256');
+                    $size = hash_update_stream($hash, $stream);
+                    if ($size !== $entry['size'] || !hash_equals($entry['sha256'], hash_final($hash))) {
+                        throw new Exception("Backup file changed during capture: {$entry['path']}");
+                    }
+                } finally {
+                    fclose($stream);
+                }
+            }
+        } finally {
+            $zip->close();
+        }
     }
 
     protected function registerSignalHandlers(): void

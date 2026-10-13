@@ -132,7 +132,6 @@ return [
             base_path('.gitignore'),
             base_path('storage/app/backups'),
             storage_path('app/backups'),
-            storage_path('app/private'),
             storage_path('logs'),
             storage_path('framework/cache'),
             storage_path('framework/sessions'),
@@ -178,12 +177,12 @@ return [
         // Delete backups older than this many days (can be overridden via CAPSULE_RETENTION_DAYS env var)
         'days' => env('CAPSULE_RETENTION_DAYS', 30),
 
-        // Maximum number of successful backups to keep (newest are preserved)
+        // Protect this many newest successes from age-based pruning (not a hard maximum)
         'count' => 10,
 
         // Optional: total storage budget for backups on the target disk (in MB)
         // When exceeded, oldest backups will be pruned until within budget, while
-        // still respecting the 'count' minimum to keep.
+        // still respecting min_keep and every retained incremental backup's base.
         'max_storage_mb' => env('CAPSULE_RETENTION_MAX_STORAGE_MB', null),
 
         // Minimum number of backups to always keep, even when over budget
@@ -211,8 +210,6 @@ return [
         // Prefix for temporary chunk files
         'temp_prefix' => 'capsule_chunk_',
 
-        // Maximum number of concurrent chunk uploads (improves upload speed)
-        'max_concurrent_uploads' => 3,
     ],
 
     /*
@@ -351,15 +348,21 @@ return [
     |
     */
 
+    // Reader budget only. Raise explicitly for trusted historical manifests on a
+    // recovery host with enough RAM; decoded JSON can need several times this size.
+    'restore' => [
+        'max_manifest_bytes' => 16 * 1024 * 1024,
+    ],
+
     'security' => [
-        // Enable backup encryption (requires CAPSULE_BACKUP_PASSWORD)
+        // Enable backup encryption (requires CAPSULE_BACKUP_PASSWORD).
+        // With --no-local this writes .capsule.enc: Capsule is REQUIRED to decrypt.
+        // Regular encrypted backups remain native AES ZIPs staged on local disk.
         'encrypt_backups' => env('CAPSULE_ENCRYPT_BACKUPS', false),
 
         // Backup encryption password
         'backup_password' => env('CAPSULE_BACKUP_PASSWORD'),
 
-        // Encryption algorithm for backups (AES-256 recommended)
-        'encryption_method' => 'AES-256-CBC',
 
         // Enable integrity verification of backup files
         'verify_integrity' => env('CAPSULE_VERIFY_INTEGRITY', true),
@@ -505,27 +508,6 @@ return [
     | the action, what was backed up/restored, and the result.
     |
     */
-
-    /*
-    |--------------------------------------------------------------------------
-    | S3 Lifecycle Management
-    |--------------------------------------------------------------------------
-    |
-    | Capsule can tag S3 objects and transition older backups to cheaper
-    | storage classes. This complements native S3 lifecycle policies.
-    |
-    */
-
-    's3_lifecycle' => [
-        'tagging_enabled' => false,
-        'transition_enabled' => false,
-        'default_storage_class' => null,
-
-        'transitions' => [
-            // ['after_days' => 30, 'storage_class' => 'STANDARD_IA'],
-            // ['after_days' => 90, 'storage_class' => 'GLACIER'],
-        ],
-    ],
 
     'audit' => [
         'enabled' => env('CAPSULE_AUDIT_ENABLED', true),

@@ -9,14 +9,17 @@ use Dgtlss\Capsule\Events\{BackupStarting, DatabaseDumpStarting, DatabaseDumpCom
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
+use Dgtlss\Capsule\Security\EncryptedChunkCodec;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 use Dgtlss\Capsule\Support\BackupContext;
-use Dgtlss\Capsule\Support\Helpers;
+use Dgtlss\Capsule\Support\FileSelection;
+use Dgtlss\Capsule\Support\Lock;
+use Dgtlss\Capsule\Database\DumpValidator;
 use Dgtlss\Capsule\Support\ManifestBuilder;
 use Dgtlss\Capsule\Support\MemoryMonitor;
 use Illuminate\Foundation\Application;
 use Illuminate\Support\Facades\Log;
 use Exception;
-use ZipArchive;
 
 class ChunkedBackupService
 {
@@ -32,24 +35,27 @@ class ChunkedBackupService
     protected bool $parallel = false;
     protected int $compressionLevel = 1;
     protected bool $encryption = false;
+    protected ?EncryptedChunkCodec $chunkCodec = null;
+    protected ?string $runPassword = null;
     protected bool $verification = false;
     protected ?string $lastError = null;
+    protected ?array $lastArchiveMetadata = null;
     protected ?string $tag = null;
     protected $outputCallback = null;
 
     public function __construct(
         Application $app,
-        StorageManager $storageManager = null,
-        NotificationManager $notificationManager = null,
-        DatabaseDumper $databaseDumper = null,
-        ManifestBuilder $manifestBuilder = null,
+        ?StorageManager $storageManager = null,
+        ?NotificationManager $notificationManager = null,
+        ?DatabaseDumper $databaseDumper = null,
+        ?ManifestBuilder $manifestBuilder = null,
     ) {
         $this->app = $app;
         $this->storageManager = $storageManager ?? new StorageManager();
         $this->notificationManager = $notificationManager ?? new NotificationManager();
         $this->databaseDumper = $databaseDumper ?? new DatabaseDumper();
         $this->manifestBuilder = $manifestBuilder ?? new ManifestBuilder();
-        $this->backupId = uniqid('backup_', true);
+        $this->backupId = bin2hex(random_bytes(16));
         $this->compressionLevel = (int) config('capsule.backup.compression_level', 1);
     }
 
@@ -88,6 +94,17 @@ class ChunkedBackupService
         $this->outputCallback = $callback;
     }
 
+    public function __debugInfo(): array
+    {
+        return ['backup_id' => $this->backupId, 'chunks_count' => count($this->chunkMetadata),
+            'encryption_active' => $this->runPassword !== null];
+    }
+
+    public function getLastArchiveMetadata(): ?array
+    {
+        return $this->lastArchiveMetadata;
+    }
+
     public function getLastError(): ?string
     {
         return $this->lastError;
@@ -100,117 +117,136 @@ class ChunkedBackupService
         }
     }
 
-    public function run(): bool
+    public function run(bool $force = false): bool
     {
-        MemoryMonitor::checkpoint('backup_start');
-        MemoryMonitor::logMemoryUsage('Backup started');
-
-        $this->log('Validating configuration...');
-        $this->validateConfiguration();
-
-        if (config('capsule.database.enabled', true)) {
-            $failedConnections = $this->probeDatabaseConnections();
-            if (!empty($failedConnections)) {
-                $reason = 'Database unreachable for connection(s): ' . implode(', ', array_map(fn($f) => $f['connection'], $failedConnections));
-                $this->lastError = $reason;
-                $this->log($reason);
-
-                $pseudoLog = new BackupLog([
-                    'started_at' => now(),
-                    'completed_at' => now(),
-                    'status' => 'failed',
-                    'error_message' => $reason,
-                    'metadata' => ['failure_stage' => 'preflight', 'failed_connections' => $failedConnections],
-                ]);
-
-                $this->notificationManager->sendFailureNotification($pseudoLog, new Exception($reason));
-                return false;
+        $this->lastError = null;
+        $this->lastArchiveMetadata = null;
+        $lock = null;
+        try {
+            if (!$force) {
+                $lock = Lock::acquire('capsule:backup');
+                if (!$lock) {
+                    $this->lastError = 'Another backup is currently running.';
+                    return false;
+                }
+            }
+            return $this->runBackup();
+        } catch (\Throwable $e) {
+            $this->lastError ??= $e->getMessage();
+            Log::error('Chunked backup failed: ' . $e->getMessage(), ['exception' => $e]);
+            return false;
+        } finally {
+            $this->storageManager->setChunkCodec(null);
+            $this->chunkCodec?->close();
+            $this->chunkCodec = null;
+            if ($this->runPassword !== null && function_exists('sodium_memzero')) {
+                sodium_memzero($this->runPassword);
+            }
+            $this->runPassword = null;
+            if ($lock) {
+                try { $lock->release(); } catch (\Throwable $e) { Log::warning('Could not release backup lock.', ['exception' => $e]); }
             }
         }
+    }
 
+    protected function runBackup(): bool
+    {
+        $this->chunks = [];
+        $this->chunkMetadata = [];
+        $this->backupId = bin2hex(random_bytes(16));
+        $this->manifestBuilder->reset();
+        MemoryMonitor::checkpoint('backup_start');
         $context = new BackupContext('chunked');
         $context->verbose = $this->verbose;
         $context->compressionLevel = $this->compressionLevel;
         $context->encryption = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
         $context->verification = $this->verification;
-        event(new BackupStarting($context));
-
-        $this->executeSteps((array) config('capsule.extensibility.pre_steps', []), $context, 'pre');
-
-        $backupLogPersisted = false;
+        $metadata = [
+            'backup_id' => $this->backupId, 'chunked' => true,
+            'storage' => ['disk' => config('capsule.default_disk'), 'backup_path' => config('capsule.backup_path'),
+                'additional_disks' => (array) config('capsule.additional_disks', [])],
+            'policy' => config('capsule._policy_name'),
+            'retention' => (array) config('capsule.retention', []),
+        ];
+        $backupLog = new BackupLog(['started_at' => now(), 'status' => 'running', 'tag' => $this->tag, 'metadata' => $metadata]);
+        $persisted = false;
         try {
-            $backupLog = BackupLog::create([
-                'started_at' => now(),
-                'status' => 'running',
-                'tag' => $this->tag,
-                'metadata' => ['backup_id' => $this->backupId, 'chunked' => true],
-            ]);
-            $backupLogPersisted = true;
-        } catch (\Throwable $e) {
-            Log::warning('BackupLog could not be persisted; continuing without DB logging', ['exception' => $e]);
-            $backupLog = new BackupLog([
-                'started_at' => now(),
-                'status' => 'running',
-                'metadata' => ['backup_id' => $this->backupId, 'chunked' => true],
-            ]);
-        }
-
-        try {
-            MemoryMonitor::checkpoint('before_backup');
-            $this->createChunkedBackup();
-            MemoryMonitor::checkpoint('after_backup');
-
-            $this->log('Collating chunks into final backup...');
-            MemoryMonitor::checkpoint('before_collation');
+            // Validate encryption before creating any remote chunk or exposing plaintext.
+            $this->validateConfiguration();
+            if ($context->encryption) {
+                $this->runPassword = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
+                $this->chunkCodec = new EncryptedChunkCodec($this->runPassword);
+                $this->storageManager->setChunkCodec($this->chunkCodec);
+                $metadata['chunk_encryption'] = $this->chunkCodec->metadata();
+                $metadata['archive_encryption'] = EncryptedArchive::FORMAT;
+                $metadata['archive_format'] = EncryptedArchive::FORMAT;
+                $metadata['requires_capsule'] = true;
+                $metadata['recovery_instruction'] = 'Capsule and the backup password are required to decrypt this .capsule.enc backup.';
+                $backupLog->metadata = $metadata;
+            }
+            if (config('capsule.database.enabled', true)) {
+                $failed = $this->probeDatabaseConnections();
+                if ($failed !== []) {
+                    throw new Exception('Database unreachable for connection(s): ' . implode(', ', array_column($failed, 'connection')));
+                }
+            }
+            try {
+                $backupLog->save();
+                $persisted = true;
+            } catch (\Throwable $e) {
+                Log::warning('BackupLog could not be persisted; continuing without DB logging', ['exception' => $e]);
+            }
+            event(new BackupStarting($context));
+            $this->executeSteps((array) config('capsule.extensibility.pre_steps', []), $context, 'pre');
+            $this->createChunkedBackup($context);
             event(new ArchiveFinalizing($context));
-            $finalBackupPath = $this->collateChunks();
-            MemoryMonitor::checkpoint('after_collation');
-
-            $context->remotePath = $finalBackupPath;
-            event(new BackupUploaded($context, $finalBackupPath));
-
-            $this->log('Updating backup log...');
-            $memoryStats = MemoryMonitor::compareCheckpoints('backup_start', 'after_collation');
-
+            $finalPath = $this->collateChunks();
+            $this->lastArchiveMetadata = ['path' => $finalPath,
+                'archive_format' => $this->runPassword !== null ? EncryptedArchive::FORMAT : 'zip',
+                'requires_capsule' => $this->runPassword !== null,
+                'recovery_instruction' => $this->runPassword !== null ? 'Capsule and the backup password are required to decrypt this .capsule.enc backup.' : null];
+            $context->remotePath = $finalPath;
+            event(new BackupUploaded($context, $finalPath));
             $backupLog->completed_at = now();
             $backupLog->status = 'success';
-            $backupLog->file_path = $finalBackupPath;
-            $backupLog->file_size = $this->getRemoteFileSize($finalBackupPath);
-            $backupLog->metadata = array_merge($backupLog->metadata ?? [], [
+            $backupLog->file_path = $finalPath;
+            $backupLog->file_size = $this->getRemoteFileSize($finalPath);
+            $backupLog->metadata = array_merge($metadata, [
                 'chunks_count' => count($this->chunkMetadata),
-                'chunked_method' => 'direct_streaming',
-                'memory_stats' => $memoryStats['formatted'] ?? null,
+                'chunked_method' => 'bounded_zip64_stream',
+                'verification' => 'sha256_readback',
+                'archive_sha256' => $this->storageManager->getLastArchiveFingerprint()['sha256'] ?? null,
             ]);
-
-            if ($backupLogPersisted) {
+            if ($persisted) {
                 try { $backupLog->save(); } catch (\Throwable $e) { Log::warning('Failed to persist success BackupLog update', ['exception' => $e]); }
             }
-
-            $this->log('Cleaning up remote chunks...');
             $this->cleanup();
             $this->notificationManager->sendSuccessNotification($backupLog);
             event(new BackupSucceeded($context));
             $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
-
             return true;
-        } catch (Exception $e) {
+        } catch (\Throwable $e) {
             $this->lastError = $e->getMessage();
-
             $backupLog->completed_at = now();
             $backupLog->status = 'failed';
             $backupLog->error_message = $e->getMessage();
-            $backupLog->metadata = array_merge($backupLog->metadata ?? [], ['chunks_attempted' => count($this->chunkMetadata)]);
-
-            if ($backupLogPersisted) {
-                try { $backupLog->save(); } catch (\Throwable $ex) { Log::warning('Failed to persist failed BackupLog update', ['exception' => $ex]); }
+            // Retain uploaded source chunks when final storage or validation fails.
+            $backupLog->metadata = array_merge($metadata, ['recovery_chunks' => $this->chunkMetadata]);
+            if ($persisted) {
+                try { $backupLog->save(); } catch (\Throwable $ignored) { }
             }
-
             Log::error('Chunked backup failed: ' . $e->getMessage(), ['exception' => $e, 'backup_id' => $this->backupId]);
-            $this->cleanupChunks();
-            $this->notificationManager->sendFailureNotification($backupLog, $e);
-            event(new BackupFailed($context, $e));
-            $this->executeSteps((array) config('capsule.extensibility.post_steps', []), $context, 'post');
-
+            $exception = $e instanceof Exception ? $e : new Exception($e->getMessage(), 0, $e);
+            try {
+                $this->notificationManager->sendFailureNotification($backupLog, $exception);
+            } catch (\Throwable $secondary) {
+                Log::warning('Failed to send backup failure notification.', ['exception' => $secondary]);
+            }
+            try {
+                event(new BackupFailed($context, $e));
+            } catch (\Throwable $secondary) {
+                Log::warning('Backup failure listener threw.', ['exception' => $secondary]);
+            }
             return false;
         }
     }
@@ -233,6 +269,16 @@ class ChunkedBackupService
 
     protected function validateConfiguration(): void
     {
+        if ($this->encryption || (bool) config('capsule.security.encrypt_backups', false)) {
+            EncryptedArchive::validatePassword(config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD') ?? '');
+            if (!extension_loaded('sodium')) {
+                throw new Exception('Encrypted streaming backups require the sodium extension.');
+            }
+        }
+        $chunkSize = (int) config('capsule.chunked_backup.chunk_size', 10485760);
+        if ($chunkSize < 1 || $chunkSize > 67108864) {
+            throw new Exception('Streaming chunk_size must be between 1 and 67108864 bytes.');
+        }
         $dbEnabled = config('capsule.database.enabled', true);
         $filesEnabled = config('capsule.files.enabled', true);
 
@@ -265,10 +311,9 @@ class ChunkedBackupService
         }
     }
 
-    protected function createChunkedBackup(): void
+    protected function createChunkedBackup(BackupContext $context): void
     {
         $timestamp = now()->format('Y-m-d_H-i-s');
-        $context = new BackupContext('chunked');
 
         if (config('capsule.database.enabled')) {
             $this->log('Creating chunked database backup...');
@@ -280,7 +325,7 @@ class ChunkedBackupService
         if (config('capsule.files.enabled')) {
             $this->log('Creating chunked file backup...');
             event(new FilesCollectStarting($context));
-            $this->createChunkedFileBackup($timestamp);
+            $this->createChunkedFileBackup($timestamp, $context);
             event(new FilesCollectCompleted($context));
         }
     }
@@ -297,79 +342,151 @@ class ChunkedBackupService
 
     protected function streamDatabaseToChunks(string $connection, string $timestamp): void
     {
-        $chunkSize = config('capsule.chunked_backup.chunk_size', 10485760);
-        $tempPrefix = config('capsule.chunked_backup.temp_prefix', 'capsule_chunk_');
-
+        $chunkSize = (int) config('capsule.chunked_backup.chunk_size', 10485760);
+        $driver = (string) config("database.connections.{$connection}.driver");
+        $entryName = 'database/' . $connection . ($driver === 'sqlite' ? '.sqlite' : '.sql');
+        $baseName = 'db_' . bin2hex(random_bytes(8));
         $streamInfo = $this->databaseDumper->buildStreamCommand($connection);
-
         try {
-            $this->streamCommandToChunks($streamInfo['command'], "db_{$connection}_{$timestamp}", $chunkSize, $tempPrefix);
+            $start = count($this->chunkMetadata);
+            $result = $this->streamCommandToChunks($streamInfo['command'], $baseName, $chunkSize, 'capsule_chunk_');
+            DumpValidator::validateContent($result['header'], $result['tail'], $result['size'], $driver);
+            for ($i = $start; $i < count($this->chunkMetadata); $i++) {
+                $this->chunkMetadata[$i]['entry_name'] = $entryName;
+            }
+            $this->manifestBuilder->addStreamEntry($entryName, $result['size'], $result['sha256'], [
+                'connection' => $connection, 'driver' => $driver, 'format' => $driver === 'sqlite' ? 'sqlite' : 'sql',
+            ]);
         } finally {
-            if (!empty($streamInfo['cleanup']) && file_exists($streamInfo['cleanup'])) {
+            if (!empty($streamInfo['cleanup'])) {
                 @unlink($streamInfo['cleanup']);
             }
         }
     }
 
-    protected function streamCommandToChunks(string $command, string $baseName, int $chunkSize, string $tempPrefix): void
+    protected function streamCommandToChunks(string $command, string $baseName, int $chunkSize, string $tempPrefix): array
     {
-        $process = popen($command, 'r');
-        if (!$process) {
-            throw new Exception("Failed to execute command: {$command}");
+        $process = proc_open($command, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+        if (!is_resource($process)) {
+            throw new Exception('Failed to start database dump process.');
         }
-
-        $chunkIndex = 0;
-        $currentChunkSize = 0;
-        $chunkBuffer = '';
-
-        while (!feof($process)) {
-            $data = fread($process, 8192); // Read in 8KB blocks
-            if ($data === false) break;
-
-            $chunkBuffer .= $data;
-            $currentChunkSize += strlen($data);
-
-            if ($currentChunkSize >= $chunkSize) {
-                $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-                $chunkBuffer = '';
-                $currentChunkSize = 0;
-                $chunkIndex++;
-                
-                // Force garbage collection every 10 chunks
-                if ($chunkIndex % 10 === 0) {
-                    gc_collect_cycles();
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+        $buffer = '';
+        $index = 0;
+        $size = 0;
+        $header = '';
+        $tail = '';
+        $stderr = '';
+        $hash = hash_init('sha256');
+        try {
+            while (!feof($pipes[1]) || !feof($pipes[2])) {
+                $read = array_filter([$pipes[1], $pipes[2]], fn ($pipe) => !feof($pipe));
+                $write = $except = null;
+                if (stream_select($read, $write, $except, 1) === false) {
+                    throw new Exception('Failed to read database dump process.');
+                }
+                foreach ($read as $pipe) {
+                    $data = fread($pipe, 65536);
+                    if ($data === false) {
+                        throw new Exception('Failed to read database dump output.');
+                    }
+                    if ($pipe === $pipes[2]) {
+                        $stderr = substr($stderr . $data, -8192);
+                        continue;
+                    }
+                    $size += strlen($data);
+                    hash_update($hash, $data);
+                    $header = substr($header . $data, 0, 4096);
+                    $tail = substr($tail . $data, -4096);
+                    $this->appendChunkData($data, $buffer, $baseName, $index, $chunkSize, $tempPrefix);
                 }
             }
+            fclose($pipes[1]);
+            fclose($pipes[2]);
+            $exit = proc_close($process);
+            $process = null;
+            if ($exit !== 0) {
+                throw new Exception('Database dump failed with exit code ' . $exit . ($stderr !== '' ? ': ' . trim($stderr) : '.'));
+            }
+            if ($buffer !== '') {
+                $this->uploadChunkDirectly($buffer, $baseName, $index, $tempPrefix);
+            }
+            return ['size' => $size, 'sha256' => hash_final($hash), 'header' => $header, 'tail' => $tail];
+        } finally {
+            foreach ($pipes as $pipe) {
+                if (is_resource($pipe)) {
+                    fclose($pipe);
+                }
+            }
+            if (is_resource($process)) {
+                proc_terminate($process);
+                proc_close($process);
+            }
         }
-
-        // Upload the last chunk if there's remaining data
-        if ($currentChunkSize > 0) {
-            $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-            $chunkIndex++;
-        }
-
-        pclose($process);
-        unset($chunkBuffer); // Free buffer memory
     }
 
-    protected function createChunkedFileBackup(string $timestamp): void
+    protected function createChunkedFileBackup(string $timestamp, BackupContext $context): void
     {
-        $paths = config('capsule.files.paths', []);
-        $excludePaths = config('capsule.files.exclude_paths', []);
-        $chunkSize = config('capsule.chunked_backup.chunk_size', 10485760);
-        $tempPrefix = config('capsule.chunked_backup.temp_prefix', 'capsule_chunk_');
-        $filters = $this->resolveFileFilters();
-
-        foreach ($paths as $path) {
-            if (is_dir($path)) {
-                $this->log("Streaming directory '{$path}' to chunks...");
-                $this->streamDirectoryToChunks($path, $excludePaths, $timestamp, $chunkSize, $tempPrefix, $filters);
-            } elseif (is_file($path)) {
-                if (!$this->passesFilters($path, $filters)) {
-                    continue;
+        $chunkSize = (int) config('capsule.chunked_backup.chunk_size', 10485760);
+        $baseName = 'files_' . bin2hex(random_bytes(8));
+        $index = 0;
+        $buffer = '';
+        $start = count($this->chunkMetadata);
+        foreach (FileSelection::files($context) as $archivePath => $filePath) {
+            $relative = substr($archivePath, strlen('files/'));
+            $stream = @fopen($filePath, 'rb');
+            if ($stream === false) {
+                throw new Exception("Cannot read backup source: {$filePath}");
+            }
+            try {
+                $stat = fstat($stream);
+                if ($stat === false || $stat['size'] < 0) {
+                    throw new Exception("Cannot determine backup source size: {$filePath}");
                 }
-                $this->log("Streaming file '{$path}' to chunks...");
-                $this->streamFileToChunks($path, $timestamp, $chunkSize, $tempPrefix);
+                $size = $stat['size'];
+                $hash = hash_init('sha256');
+                $this->appendChunkData(pack('N', strlen($relative)) . $relative . pack('P', $size), $buffer, $baseName, $index, $chunkSize, 'capsule_chunk_');
+                $remaining = $size;
+                while ($remaining > 0) {
+                    $data = fread($stream, min(65536, $remaining));
+                    if ($data === false || $data === '') {
+                        throw new Exception("Backup source changed or became unreadable: {$filePath}");
+                    }
+                    $remaining -= strlen($data);
+                    hash_update($hash, $data);
+                    $this->appendChunkData($data, $buffer, $baseName, $index, $chunkSize, 'capsule_chunk_');
+                }
+                if (fread($stream, 1) !== '') {
+                    throw new Exception("Backup source changed while being read: {$filePath}");
+                }
+                $this->manifestBuilder->addStreamEntry($archivePath, $size, hash_final($hash));
+            } finally {
+                fclose($stream);
+            }
+        }
+        if ($buffer !== '') {
+            $this->uploadChunkDirectly($buffer, $baseName, $index, 'capsule_chunk_');
+        }
+        for ($i = $start; $i < count($this->chunkMetadata); $i++) {
+            $this->chunkMetadata[$i]['format'] = 'framed-v2';
+        }
+    }
+
+    protected function appendChunkData(#[\SensitiveParameter] string $data, #[\SensitiveParameter] string &$buffer, string $baseName, int &$index, int $chunkSize, string $prefix): void
+    {
+        if ($chunkSize < 1) {
+            throw new Exception('Streaming chunk_size must be positive.');
+        }
+        $offset = 0;
+        while ($offset < strlen($data)) {
+            $take = min($chunkSize - strlen($buffer), strlen($data) - $offset);
+            $buffer .= substr($data, $offset, $take);
+            $offset += $take;
+            if (strlen($buffer) === $chunkSize) {
+                $this->uploadChunkDirectly($buffer, $baseName, $index++, $prefix);
+                $buffer = '';
             }
         }
     }
@@ -378,14 +495,11 @@ class ChunkedBackupService
     {
         $filters = [];
         foreach ((array) config('capsule.extensibility.file_filters', []) as $class) {
-            try {
-                $instance = app($class);
-                if ($instance instanceof FileFilterInterface) {
-                    $filters[] = $instance;
-                }
-            } catch (\Throwable $e) {
-                Log::warning('Failed to resolve file filter: ' . $class, ['exception' => $e]);
+            $instance = app($class);
+            if (!$instance instanceof FileFilterInterface) {
+                throw new Exception('Configured file filter does not implement FileFilterInterface: ' . $class);
             }
+            $filters[] = $instance;
         }
         return $filters;
     }
@@ -401,271 +515,28 @@ class ChunkedBackupService
         return true;
     }
 
-    protected function streamDirectoryToChunks(string $dir, array $excludePaths, string $timestamp, int $chunkSize, string $tempPrefix, array $filters = []): void
+    protected function uploadChunkDirectly(#[\SensitiveParameter] string $data, string $baseName, int $chunkIndex, string $tempPrefix): void
     {
-        $iterator = new \RecursiveIteratorIterator(
-            new \RecursiveDirectoryIterator($dir, \RecursiveDirectoryIterator::SKIP_DOTS),
-            \RecursiveIteratorIterator::SELF_FIRST
-        );
-
-        $chunkIndex = 0;
-        $currentChunkSize = 0;
-        $chunkBuffer = '';
-        $baseName = "files_" . basename($dir) . "_{$timestamp}";
-        $fileCount = 0;
-
-        foreach ($iterator as $file) {
-            $filePath = $file->getRealPath();
-
-            if ($filePath === false || empty($filePath)) {
-                continue;
-            }
-
-            if ($this->shouldExcludePath($filePath, $excludePaths)) {
-                continue;
-            }
-
-            if ($file->isFile() && !$this->passesFilters($filePath, $filters)) {
-                continue;
-            }
-
-            if ($file->isFile()) {
-                $fileSize = $file->getSize();
-                
-                // If single file is larger than chunk size, handle it separately
-                if ($fileSize > $chunkSize) {
-                    // Upload current chunk if it has data
-                    if ($currentChunkSize > 0) {
-                        $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-                        $chunkBuffer = '';
-                        $currentChunkSize = 0;
-                        $chunkIndex++;
-                    }
-                    
-                    // Stream large file directly
-                    $this->streamLargeFileToChunks($filePath, $dir, $baseName, $chunkSize, $tempPrefix, $chunkIndex);
-                    $chunkIndex += ceil($fileSize / $chunkSize);
-                    continue;
-                }
-
-                // Add file to current chunk buffer
-                $fileData = $this->prepareFileForChunk($filePath, $dir);
-                $fileDataSize = strlen($fileData);
-
-                if ($currentChunkSize + $fileDataSize > $chunkSize && $currentChunkSize > 0) {
-                    // Upload current chunk and start a new one
-                    $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-                    $chunkBuffer = '';
-                    $currentChunkSize = 0;
-                    $chunkIndex++;
-                }
-
-                $chunkBuffer .= $fileData;
-                $currentChunkSize += $fileDataSize;
-                
-                // Free file data immediately
-                unset($fileData);
-                $fileCount++;
-                
-                // Force garbage collection every 50 files
-                if ($fileCount % 50 === 0) {
-                    gc_collect_cycles();
-                }
-            }
-        }
-
-        // Upload the last chunk if there's remaining data
-        if ($currentChunkSize > 0) {
-            $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-        }
-        
-        unset($chunkBuffer); // Free buffer memory
+        // Object names are run-scoped and opaque; no connection, filename, or host leaks.
+        $chunkName = 'capsule_chunk_' . $this->backupId . '_' . hash('sha256', $baseName) . '.part' . $chunkIndex;
+        $stored = $this->storageManager->storeChunkData($data, $chunkName);
+        $this->chunkMetadata[] = array_merge($stored, [
+            'name' => $chunkName, 'index' => $chunkIndex, 'base_name' => $baseName,
+        ]);
     }
-
-    protected function streamFileToChunks(string $filePath, string $timestamp, int $chunkSize, string $tempPrefix): void
-    {
-        $baseName = "file_" . basename($filePath) . "_{$timestamp}";
-        $handle = fopen($filePath, 'r');
-        
-        if (!$handle) {
-            throw new Exception("Cannot open file for chunked backup: {$filePath}");
-        }
-
-        $chunkIndex = 0;
-        $chunkBuffer = '';
-        
-        while (!feof($handle)) {
-            $data = fread($handle, min(8192, $chunkSize - strlen($chunkBuffer)));
-            if ($data === false) break;
-            
-            $chunkBuffer .= $data;
-            
-            if (strlen($chunkBuffer) >= $chunkSize) {
-                $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-                $chunkBuffer = '';
-                $chunkIndex++;
-            }
-        }
-        
-        // Upload the last chunk if there's remaining data
-        if (strlen($chunkBuffer) > 0) {
-            $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-        }
-
-        fclose($handle);
-    }
-
-
-    protected function prepareFileForChunk(string $filePath, string $baseDir): string
-    {
-        $relativePath = substr($filePath, strlen($baseDir) + 1);
-        
-        $this->manifestBuilder->addDeferredEntry('files/' . $relativePath, $filePath);
-        
-        // Stream file content instead of loading all at once
-        $fileHandle = fopen($filePath, 'r');
-        if (!$fileHandle) {
-            throw new Exception("Cannot open file: {$filePath}");
-        }
-        
-        $pathLength = strlen($relativePath);
-        $contentLength = filesize($filePath);
-        
-        // Create header
-        $result = pack('N', $pathLength) . $relativePath . pack('N', $contentLength);
-        
-        // Stream file content
-        while (!feof($fileHandle)) {
-            $data = fread($fileHandle, 8192);
-            if ($data !== false) {
-                $result .= $data;
-            }
-        }
-        
-        fclose($fileHandle);
-        return $result;
-    }
-
-
-    protected function streamLargeFileToChunks(string $filePath, string $baseDir, string $baseName, int $chunkSize, string $tempPrefix, int &$chunkIndex): void
-    {
-        $relativePath = substr($filePath, strlen($baseDir) + 1);
-        $this->manifestBuilder->addDeferredEntry('files/' . $relativePath, $filePath);
-        
-        $fileHandle = fopen($filePath, 'r');
-        if (!$fileHandle) {
-            throw new Exception("Cannot open large file for streaming: {$filePath}");
-        }
-
-        $pathLength = strlen($relativePath);
-        $pathData = pack('N', $pathLength) . $relativePath;
-        $pathDataSize = strlen($pathData);
-        
-        $chunkBuffer = '';
-        
-        while (!feof($fileHandle)) {
-            // Start new chunk with path data
-            if (empty($chunkBuffer)) {
-                $chunkBuffer = $pathData;
-            }
-            
-            // Read file content until chunk size reached
-            while (strlen($chunkBuffer) < $chunkSize && !feof($fileHandle)) {
-                $data = fread($fileHandle, min(8192, $chunkSize - strlen($chunkBuffer)));
-                if ($data === false) break;
-                $chunkBuffer .= $data;
-            }
-            
-            if (strlen($chunkBuffer) > $pathDataSize) {
-                // Calculate content length and insert it after path data
-                $contentLength = strlen($chunkBuffer) - $pathDataSize;
-                $chunkBuffer = $pathData . pack('N', $contentLength) . substr($chunkBuffer, $pathDataSize);
-                
-                $this->uploadChunkDirectly($chunkBuffer, $baseName, $chunkIndex, $tempPrefix);
-                $chunkIndex++;
-                $chunkBuffer = '';
-            }
-        }
-
-        fclose($fileHandle);
-    }
-
-
-    protected function uploadChunkDirectly(string $data, string $baseName, int $chunkIndex, string $tempPrefix): void
-    {
-        $chunkName = "{$tempPrefix}{$baseName}.part{$chunkIndex}";
-        $dataSize = strlen($data);
-        
-        $this->log("Uploading chunk {$chunkIndex} for {$baseName} directly...");
-        
-        // Upload chunk directly to storage using stream
-        $stream = fopen('php://temp', 'r+');
-        fwrite($stream, $data);
-        rewind($stream);
-        
-        try {
-            $this->storageManager->storeStream($stream, $chunkName);
-            
-            // Store minimal metadata for collation
-            $this->chunkMetadata[] = [
-                'name' => $chunkName,
-                'index' => $chunkIndex,
-                'base_name' => $baseName,
-                'size' => $dataSize,
-            ];
-            
-            $this->log("Chunk {$chunkIndex} uploaded successfully");
-            
-            // Free memory immediately after upload
-            unset($data);
-        } catch (Exception $e) {
-            fclose($stream);
-            throw new Exception("Failed to upload chunk {$chunkIndex}: " . $e->getMessage());
-        }
-        
-        fclose($stream);
-    }
-
 
     protected function collateChunks(): string
     {
-        $timestamp = now()->format('Y-m-d_H-i-s');
-        $finalBackupName = "backup_{$timestamp}.zip";
-
-        $encryptionEnabled = $this->encryption || (bool) config('capsule.security.encrypt_backups', false);
-        $manifest = $this->manifestBuilder->build(true, $this->compressionLevel, $encryptionEnabled);
-        $manifestJson = json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-        
-        // Upload manifest chunk directly
-        $manifestChunkName = "capsule_chunk_manifest.json.part0";
-        $stream = fopen('php://temp', 'r+');
-        fwrite($stream, $manifestJson);
-        rewind($stream);
-        $this->storageManager->storeStream($stream, $manifestChunkName);
-        fclose($stream);
-        
-        // Add manifest to metadata
-        $this->chunkMetadata[] = [
-            'name' => $manifestChunkName,
-            'index' => 0,
-            'base_name' => 'manifest.json',
-            'size' => strlen($manifestJson),
-        ];
-        
-        // Free manifest data immediately
-        unset($manifest, $manifestJson);
-
-        $this->log("Collating chunks into '{$finalBackupName}'...");
-        $finalPath = $this->storageManager->collateChunksAdvanced(
-            $this->chunkMetadata,
-            $finalBackupName,
-            $this->compressionLevel,
-            $this->encryption || (bool) config('capsule.security.encrypt_backups', false),
-            (string) (config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD'))
-        );
-        
-        $this->log("Final backup file created at: {$finalPath}");
-        return $finalPath;
+        $name = 'backup_' . now()->format('Y-m-d_H-i-s') . '_' . $this->backupId . ($this->runPassword !== null ? EncryptedArchive::EXTENSION : '.zip');
+        $manifest = $this->manifestBuilder->build(true, $this->compressionLevel, $this->runPassword !== null);
+        $json = ManifestBuilder::encode($manifest);
+        $index = 0;
+        $buffer = '';
+        $this->appendChunkData($json, $buffer, 'manifest.json', $index, (int) config('capsule.chunked_backup.chunk_size', 10485760), 'capsule_chunk_');
+        if ($buffer !== '') {
+            $this->uploadChunkDirectly($buffer, 'manifest.json', $index, 'capsule_chunk_');
+        }
+        return $this->storageManager->collateChunksAdvanced($this->chunkMetadata, $name, $this->compressionLevel, $this->runPassword !== null, $this->runPassword ?? '');
     }
 
     protected function getRemoteFileSize(string $fileName): int
@@ -675,12 +546,7 @@ class ChunkedBackupService
 
     protected function shouldExcludePath(string $path, array $excludePaths): bool
     {
-        foreach ($excludePaths as $excludePath) {
-            if (strpos($path, $excludePath) === 0) {
-                return true;
-            }
-        }
-        return false;
+        return FileSelection::shouldExclude($path, $excludePaths);
     }
 
     protected function cleanupChunks(): void
@@ -689,7 +555,7 @@ class ChunkedBackupService
         foreach ($this->chunkMetadata as $chunk) {
             try {
                 $this->storageManager->delete($chunk['name']);
-            } catch (Exception $e) {
+            } catch (\Throwable $e) {
                 Log::warning("Failed to cleanup chunk: {$chunk['name']}", ['exception' => $e]);
             }
         }
@@ -697,39 +563,13 @@ class ChunkedBackupService
 
     protected function cleanup(): void
     {
-        // Clean up chunks after successful collation
         $this->cleanupChunks();
-        
-        // Run regular cleanup if enabled
         if (config('capsule.retention.cleanup_enabled', true)) {
-            $this->log('Running retention cleanup...');
-            $retentionDays = config('capsule.retention.days', 30);
-            $retentionCount = config('capsule.retention.count', 10);
-
-            // Get IDs of backups to keep (latest N successful backups)
-            $keepIds = BackupLog::where('status', 'success')
-                ->orderBy('created_at', 'desc')
-                ->limit($retentionCount)
-                ->pluck('id')
-                ->toArray();
-
-            // Find backups to delete
-            $query = BackupLog::where('status', 'success')
-                ->where('created_at', '<', now()->subDays($retentionDays));
-
-            if (!empty($keepIds)) {
-                $query->whereNotIn('id', $keepIds);
+            try {
+                app(RetentionService::class)->cleanup(['scope' => RetentionService::currentScope()]);
+            } catch (\Throwable $e) {
+                Log::warning('Retention cleanup failed after verified backup upload.', ['exception' => $e]);
             }
-
-            // Use eachById to avoid memory issues with large result sets
-            $query->eachById(function (BackupLog $backup) {
-                if ($backup->file_path) {
-                    $fileName = basename($backup->file_path);
-                    $this->storageManager->delete($fileName);
-                }
-                $backup->delete();
-            });
         }
     }
-
 }

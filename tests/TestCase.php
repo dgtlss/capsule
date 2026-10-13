@@ -7,6 +7,8 @@ use Orchestra\Testbench\TestCase as BaseTestCase;
 
 abstract class TestCase extends BaseTestCase
 {
+    protected ?string $testDirectory = null;
+
     protected function getPackageProviders($app): array
     {
         return [
@@ -21,6 +23,14 @@ abstract class TestCase extends BaseTestCase
 
     protected function defineEnvironment($app): void
     {
+        $this->testDirectory = sys_get_temp_dir() . '/capsule-tests-' . bin2hex(random_bytes(8));
+        mkdir($this->testDirectory, 0700, true);
+        $app->useStoragePath($this->testDirectory . '/storage');
+        mkdir($app->storagePath('framework/cache'), 0700, true);
+        mkdir($app->storagePath('logs'), 0700, true);
+
+        $app['config']->set('cache.default', 'array');
+        $app['config']->set('app.key', 'base64:' . base64_encode(str_repeat('a', 32)));
         $app['config']->set('database.default', 'testing');
         $app['config']->set('database.connections.testing', [
             'driver' => 'sqlite',
@@ -30,7 +40,8 @@ abstract class TestCase extends BaseTestCase
 
         $app['config']->set('filesystems.disks.capsule-test', [
             'driver' => 'local',
-            'root' => sys_get_temp_dir() . '/capsule-tests',
+            'root' => $this->testDirectory . '/disk',
+            'throw' => true,
         ]);
 
         $app['config']->set('capsule.default_disk', 'capsule-test');
@@ -43,12 +54,18 @@ abstract class TestCase extends BaseTestCase
 
     protected function tearDown(): void
     {
-        $testDir = sys_get_temp_dir() . '/capsule-tests';
-        if (is_dir($testDir)) {
-            $this->removeDirectory($testDir);
+        try {
+            parent::tearDown();
+        } finally {
+            if ($this->testDirectory !== null && is_dir($this->testDirectory)) {
+                $this->removeDirectory($this->testDirectory);
+            }
         }
+    }
 
-        parent::tearDown();
+    protected function testPath(string $path = ''): string
+    {
+        return $this->testDirectory . ($path === '' ? '' : '/' . ltrim($path, '/'));
     }
 
     protected function removeDirectory(string $dir): void
@@ -59,10 +76,10 @@ abstract class TestCase extends BaseTestCase
         );
 
         foreach ($items as $item) {
-            if ($item->isDir()) {
-                rmdir($item->getRealPath());
+            if ($item->isDir() && !$item->isLink()) {
+                rmdir($item->getPathname());
             } else {
-                unlink($item->getRealPath());
+                unlink($item->getPathname());
             }
         }
 

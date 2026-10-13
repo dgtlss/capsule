@@ -12,8 +12,7 @@ class DiagnoseCommand extends Command
     protected $signature = 'capsule:diagnose 
     {--detailed : Show detailed performance and security analysis}
     {--fix : Attempt to fix common issues automatically}
-    {--format=table : Output format (table, json)}
-    {--detailed : Verbose output}';
+    {--format=table : Output format (table, json)}';
     
     protected $description = 'Diagnose Capsule configuration and system requirements';
 
@@ -22,7 +21,7 @@ class DiagnoseCommand extends Command
         $detailed = $this->option('detailed');
         $format = $this->option('format');
         $fix = $this->option('fix');
-        $verbose = $this->option('detailed');
+        $verbose = true;
 
         if ($format === 'json') {
             return $this->handleJsonOutput($detailed, $fix);
@@ -77,26 +76,35 @@ class DiagnoseCommand extends Command
 
     protected function handleJsonOutput(bool $detailed, bool $fix): int
     {
-        $results = [
-            'timestamp' => now()->toISOString(),
-            'checks' => [
-                'basic' => $this->checkBasicConfig($fix, false),
-                'storage' => $this->checkStorageConfig($fix, false),
-                'database' => $this->checkDatabaseConfig($fix, false),
-                'files' => $this->checkFileConfig($fix, false),
-                'system' => $this->checkSystemRequirements($fix, false),
-            ]
+        $checks = [
+            'basic' => fn () => $this->checkBasicConfig($fix, false),
+            'storage' => fn () => $this->checkStorageConfig($fix, false),
+            'database' => fn () => $this->checkDatabaseConfig($fix, false),
+            'files' => fn () => $this->checkFileConfig($fix, false),
+            'system' => fn () => $this->checkSystemRequirements($fix, false),
+            'health' => fn () => $this->checkHealthSummary(false),
         ];
-
         if ($detailed) {
-            $results['checks']['performance'] = $this->checkPerformance(false);
-            $results['checks']['security'] = $this->checkSecurity(false);
-            $results['checks']['backup_history'] = $this->checkBackupHistory(false);
+            $checks += [
+                'performance' => fn () => $this->checkPerformance(false),
+                'security' => fn () => $this->checkSecurity(false),
+                'backup_history' => fn () => $this->checkBackupHistory(false),
+            ];
         }
 
-        $results['overall_status'] = collect($results['checks'])->every(fn($result) => $result) ? 'passed' : 'failed';
-
-        $this->line(json_encode($results, JSON_PRETTY_PRINT));
+        $results = ['timestamp' => now()->toISOString(), 'checks' => [], 'errors' => []];
+        foreach ($checks as $name => $check) {
+            try {
+                $results['checks'][$name] = $check();
+            } catch (\Throwable $e) {
+                $results['checks'][$name] = false;
+                // Adapter/database exceptions may contain credentials or other
+                // private configuration. Do not serialize their messages.
+                $results['errors'][$name] = 'Check could not complete; inspect the configuration for this check.';
+            }
+        }
+        $results['overall_status'] = in_array(false, $results['checks'], true) ? 'failed' : 'passed';
+        $this->line(json_encode($results, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE));
 
         return $results['overall_status'] === 'passed' ? self::SUCCESS : self::FAILURE;
     }
@@ -115,7 +123,7 @@ class DiagnoseCommand extends Command
             if ($verbose) $this->error('  ❌ Config file missing. Run: php artisan vendor:publish --tag=capsule-config');
             if ($fix) {
                 if ($verbose) $this->info('  🔧 Attempting to publish config...');
-                $this->call('vendor:publish', ['--tag' => 'capsule-config']);
+                $verbose ? $this->call('vendor:publish', ['--tag' => 'capsule-config']) : $this->callSilent('vendor:publish', ['--tag' => 'capsule-config']);
                 $configExists = file_exists(config_path('capsule.php'));
                 if ($configExists && $verbose) {
                     $this->info('  ✅ Config file published successfully');
@@ -146,20 +154,20 @@ class DiagnoseCommand extends Command
         $diskName = config('capsule.default_disk', 'local');
         $backupPath = config('capsule.backup_path', 'backups');
 
-        $this->info("  📁 Using disk: {$diskName}");
-        $this->info("  📂 Backup path: {$backupPath}");
+        if ($verbose) $this->info("  📁 Using disk: {$diskName}");
+        if ($verbose) $this->info("  📂 Backup path: {$backupPath}");
 
         try {
             $filesystemDisks = config('filesystems.disks', []);
             
             if (!isset($filesystemDisks[$diskName])) {
                 $available = implode(', ', array_keys($filesystemDisks));
-                $this->error("  ❌ Disk '{$diskName}' not found in filesystems.php");
-                $this->error("  Available disks: {$available}");
+                if ($verbose) $this->error("  ❌ Disk '{$diskName}' not found in filesystems.php");
+                if ($verbose) $this->error("  Available disks: {$available}");
                 return false;
             }
 
-            $this->info('  ✅ Storage disk configuration found');
+            if ($verbose) $this->info('  ✅ Storage disk configuration found');
 
             // Test storage access
             try {
@@ -169,18 +177,18 @@ class DiagnoseCommand extends Command
                 
                 if ($disk->exists($testFile)) {
                     $disk->delete($testFile);
-                    $this->info('  ✅ Storage disk is writable');
+                    if ($verbose) $this->info('  ✅ Storage disk is writable');
                 } else {
-                    $this->error('  ❌ Failed to write test file to storage');
+                    if ($verbose) $this->error('  ❌ Failed to write test file to storage');
                     return false;
                 }
             } catch (\Exception $e) {
-                $this->error("  ❌ Storage test failed: {$e->getMessage()}");
+                if ($verbose) $this->error("  ❌ Storage test failed: {$e->getMessage()}");
                 return false;
             }
 
         } catch (\Exception $e) {
-            $this->error("  ❌ Storage configuration error: {$e->getMessage()}");
+            if ($verbose) $this->error("  ❌ Storage configuration error: {$e->getMessage()}");
             return false;
         }
 
@@ -189,12 +197,12 @@ class DiagnoseCommand extends Command
 
     protected function checkDatabaseConfig(bool $fix = false, bool $verbose = true): bool
     {
-        $this->line('🗄️  Database Configuration');
+        if ($verbose) $this->line('🗄️  Database Configuration');
         
         $dbEnabled = config('capsule.database.enabled', true);
         
         if (!$dbEnabled) {
-            $this->comment('  ⏭️  Database backup disabled');
+            if ($verbose) $this->comment('  ⏭️  Database backup disabled');
             return true;
         }
 
@@ -210,62 +218,62 @@ class DiagnoseCommand extends Command
         $allGood = true;
 
         foreach ($connections as $connection) {
-            $this->info("  🔗 Checking connection: {$connection}");
+            if ($verbose) $this->info("  🔗 Checking connection: {$connection}");
             
             // Resolve 'default' to the actual default connection name
             $resolvedConnection = $connection === 'default' ? config('database.default') : $connection;
             $dbConfig = config("database.connections.{$resolvedConnection}");
             if (!$dbConfig) {
-                $this->error("    ❌ Connection '{$resolvedConnection}' not found");
+                if ($verbose) $this->error("    ❌ Connection '{$resolvedConnection}' not found");
                 $allGood = false;
                 continue;
             }
 
             $driver = $dbConfig['driver'] ?? 'unknown';
-            $this->info("    📊 Driver: {$driver}");
+            if ($verbose) $this->info("    📊 Driver: {$driver}");
 
             // Check database tools
             switch ($driver) {
                 case 'mysql':
                     if (Helpers::commandExists('mysqldump') || Helpers::commandExists('mariadb-dump')) {
-                        $this->info('    ✅ mysqldump/mariadb-dump available');
+                        if ($verbose) $this->info('    ✅ mysqldump/mariadb-dump available');
                     } else {
-                        $this->error('    ❌ mysqldump/mariadb-dump not found');
+                        if ($verbose) $this->error('    ❌ mysqldump/mariadb-dump not found');
                         $allGood = false;
                     }
                     break;
                 case 'pgsql':
                     if (Helpers::commandExists('pg_dump')) {
-                        $this->info('    ✅ pg_dump available');
+                        if ($verbose) $this->info('    ✅ pg_dump available');
                     } else {
-                        $this->error('    ❌ pg_dump not found');
+                        if ($verbose) $this->error('    ❌ pg_dump not found');
                         $allGood = false;
                     }
                     break;
                 case 'sqlite':
                     $dbPath = $dbConfig['database'] ?? '';
                     if (file_exists($dbPath)) {
-                        $this->info('    ✅ SQLite database file exists');
+                        if ($verbose) $this->info('    ✅ SQLite database file exists');
                     } else {
-                        $this->error("    ❌ SQLite file not found: {$dbPath}");
+                        if ($verbose) $this->error("    ❌ SQLite file not found: {$dbPath}");
                         $allGood = false;
                     }
                     break;
                 default:
-                    $this->comment("    ⚠️  Unsupported driver: {$driver}");
+                    if ($verbose) $this->comment("    ⚠️  Unsupported driver: {$driver}");
                     break;
             }
 
             // Test database connection
             if ($fix && in_array($driver, ['mysql', 'pgsql'])) {
                 // Defer actual connection test; inform about graceful degrade
-                $this->comment('    ℹ️  Will gracefully continue without DB logging if connection fails at runtime');
+                if ($verbose) $this->comment('    ℹ️  Will gracefully continue without DB logging if connection fails at runtime');
             } else {
                 try {
                     \DB::connection($resolvedConnection)->getPdo();
-                    $this->info('    ✅ Database connection successful');
+                    if ($verbose) $this->info('    ✅ Database connection successful');
                 } catch (\Exception $e) {
-                    $this->error("    ❌ Database connection failed: {$e->getMessage()}");
+                    if ($verbose) $this->error("    ❌ Database connection failed: {$e->getMessage()}");
                     $allGood = false;
                 }
             }
@@ -276,12 +284,12 @@ class DiagnoseCommand extends Command
 
     protected function checkFileConfig(bool $fix = false, bool $verbose = true): bool
     {
-        $this->line('📁 File Backup Configuration');
+        if ($verbose) $this->line('📁 File Backup Configuration');
         
         $filesEnabled = config('capsule.files.enabled', true);
         
         if (!$filesEnabled) {
-            $this->comment('  ⏭️  File backup disabled');
+            if ($verbose) $this->comment('  ⏭️  File backup disabled');
             return true;
         }
 
@@ -289,27 +297,27 @@ class DiagnoseCommand extends Command
         $excludePaths = config('capsule.files.exclude_paths', []);
 
         if (empty($paths)) {
-            $this->error('  ❌ No file paths configured');
+            if ($verbose) $this->error('  ❌ No file paths configured');
             return false;
         }
 
-        $this->info('  📂 Checking backup paths:');
+        if ($verbose) $this->info('  📂 Checking backup paths:');
         $allGood = true;
 
         foreach ($paths as $path) {
             if (file_exists($path)) {
                 $size = $this->getDirectorySize($path);
-                $this->info("    ✅ {$path} ({$size})");
+                if ($verbose) $this->info("    ✅ {$path} ({$size})");
             } else {
-                $this->error("    ❌ {$path} (not found)");
+                if ($verbose) $this->error("    ❌ {$path} (not found)");
                 $allGood = false;
             }
         }
 
         if (!empty($excludePaths)) {
-            $this->info('  🚫 Exclude paths:');
+            if ($verbose) $this->info('  🚫 Exclude paths:');
             foreach ($excludePaths as $path) {
-                $this->comment("    ⏭️  {$path}");
+                if ($verbose) $this->comment("    ⏭️  {$path}");
             }
         }
 
@@ -318,26 +326,26 @@ class DiagnoseCommand extends Command
 
     protected function checkSystemRequirements(bool $fix = false, bool $verbose = true): bool
     {
-        $this->line('⚙️  System Requirements');
+        if ($verbose) $this->line('⚙️  System Requirements');
         
         $allGood = true;
 
         // Check PHP version
         $phpVersion = PHP_VERSION;
-        if (version_compare($phpVersion, '8.1', '>=')) {
-            $this->info("  ✅ PHP version: {$phpVersion}");
+        if (version_compare($phpVersion, '8.2', '>=')) {
+            if ($verbose) $this->info("  ✅ PHP version: {$phpVersion}");
         } else {
-            $this->error("  ❌ PHP 8.1+ required, found: {$phpVersion}");
+            if ($verbose) $this->error("  ❌ PHP 8.2+ required, found: {$phpVersion}");
             $allGood = false;
         }
 
         // Check required extensions
-        $extensions = ['zip', 'json'];
+        $extensions = ['zip', 'json', 'zlib', 'sodium'];
         foreach ($extensions as $ext) {
             if (extension_loaded($ext)) {
-                $this->info("  ✅ {$ext} extension loaded");
+                if ($verbose) $this->info("  ✅ {$ext} extension loaded");
             } else {
-                $this->error("  ❌ {$ext} extension missing");
+                if ($verbose) $this->error("  ❌ {$ext} extension missing");
                 $allGood = false;
             }
         }
@@ -345,9 +353,9 @@ class DiagnoseCommand extends Command
         // Check directory permissions
         $storageDir = storage_path('app');
         if (is_writable($storageDir)) {
-            $this->info("  ✅ Storage directory writable: {$storageDir}");
+            if ($verbose) $this->info("  ✅ Storage directory writable: {$storageDir}");
         } else {
-            $this->error("  ❌ Storage directory not writable: {$storageDir}");
+            if ($verbose) $this->error("  ❌ Storage directory not writable: {$storageDir}");
             $allGood = false;
         }
 
@@ -452,32 +460,32 @@ class DiagnoseCommand extends Command
 
     protected function checkHealthSummary(bool $verbose = true): bool
     {
-        $this->line('❤️  Capsule Health Summary');
+        if ($verbose) $this->line('❤️  Capsule Health Summary');
         try {
             $age = \Dgtlss\Capsule\Health\Checks\BackupHealthCheck::lastSuccessAgeDays();
             $failures = \Dgtlss\Capsule\Health\Checks\BackupHealthCheck::recentFailuresCount();
             $usage = \Dgtlss\Capsule\Health\Checks\BackupHealthCheck::storageUsageBytes();
 
-            $this->info('  Last success age: ' . ($age === null ? 'none' : ($age . ' day(s)')));
+            if ($verbose) $this->info('  Last success age: ' . ($age === null ? 'none' : ($age . ' day(s)')));
             if ($failures > 0) {
-                $this->warn("  Recent failures (7d): {$failures}");
+                if ($verbose) $this->warn("  Recent failures (7d): {$failures}");
             } else {
-                $this->info('  Recent failures (7d): 0');
+                if ($verbose) $this->info('  Recent failures (7d): 0');
             }
-            $this->info('  Storage usage: ' . Helpers::formatBytes($usage));
+            if ($verbose) $this->info('  Storage usage: ' . Helpers::formatBytes($usage));
 
             $staleTimeout = (int) config('capsule.lock.timeout_seconds', 900);
             $staleRunning = BackupLog::running()
                 ->where('started_at', '<', now()->subSeconds($staleTimeout))
                 ->count();
             if ($staleRunning > 0) {
-                $this->warn("  Stale 'running' backups: {$staleRunning} (started > " . ($staleTimeout / 60) . "min ago)");
-                $this->comment("  Run: capsule:cleanup --failed to clean these up");
+                if ($verbose) $this->warn("  Stale 'running' backups: {$staleRunning} (started > " . ($staleTimeout / 60) . "min ago)");
+                if ($verbose) $this->comment("  Run: capsule:cleanup --failed to clean these up");
             }
 
             return true;
         } catch (\Throwable $e) {
-            $this->error('  ❌ Failed to compute health summary: ' . $e->getMessage());
+            if ($verbose) $this->error('  ❌ Failed to compute health summary: ' . $e->getMessage());
             return false;
         }
     }

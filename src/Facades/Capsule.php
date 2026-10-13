@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Facades;
 
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Services\BackupService;
+use Dgtlss\Capsule\Services\PolicyRunner;
 use Dgtlss\Capsule\Services\SimulationService;
 use Illuminate\Support\Collection;
 
@@ -24,37 +25,28 @@ class Capsule
 {
     public static function backup(array $options = []): bool
     {
-        $service = app(BackupService::class);
-
-        if (!empty($options['tag'])) {
-            $service->setTag($options['tag']);
+        if (!empty($options['db_only']) && !empty($options['files_only'])) {
+            throw new \InvalidArgumentException('Cannot use db_only and files_only together.');
         }
 
-        if (!empty($options['incremental'])) {
-            $service->setIncremental(true);
-        }
+        return PolicyRunner::withPolicy($options['policy'] ?? null, function (array $policy) use ($options): bool {
+            if (!empty($options['db_only'])) {
+                config(['capsule.files.enabled' => false]);
+            }
+            if (!empty($options['files_only'])) {
+                config(['capsule.database.enabled' => false]);
+            }
 
-        if (!empty($options['encrypt'])) {
-            $service->setEncryption(true);
-        }
-
-        if (!empty($options['verify'])) {
-            $service->setVerification(true);
-        }
-
-        if (isset($options['compression_level'])) {
-            $service->setCompressionLevel((int) $options['compression_level']);
-        }
-
-        if (!empty($options['db_only'])) {
-            config(['capsule.files.enabled' => false]);
-        }
-
-        if (!empty($options['files_only'])) {
-            config(['capsule.database.enabled' => false]);
-        }
-
-        return $service->run();
+            $service = app(BackupService::class);
+            $service->setTag($options['tag'] ?? ($policy['tag'] ?? ($options['policy'] ?? null)));
+            $service->setIncremental((bool) ($options['incremental'] ?? config('capsule._policy_incremental', false)));
+            $service->setEncryption((bool) ($options['encrypt'] ?? false));
+            $service->setVerification((bool) ($options['verify'] ?? false));
+            if (isset($options['compression_level'])) {
+                $service->setCompressionLevel((int) $options['compression_level']);
+            }
+            return $service->run((bool) ($options['force'] ?? false));
+        });
     }
 
     public static function simulate(): array

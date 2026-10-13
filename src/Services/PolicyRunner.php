@@ -2,9 +2,6 @@
 
 namespace Dgtlss\Capsule\Services;
 
-use Dgtlss\Capsule\Support\Helpers;
-use Illuminate\Support\Facades\Log;
-
 class PolicyRunner
 {
     /**
@@ -42,6 +39,10 @@ class PolicyRunner
         }
 
         $policy = $policies[$name];
+        config([
+            'capsule._policy_name' => $name,
+            'capsule._policy_incremental' => (bool) ($policy['incremental'] ?? false),
+        ]);
 
         if (isset($policy['database'])) {
             config(['capsule.database.enabled' => (bool) $policy['database']]);
@@ -53,6 +54,10 @@ class PolicyRunner
 
         if (isset($policy['disk'])) {
             config(['capsule.default_disk' => $policy['disk']]);
+        }
+
+        if (isset($policy['backup_path'])) {
+            config(['capsule.backup_path' => $policy['backup_path']]);
         }
 
         if (isset($policy['paths'])) {
@@ -77,11 +82,19 @@ class PolicyRunner
             config(['capsule.backup.compression_level' => (int) $policy['compression_level']]);
         }
 
-        if (isset($policy['incremental']) && $policy['incremental']) {
-            config(['capsule._policy_incremental' => true]);
-        }
-
         return $policy;
+    }
+
+    /** Execute one operation with overrides and restore the full original config. */
+    public static function withPolicy(?string $name, callable $operation)
+    {
+        $original = config('capsule', []);
+        try {
+            $policy = $name !== null ? self::applyPolicy($name) : [];
+            return $operation($policy);
+        } finally {
+            config(['capsule' => $original]);
+        }
     }
 
     /**

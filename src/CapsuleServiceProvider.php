@@ -12,6 +12,7 @@ use Dgtlss\Capsule\Commands\VerifyScheduledCommand;
 use Dgtlss\Capsule\Commands\ListCommand;
 use Dgtlss\Capsule\Commands\InspectCommand;
 use Dgtlss\Capsule\Commands\DownloadCommand;
+use Dgtlss\Capsule\Commands\DecryptCommand;
 use Dgtlss\Capsule\Commands\HealthCommand;
 use Dgtlss\Capsule\Commands\RestoreCommand;
 use Dgtlss\Capsule\Database\DatabaseDumper;
@@ -29,11 +30,11 @@ class CapsuleServiceProvider extends ServiceProvider
     {
         $this->mergeConfigFrom(__DIR__ . '/../config/capsule.php', 'capsule');
 
-        $this->app->singleton(StorageManager::class);
-        $this->app->singleton(NotificationManager::class);
-        $this->app->singleton(DatabaseDumper::class);
+        $this->app->bind(StorageManager::class);
+        $this->app->bind(NotificationManager::class);
+        $this->app->bind(DatabaseDumper::class);
 
-        $this->app->singleton(BackupService::class, function ($app) {
+        $this->app->bind(BackupService::class, function ($app) {
             return new BackupService(
                 $app,
                 $app->make(StorageManager::class),
@@ -43,7 +44,7 @@ class CapsuleServiceProvider extends ServiceProvider
             );
         });
 
-        $this->app->singleton(ChunkedBackupService::class, function ($app) {
+        $this->app->bind(ChunkedBackupService::class, function ($app) {
             return new ChunkedBackupService(
                 $app,
                 $app->make(StorageManager::class),
@@ -78,6 +79,7 @@ class CapsuleServiceProvider extends ServiceProvider
                 HealthCommand::class,
                 RestoreCommand::class,
                 DownloadCommand::class,
+                DecryptCommand::class,
                 VerifyScheduledCommand::class,
             ]);
         }

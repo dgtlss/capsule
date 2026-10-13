@@ -23,7 +23,7 @@ class DownloadCommand extends Command
             return self::FAILURE;
         }
 
-        $diskName = config('capsule.default_disk', 'local');
+        $diskName = $backup->metadata['storage']['disk'] ?? config('capsule.default_disk', 'local');
         $disk = Storage::disk($diskName);
 
         if (!$backup->file_path || !$disk->exists($backup->file_path)) {
@@ -48,11 +48,23 @@ class DownloadCommand extends Command
             return self::FAILURE;
         }
 
-        $out = fopen($localPath, 'wb');
-        $bytes = stream_copy_to_stream($stream, $out);
-        fclose($out);
-        if (is_resource($stream)) {
+        $temporary = tempnam($destinationDir, '.capsule-download-');
+        $out = $temporary !== false ? fopen($temporary, 'wb') : false;
+        if ($out === false) {
             fclose($stream);
+            $this->error('Cannot create temporary download file.');
+            return self::FAILURE;
+        }
+        try {
+            $bytes = stream_copy_to_stream($stream, $out);
+        } finally {
+            fclose($out);
+            fclose($stream);
+        }
+        if ($bytes === false || $bytes !== $disk->size($backup->file_path) || is_link($localPath) || !rename($temporary, $localPath)) {
+            @unlink($temporary);
+            $this->error('Download could not be safely completed.');
+            return self::FAILURE;
         }
 
         $this->info("Downloaded to: {$localPath} (" . Helpers::formatBytes($bytes ?: 0) . ")");

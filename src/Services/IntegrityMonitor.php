@@ -5,16 +5,16 @@ namespace Dgtlss\Capsule\Services;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Models\VerificationLog;
 use Dgtlss\Capsule\Notifications\NotificationManager;
-use Dgtlss\Capsule\Support\Helpers;
+use Dgtlss\Capsule\Support\RestoreArchive;
+use Dgtlss\Capsule\Security\EncryptedArchive;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Storage;
-use ZipArchive;
 
 class IntegrityMonitor
 {
     protected NotificationManager $notificationManager;
 
-    public function __construct(NotificationManager $notificationManager = null)
+    public function __construct(?NotificationManager $notificationManager = null)
     {
         $this->notificationManager = $notificationManager ?? new NotificationManager();
     }
@@ -34,7 +34,7 @@ class IntegrityMonitor
                 'status' => $result['failures'] === 0 ? 'passed' : 'failed',
                 'entries_checked' => $result['checked'],
                 'entries_failed' => $result['failures'],
-                'error_message' => $result['failures'] > 0 ? $result['error_summary'] : null,
+                'error_message' => $result['failures'] > 0 ? $result['error_summary'] : (($result['warnings'] ?? []) !== [] ? implode(' ', $result['warnings']) : null),
                 'duration_seconds' => round(microtime(true) - $startTime, 2),
                 'trigger' => $trigger,
             ]);
@@ -102,124 +102,93 @@ class IntegrityMonitor
 
     protected function performVerification(BackupLog $backup): array
     {
-        $diskName = config('capsule.default_disk', 'local');
+        return $this->inspect($backup);
+    }
+
+    /** Verify without writing a verification log, for the manual CLI command. */
+    public function inspect(BackupLog $backup, bool $keep = false): array
+    {
+        $diskName = $backup->metadata['storage']['disk'] ?? $backup->metadata['disk'] ?? config('capsule.default_disk', 'local');
+        if (!is_string($diskName) || $diskName === '') {
+            throw new \RuntimeException('Backup storage metadata has an invalid disk.');
+        }
         $disk = Storage::disk($diskName);
-
         if (!$backup->file_path || !$disk->exists($backup->file_path)) {
-            throw new \Exception("Backup file not found: {$backup->file_path}");
+            throw new \RuntimeException("Backup file not found on disk '{$diskName}': {$backup->file_path}");
         }
 
-        $tmpPath = tempnam(sys_get_temp_dir(), 'capsule_intmon_');
-        $stream = $disk->readStream($backup->file_path);
-        if ($stream === false) {
-            throw new \Exception('Failed to open remote file stream.');
+        $tmpPath = tempnam(sys_get_temp_dir(), 'capsule_verify_');
+        if ($tmpPath === false) {
+            throw new \RuntimeException('Unable to create verification download file.');
         }
-
-        $out = fopen($tmpPath, 'wb');
-        stream_copy_to_stream($stream, $out);
-        fclose($out);
-        if (is_resource($stream)) {
-            fclose($stream);
-        }
-
+        $input = $output = null;
+        $downloaded = false;
         try {
-            return $this->verifyArchive($tmpPath);
+            $input = $disk->readStream($backup->file_path);
+            $output = fopen($tmpPath, 'wb');
+            if (!is_resource($input) || !is_resource($output)) {
+                throw new \RuntimeException('Failed to open backup download stream.');
+            }
+            $bytes = stream_copy_to_stream($input, $output);
+            if ($bytes === false || !fflush($output) || $bytes !== $disk->size($backup->file_path)) {
+                throw new \RuntimeException('Backup download was incomplete.');
+            }
+            if ($backup->file_size !== null && $backup->file_size > 0 && $bytes !== $backup->file_size) {
+                throw new \RuntimeException('Backup size differs from its recorded size.');
+            }
+            fclose($input);
+            fclose($output);
+            $input = $output = null;
+            $downloaded = true;
+            $expectedHash = $backup->metadata['archive_sha256'] ?? null;
+            if ($expectedHash !== null && (!is_string($expectedHash)
+                || !preg_match('/^[a-f0-9]{64}$/iD', $expectedHash)
+                || !hash_equals(strtolower($expectedHash), hash_file('sha256', $tmpPath)))) {
+                throw new \RuntimeException('Backup checksum differs from its recorded checksum.');
+            }
+            $result = $this->verifyArchive($tmpPath, RestoreArchive::formatExpectation($backup->file_path, $backup->metadata ?? []));
+            $result['disk'] = $diskName;
+            if ($keep) {
+                $result['local_path'] = $tmpPath;
+            }
+            return $result;
+        } catch (\Throwable $e) {
+            if ($keep && $downloaded) {
+                throw new \RuntimeException($e->getMessage() . " Download kept at: {$tmpPath}", 0, $e);
+            }
+            throw $e;
         } finally {
-            @unlink($tmpPath);
+            if (is_resource($input)) {
+                fclose($input);
+            }
+            if (is_resource($output)) {
+                fclose($output);
+            }
+            if (!$keep || !$downloaded) {
+                @unlink($tmpPath);
+            }
         }
     }
 
-    protected function verifyArchive(string $localPath): array
+    protected function verifyArchive(string $localPath, ?string $expectedFormat = null): array
     {
-        $zip = new ZipArchive();
-        $openResult = $zip->open($localPath, ZipArchive::CHECKCONS);
-        if ($openResult !== true) {
-            throw new \Exception('ZIP integrity check failed (corrupt archive).');
-        }
-
         $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
-        if (!empty($password)) {
-            @$zip->setPassword($password);
+        $archive = new RestoreArchive($localPath, $password, $expectedFormat,
+            RestoreArchive::manifestByteLimit(config('capsule.restore.max_manifest_bytes', RestoreArchive::MAX_MANIFEST_BYTES)));
+        try {
+            $archive->verifyOnly();
+            return [
+                'checked' => count($archive->entries()),
+                'failures' => 0,
+                'error_summary' => null,
+                'archive_format' => EncryptedArchive::isEncryptedFile($localPath) ? EncryptedArchive::FORMAT : 'zip',
+                'requires_capsule' => EncryptedArchive::isEncryptedFile($localPath),
+                'warnings' => $archive->warnings(),
+                'checksums_complete' => count(array_filter($archive->entries(), static fn ($entry) => ($entry['integrity'] ?? 'sha256') !== 'sha256')) === 0,
+            ];
+        } finally {
+            $archive->close();
         }
-
-        $manifestStream = $zip->getStream('manifest.json');
-        if ($manifestStream === false) {
-            $zip->close();
-            throw new \Exception('manifest.json not found in archive.');
-        }
-
-        $manifestContent = stream_get_contents($manifestStream);
-        fclose($manifestStream);
-        $manifest = json_decode($manifestContent, true);
-
-        if (!is_array($manifest) || !isset($manifest['entries'])) {
-            $zip->close();
-            throw new \Exception('manifest.json is invalid or missing entries.');
-        }
-
-        $failures = 0;
-        $checked = 0;
-        $errors = [];
-
-        foreach ($manifest['entries'] as $entry) {
-            $path = $entry['path'] ?? null;
-            if (!$path) {
-                $failures++;
-                continue;
-            }
-
-            $stat = $zip->statName($path);
-            if ($stat === false) {
-                $errors[] = "Missing: {$path}";
-                $failures++;
-                continue;
-            }
-
-            $expectedSize = (int) ($entry['size'] ?? -1);
-            $actualSize = (int) ($stat['size'] ?? 0);
-            if ($expectedSize !== 0 && $expectedSize !== $actualSize) {
-                $errors[] = "Size mismatch: {$path} (expected {$expectedSize}, got {$actualSize})";
-                $failures++;
-                continue;
-            }
-
-            $expectedHash = $entry['sha256'] ?? '';
-            if (!empty($expectedHash)) {
-                $entryStream = $zip->getStream($path);
-                if ($entryStream === false) {
-                    $errors[] = "Cannot read: {$path}";
-                    $failures++;
-                    continue;
-                }
-
-                $ctx = hash_init('sha256');
-                while (!feof($entryStream)) {
-                    $buf = fread($entryStream, 8192);
-                    if ($buf === false) {
-                        break;
-                    }
-                    hash_update($ctx, $buf);
-                }
-                fclose($entryStream);
-                $actualHash = hash_final($ctx);
-
-                if (!hash_equals($expectedHash, $actualHash)) {
-                    $errors[] = "Hash mismatch: {$path}";
-                    $failures++;
-                    continue;
-                }
-            }
-
-            $checked++;
-        }
-
-        $zip->close();
-
-        return [
-            'checked' => $checked,
-            'failures' => $failures,
-            'error_summary' => !empty($errors) ? implode('; ', array_slice($errors, 0, 5)) : null,
-        ];
     }
 
     protected function alertVerificationFailure(BackupLog $backup, VerificationLog $verificationLog): void
