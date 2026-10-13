@@ -93,6 +93,31 @@ class SqliteSnapshotTest extends TestCase
         }
     }
 
+    #[DataProvider('modes')]
+    public function test_snapshot_preserves_implicit_row_ids(string $mode): void
+    {
+        $this->writer->exec('CREATE TABLE implicit_records (value TEXT)');
+        $this->writer->exec("INSERT INTO implicit_records (rowid, value) VALUES (10, 'first'), (20, 'second')");
+        $destination = $this->directory . '/rowids.sqlite';
+        $dumper = new DatabaseDumper();
+        if ($mode === 'streaming') {
+            $stream = $dumper->buildStreamCommand('live_sqlite');
+            try {
+                $process = proc_open($stream['command'], [1 => ['file', $destination, 'wb']], $pipes);
+                $this->assertSame(0, proc_close($process));
+            } finally {
+                unlink($stream['cleanup']);
+            }
+        } elseif ($mode === 'parallel') {
+            $this->assertNull($dumper->startDumpProcess('live_sqlite', $destination));
+        } else {
+            $dumper->dump('live_sqlite', $destination);
+        }
+        $snapshot = new PDO('sqlite:' . $destination);
+        $this->assertSame([[10, 'first'], [20, 'second']],
+            $snapshot->query('SELECT rowid, value FROM implicit_records ORDER BY rowid')->fetchAll(PDO::FETCH_NUM));
+    }
+
     public function test_snapshot_never_overwrites_its_source(): void
     {
         $source = config('database.connections.live_sqlite.database');

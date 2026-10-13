@@ -59,7 +59,7 @@ class DumpValidator
      * Validate bounded first/last 4096-byte samples of a completed stream.
      * SQLite streams originate from a separately integrity-checked snapshot.
      */
-    public static function validateContent(string $header, string $tail, int $size, string $driver): void
+    public static function validateContent(#[\SensitiveParameter] string $header, #[\SensitiveParameter] string $tail, int $size, string $driver): void
     {
         if ($size <= 0 || $header === '') {
             throw new Exception('Database dump is empty.');
@@ -73,7 +73,7 @@ class DumpValidator
         };
     }
 
-    protected static function validateMysqlContent(string $header, string $tail): void
+    protected static function validateMysqlContent(#[\SensitiveParameter] string $header, #[\SensitiveParameter] string $tail): void
     {
         if (!self::mysqlCommentsEnabled()) {
             // Explicitly comment-free dumps have no completion marker. Require
@@ -108,7 +108,7 @@ class DumpValidator
         return $enabled;
     }
 
-    protected static function validatePostgresContent(string $header, string $tail): void
+    protected static function validatePostgresContent(#[\SensitiveParameter] string $header, #[\SensitiveParameter] string $tail): void
     {
         if (!preg_match('/^-- PostgreSQL database dump\s*$/m', $header)) {
             throw new Exception('PostgreSQL dump appears invalid: missing expected header.');
@@ -118,7 +118,7 @@ class DumpValidator
         }
     }
 
-    protected static function validateSqliteContent(string $header, int $size): void
+    protected static function validateSqliteContent(#[\SensitiveParameter] string $header, int $size): void
     {
         if ($size < 100 || strlen($header) < 100 || substr($header, 0, 16) !== "SQLite format 3\0") {
             throw new Exception('SQLite dump does not have a valid SQLite header.');

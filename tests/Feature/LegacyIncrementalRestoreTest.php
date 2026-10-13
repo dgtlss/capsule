@@ -237,7 +237,7 @@ class LegacyIncrementalRestoreTest extends TestCase
         ]);
         [$code, $result] = $this->restore($archive);
         $this->assertSame(1, $code);
-        $this->assertStringContainsString('Conflicting restore destinations', $result['error']);
+        $this->assertStringContainsString('conflicting', strtolower($result['error']));
         $this->assertDirectoryDoesNotExist($this->testPath('target'));
     }
 

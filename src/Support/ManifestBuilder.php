@@ -94,11 +94,10 @@ class ManifestBuilder
     private function registerPath(string $path): void
     {
         RestoreArchive::assertSafeName($path);
-        $key = strtolower($path);
-        if ($path === 'manifest.json' || isset($this->paths[$key])) {
+        if (RestoreArchive::portablePathKey($path) === 'manifest.json') {
             throw new \RuntimeException("Duplicate or reserved manifest path: {$path}");
         }
-        $this->paths[$key] = true;
+        RestoreArchive::registerPortablePath($path, $this->paths);
     }
 
     public static function encode(array $manifest): string

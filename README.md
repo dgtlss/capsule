@@ -421,6 +421,8 @@ php artisan capsule:backup --incremental
 
 If no compatible previous full backup exists, Capsule automatically runs a full backup instead. Each new incremental manifest records its base archive disk, object path, SHA-256 checksum, and deleted file paths. Historical schema 1 incrementals have weaker metadata; their [legacy recovery warnings and base requirements](#compatibility-with-older-backups) still apply. Restore verifies the base, applies its files, overlays changed files, then applies deletions. Retention protects bases required by retained incremental backups.
 
+An incremental base must use the same encryption mode and password. Changing either starts a new full base. Catalog records from before the password-compatibility check also start a new full base on their next incremental run; existing archives and snapshots remain available for recovery. Standard encrypted backups record a salted Argon2id password verifier in the catalog, using two passes and 64 MiB of native memory. Base selection checks that verifier without downloading the full base. Protect the catalog: the verifier permits offline password guesses, but contains neither the password nor an archive encryption key.
+
 For disaster recovery with downloaded archives, explicitly supply the matching base:
 
 ```bash

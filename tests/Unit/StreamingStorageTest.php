@@ -366,9 +366,12 @@ class StreamingStorageTest extends TestCase
 
     public function test_exact_and_case_conflicting_entries_fail_closed(): void
     {
-        foreach (['a.txt', 'A.txt'] as $second) {
-            $wire = pack('N', 5) . 'a.txt' . pack('P', 1) . 'A'
-                . pack('N', 5) . $second . pack('P', 1) . 'B';
+        foreach ([['a.txt', 'a.txt'], ['a.txt', 'A.txt'], ['Å.txt', 'å.txt'],
+            ['é.txt', "e\u{0301}.txt"], ['A/x.txt', 'a/y.txt']] as $names) {
+            $wire = '';
+            foreach ($names as $name) {
+                $wire .= pack('N', strlen($name)) . $name . pack('P', 1) . 'x';
+            }
             try {
                 app(StorageManager::class)->collateChunksAdvanced($this->writeChunks($wire, 3, 'files_duplicate', 'framed-v2'), 'duplicate.zip');
                 $this->fail('Accepted conflicting path.');

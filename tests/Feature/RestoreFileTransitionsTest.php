@@ -251,6 +251,41 @@ class RestoreFileTransitionsTest extends TestCase
         $this->assertDirectoryDoesNotExist($this->testPath('target/root'));
     }
 
+    public static function unicodeNames(): array
+    {
+        return ['case' => ['Å.txt', 'å.txt'], 'normalization' => ['é.txt', "e\u{0301}.txt"]];
+    }
+
+    #[DataProvider('unicodeNames')]
+    public function test_legacy_unicode_names_require_a_filesystem_that_preserves_both_spellings(string $first, string $second): void
+    {
+        $this->requireUnix();
+        $probe = $this->testPath('unicode-probe');
+        mkdir($probe, 0700);
+        $stream = fopen($probe . '/' . $first, 'xb');
+        fclose($stream);
+        $stream = @fopen($probe . '/' . $second, 'xb');
+        $distinct = $stream !== false;
+        if ($distinct) {
+            fclose($stream);
+        }
+        $archive = $this->archive(['files/' . $first => 'first bytes', 'files/' . $second => 'second bytes'], ['schema_version' => 1]);
+        $target = realpath($this->testDirectory) . '/unicode-target';
+        mkdir($target, 0700);
+        file_put_contents($target . '/untouched', 'existing');
+        [$code, $result] = $this->restore($archive, ['--target' => $target]);
+        $this->assertSame('existing', file_get_contents($target . '/untouched'));
+        if ($distinct) {
+            $this->assertSame(0, $code, json_encode($result));
+            $this->assertSame('first bytes', file_get_contents($target . '/' . $first));
+            $this->assertSame('second bytes', file_get_contents($target . '/' . $second));
+        } else {
+            $this->assertSame(1, $code, json_encode($result));
+            $this->assertSame(['.', '..', 'untouched'], scandir($target));
+        }
+        $this->assertSame([], glob($target . '/.capsule_*'));
+    }
+
     public function test_case_transition_rejects_incompatible_filesystem_before_deletion(): void
     {
         $base = $this->archive(['files/Name.txt' => 'base']);

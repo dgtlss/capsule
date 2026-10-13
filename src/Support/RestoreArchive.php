@@ -5,6 +5,7 @@ namespace Dgtlss\Capsule\Support;
 use Dgtlss\Capsule\Security\EncryptedArchive;
 use RuntimeException;
 use SensitiveParameter;
+use Symfony\Component\String\UnicodeString;
 use ZipArchive;
 
 /** A fully verified, privately staged archive. Never extracts ZIP paths directly. */
@@ -110,6 +111,30 @@ class RestoreArchive
         }
     }
 
+    /** Compare Unicode spelling without changing the archived or restored name. */
+    public static function portablePathKey(string $path): string
+    {
+        return preg_match('/[^\x00-\x7f]/', $path)
+            ? (new UnicodeString($path))->folded(false)->normalize()->toString()
+            : strtolower($path);
+    }
+
+    /** Track files and inferred directories using the same rules in every producer/reader. */
+    public static function registerPortablePath(string $name, array &$paths): void
+    {
+        self::assertSafeName($name);
+        $directory = str_ends_with($name, '/');
+        for ($path = rtrim($name, '/'); $path !== '.'; $path = dirname($path)) {
+            $key = self::portablePathKey($path);
+            $spelling = $path . ($directory ? '/' : '');
+            if (isset($paths[$key]) && (!$directory || $paths[$key] !== $spelling)) {
+                throw new RuntimeException("Unsafe or duplicate archive path (conflicting destinations): {$name}");
+            }
+            $paths[$key] = $spelling;
+            $directory = true;
+        }
+    }
+
     public function verifyAndStage(bool $stage = true): void
     {
         if (!$this->opened) {
@@ -189,14 +214,17 @@ class RestoreArchive
         $requiresUnixPaths = false;
         foreach ($names as $name) {
             self::assertSafeName($name, !$legacyPaths);
-            $portableName = strtolower(rtrim($name, '/'));
-            if (isset($portableNames[$portableName])) {
-                if (!$legacyPaths) {
-                    throw new RuntimeException("Duplicate archive path: {$name}");
+            if (!$legacyPaths) {
+                self::registerPortablePath($name, $portableNames);
+            } else {
+                for ($path = rtrim($name, '/'); $path !== '.'; $path = dirname($path)) {
+                    $key = self::portablePathKey($path);
+                    if (isset($portableNames[$key]) && $portableNames[$key] !== $path) {
+                        $requiresUnixPaths = true;
+                    }
+                    $portableNames[$key] = $path;
                 }
-                $requiresUnixPaths = true;
             }
-            $portableNames[$portableName] = true;
             if ($legacyPaths) {
                 try {
                     self::assertSafeName($name);

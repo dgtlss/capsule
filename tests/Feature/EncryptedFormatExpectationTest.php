@@ -139,6 +139,28 @@ class EncryptedFormatExpectationTest extends TestCase
         $this->assertSame(self::PAYLOAD, file_get_contents($this->testPath('authentic-target/restored.txt')));
     }
 
+    public function test_download_staging_in_a_symlinked_directory_is_canonical_and_decryptable(): void
+    {
+        $directory = $this->testPath('temporary');
+        $link = $this->testPath('temporary-link');
+        mkdir($directory, 0700);
+        if (!@symlink($directory, $link)) {
+            $this->markTestSkipped('Creating directory symlinks is unavailable.');
+        }
+        $temporary = tempnam($link, 'capsule_restore_');
+        $archive = null;
+        try {
+            $this->assertSame(realpath($temporary), $temporary);
+            copy($this->encryptedArchive(), $temporary);
+            $archive = new RestoreArchive($temporary, self::PASSWORD, EncryptedArchive::FORMAT);
+            $archive->verifyOnly();
+            $this->assertCount(1, $archive->entries());
+        } finally {
+            $archive?->close();
+            unlink($temporary);
+        }
+    }
+
     #[DataProvider('ordinaryZipEncryption')]
     public function test_plain_and_native_encrypted_zips_remain_restorable_without_an_envelope_requirement(bool $legacyEncrypted): void
     {

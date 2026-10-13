@@ -475,21 +475,12 @@ class StorageManager
         $offset = 0;
         $directory = [];
         $portableNames = [];
-        $portableDirectories = [];
         foreach ($entries() as $entry) {
             $name = $entry['name'];
-            RestoreArchive::assertSafeName($name);
-            $portableName = strtolower(rtrim($name, '/'));
-            if (strlen($name) > 65535 || str_ends_with($name, '/') || isset($portableNames[$portableName]) || isset($portableDirectories[$portableName])) {
+            if (strlen($name) > 65535 || str_ends_with($name, '/')) {
                 throw new Exception('Unsafe or duplicate ZIP entry: ' . $name);
             }
-            for ($parent = dirname($portableName); $parent !== '.'; $parent = dirname($parent)) {
-                if (isset($portableNames[$parent])) {
-                    throw new Exception('ZIP file/directory conflict: ' . $name);
-                }
-                $portableDirectories[$parent] = true;
-            }
-            $portableNames[$portableName] = true;
+            RestoreArchive::registerPortablePath($name, $portableNames);
             if (!isset($entry['size']) || !is_int($entry['size']) || $entry['size'] < 0) {
                 throw new Exception('Streaming ZIP entries require a known non-negative size.');
             }

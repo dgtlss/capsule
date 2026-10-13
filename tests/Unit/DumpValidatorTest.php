@@ -8,6 +8,27 @@ use PHPUnit\Framework\Attributes\DataProvider;
 
 class DumpValidatorTest extends TestCase
 {
+    public function test_dump_samples_are_redacted_when_exception_arguments_are_enabled(): void
+    {
+        $ignore = ini_set('zend.exception_ignore_args', '0');
+        $limit = ini_set('zend.exception_string_param_max_len', '4096');
+        try {
+            foreach (['mysql' => '-- MySQL dump', 'pgsql' => '-- PostgreSQL database dump', 'sqlite' => 'invalid'] as $driver => $start) {
+                try {
+                    DumpValidator::validateContent($start . "\nprivate-head-marker", 'private-tail-marker', 128, $driver);
+                    $this->fail('The incomplete dummy dump must fail.');
+                } catch (\Exception $e) {
+                    $this->assertStringNotContainsString('private-head-marker', $e->getTraceAsString());
+                    $this->assertStringNotContainsString('private-tail-marker', $e->getTraceAsString());
+                    $this->assertInstanceOf(\SensitiveParameterValue::class, $e->getTrace()[0]['args'][0]);
+                }
+            }
+        } finally {
+            ini_set('zend.exception_ignore_args', $ignore);
+            ini_set('zend.exception_string_param_max_len', $limit);
+        }
+    }
+
     public static function invalidSqlDumps(): array
     {
         return [

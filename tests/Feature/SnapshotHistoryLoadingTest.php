@@ -4,6 +4,7 @@ namespace Dgtlss\Capsule\Tests\Feature;
 
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Models\BackupSnapshot;
+use Dgtlss\Capsule\Security\EncryptionPasswordVerifier;
 use Dgtlss\Capsule\Services\IncrementalService;
 use Dgtlss\Capsule\Services\RetentionService;
 use Dgtlss\Capsule\Tests\TestCase;
@@ -41,9 +42,11 @@ class SnapshotHistoryLoadingTest extends TestCase
 
     public function test_incremental_selection_pages_metadata_and_loads_only_the_eligible_encrypted_base_index(): void
     {
-        config(['capsule._policy_name' => 'daily']);
+        config(['capsule._policy_name' => 'daily', 'capsule.security.encrypt_backups' => true,
+            'capsule.security.backup_password' => 'history-test-password']);
         $index = $this->largeIndex();
-        $selected = $this->snapshot('selected.capsule.enc', $index);
+        $encryption = ['encryption_password_hash' => EncryptionPasswordVerifier::create('history-test-password')];
+        $selected = $this->snapshot('selected.capsule.enc', $index, $encryption);
         $ineligible = [
             ['policy' => 'other'],
             ['storage' => ['disk' => 'unconfigured', 'backup_path' => 'backups']],
@@ -53,7 +56,7 @@ class SnapshotHistoryLoadingTest extends TestCase
             [], // Otherwise compatible, but its storage object is missing.
         ];
         for ($i = 0; $i < 120; $i++) {
-            $this->snapshot("history-{$i}.zip", $index, $ineligible[$i % count($ineligible)]);
+            $this->snapshot("history-{$i}.zip", $index, $ineligible[$i % count($ineligible)] + $encryption);
         }
         $this->snapshot('failed.zip', $index, [], 1, 'full', null, 'failed');
         $this->snapshot('incremental.zip', $index, [], 1, 'incremental', $selected->id);
@@ -114,6 +117,26 @@ class SnapshotHistoryLoadingTest extends TestCase
         $queries = $this->snapshotQueries();
         DB::disableQueryLog();
 
+        $this->assertCount(1, $queries);
+        $this->assertSame('id, backup_log_id', $queries[0]['projection']);
+    }
+
+    public function test_invalid_or_unbounded_password_verifiers_never_load_a_base_index(): void
+    {
+        config(['capsule.security.encrypt_backups' => true, 'capsule.security.backup_password' => 'verifier-test-password']);
+        $hash = EncryptionPasswordVerifier::create('verifier-test-password');
+        $unversioned = sodium_crypto_pwhash_str('verifier-test-password', 2, 67108864);
+        foreach (['invalid', str_replace('m=65536', 'm=1073741824', $hash), false, $unversioned] as $index => $invalid) {
+            $this->snapshot("invalid-{$index}.zip", $this->largeIndex(), ['encryption_password_hash' => $invalid]);
+        }
+        $disk = Mockery::mock();
+        $disk->shouldReceive('exists')->times(4)->andReturnTrue();
+        Storage::shouldReceive('disk')->times(4)->with('capsule-test')->andReturn($disk);
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+        $this->assertNull(app(IncrementalService::class)->getLatestFullSnapshot());
+        $queries = $this->snapshotQueries();
+        DB::disableQueryLog();
         $this->assertCount(1, $queries);
         $this->assertSame('id, backup_log_id', $queries[0]['projection']);
     }
@@ -188,6 +211,7 @@ class SnapshotHistoryLoadingTest extends TestCase
                 'policy' => config('capsule._policy_name'),
                 'storage' => ['disk' => 'capsule-test', 'backup_path' => 'backups'],
                 'archive_sha256' => str_repeat('a', 64),
+                'encryption_password_hash' => null,
                 'retention' => ['days' => 30, 'count' => 0, 'min_keep' => 0],
             ], $metadata),
         ]);

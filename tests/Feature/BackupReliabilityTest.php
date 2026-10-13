@@ -7,6 +7,7 @@ use Dgtlss\Capsule\Services\BackupService;
 use Dgtlss\Capsule\Services\IncrementalService;
 use Dgtlss\Capsule\Support\FileSelection;
 use Dgtlss\Capsule\Tests\TestCase;
+use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Storage;
 use ZipArchive;
 
@@ -68,6 +69,79 @@ class BackupReliabilityTest extends TestCase
         $this->assertFalse($service->run());
         $this->assertStringContainsString('password', $service->getLastError());
         $this->assertSame([], Storage::disk(config('capsule.default_disk'))->allFiles());
+    }
+
+    public function test_directory_aliases_fail_before_either_backup_engine_publishes(): void
+    {
+        mkdir($this->fixture . '/other', 0700);
+        file_put_contents($this->fixture . '/other/different.txt', 'other');
+        config(['capsule.files.paths' => ['A' => $this->fixture . '/source', 'a' => $this->fixture . '/other']]);
+        foreach ([BackupService::class, \Dgtlss\Capsule\Services\ChunkedBackupService::class] as $class) {
+            $service = app($class);
+            $this->assertFalse($service->run(), 'Accepted case-conflicting root directories.');
+            $this->assertStringContainsString('conflict', strtolower($service->getLastError()));
+            $this->assertSame([], Storage::disk(config('capsule.default_disk'))->allFiles());
+        }
+    }
+
+    public function test_password_change_starts_a_new_full_base_and_subsequent_incremental_restores(): void
+    {
+        config(['capsule.security.backup_password' => 'old-test-password']);
+        $service = app(BackupService::class);
+        $service->setEncryption(true);
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $old = BackupLog::successful()->latest('id')->firstOrFail();
+
+        config(['capsule.security.backup_password' => 'new-test-password']);
+        file_put_contents($this->fixture . '/source/added.txt', 'unchanged after rotation');
+        $service->setIncremental(true);
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $base = BackupLog::successful()->latest('id')->firstOrFail();
+        $this->assertSame('full', $base->metadata['backup_type']);
+        $this->assertNull($base->metadata['base_archive']);
+        Storage::disk(config('capsule.default_disk'))->assertExists($old->file_path);
+
+        file_put_contents($this->fixture . '/source/hello.txt', 'changed after rotation');
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $delta = BackupLog::successful()->latest('id')->firstOrFail();
+        $this->assertSame('incremental', $delta->metadata['backup_type']);
+        $this->assertSame($base->file_path, $delta->metadata['base_archive']['path']);
+        $target = realpath($this->fixture) . '/recovered';
+        $this->assertSame(0, Artisan::call('capsule:restore', [
+            'id' => $delta->id, '--target' => $target, '--files-only' => true,
+            '--force' => true, '--format' => 'json',
+        ]), Artisan::output());
+        $this->assertSame('unchanged after rotation', file_get_contents($this->fixture . '/recovered/root-0/added.txt'));
+        $this->assertSame('changed after rotation', file_get_contents($this->fixture . '/recovered/root-0/hello.txt'));
+    }
+
+    public function test_old_snapshot_without_password_identity_starts_a_full_base_without_deleting_history(): void
+    {
+        $service = app(BackupService::class);
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $old = BackupLog::successful()->latest('id')->firstOrFail();
+        $metadata = $old->metadata;
+        unset($metadata['encryption_password_hash']);
+        $old->update(['metadata' => $metadata]);
+        $service->setIncremental(true);
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $this->assertSame('full', BackupLog::successful()->latest('id')->firstOrFail()->metadata['backup_type']);
+        Storage::disk(config('capsule.default_disk'))->assertExists($old->file_path);
+    }
+
+    public function test_disabling_encryption_starts_a_new_plaintext_full_base(): void
+    {
+        config(['capsule.security.backup_password' => 'encryption-transition-password']);
+        $service = app(BackupService::class);
+        $service->setEncryption(true);
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $service->setEncryption(false);
+        $service->setIncremental(true);
+        config(['capsule.security.backup_password' => null]);
+        $this->assertTrue($service->run(), $service->getLastError() ?? '');
+        $latest = BackupLog::successful()->latest('id')->firstOrFail();
+        $this->assertSame('full', $latest->metadata['backup_type']);
+        $this->assertNull($latest->metadata['encryption_password_hash']);
     }
 
     public function test_nul_password_is_not_silently_shortened_by_native_libzip(): void

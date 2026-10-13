@@ -6,6 +6,7 @@ use Dgtlss\Capsule\Database\DatabaseDumper;
 use Dgtlss\Capsule\Database\DumpValidator;
 use Dgtlss\Capsule\Services\AuditLogger;
 use Dgtlss\Capsule\Models\BackupLog;
+use Dgtlss\Capsule\Security\EncryptionPasswordVerifier;
 use Dgtlss\Capsule\Notifications\NotificationManager;
 use Dgtlss\Capsule\Storage\StorageManager;
 use Dgtlss\Capsule\Support\BackupContext;
@@ -226,6 +227,9 @@ class BackupService
             
             // Never publish a ZIP whose payload differs from its manifest.
             $this->verifyBackup($localBackupPath);
+            $passwordHash = $this->encryptionEnabled() ? EncryptionPasswordVerifier::create(
+                config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD'),
+            ) : null;
 
             $this->log("Uploading backup to storage (" . Helpers::formatBytes($fileSize) . ")...");
             $remotePath = $this->storageManager->store($localBackupPath);
@@ -244,6 +248,7 @@ class BackupService
                 'policy' => config('capsule._policy_name'),
                 'retention' => (array) config('capsule.retention', []),
                 'archive_sha256' => hash_file('sha256', $localBackupPath),
+                'encryption_password_hash' => $passwordHash,
                 'backup_type' => $this->backupType,
                 'base_archive' => $this->baseArchive,
             ];
@@ -384,7 +389,7 @@ class BackupService
             if (config('capsule.files.enabled')) {
                 event(new FilesCollectStarting($context));
                 $this->currentFileIndex = $this->incrementalService->buildCurrentIndex(true, $context);
-                $baseSnapshot = $this->incremental ? $this->incrementalService->getLatestFullSnapshot() : null;
+                $baseSnapshot = $this->incremental ? $this->incrementalService->getLatestFullSnapshot($this->encryptionEnabled()) : null;
                 if ($baseSnapshot) {
                     $diff = $this->incrementalService->diff($this->currentFileIndex, $baseSnapshot);
                     $this->addSpecificFilesToBackup($zip, $this->incrementalService->getChangedFiles($diff));

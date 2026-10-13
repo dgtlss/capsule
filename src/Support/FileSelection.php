@@ -78,11 +78,7 @@ class FileSelection
                 }
                 $relative = is_file($root) ? basename($root) : substr($source, strlen($root) + 1);
                 $archivePath = 'files/' . $id . '/' . str_replace(DIRECTORY_SEPARATOR, '/', $relative);
-                RestoreArchive::assertSafeName($archivePath);
-                if (isset($portableNames[strtolower($archivePath)])) {
-                    throw new RuntimeException("File names conflict on case-insensitive recovery targets: {$archivePath}");
-                }
-                $portableNames[strtolower($archivePath)] = true;
+                RestoreArchive::registerPortablePath($archivePath, $portableNames);
                 $files[$archivePath] = $source;
             }
         }

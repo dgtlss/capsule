@@ -193,6 +193,9 @@ class LegacyArchiveValidationTest extends TestCase
             yield $name => [[$name]];
         }
         yield 'case-distinct files' => [['A.txt', 'a.txt']];
+        yield 'Unicode case-distinct files' => [['Å.txt', 'å.txt']];
+        yield 'Unicode normalization aliases' => [['é.txt', "e\u{0301}.txt"]];
+        yield 'case-distinct directories' => [['A/x.txt', 'a/y.txt']];
     }
 
     #[DataProvider('unixOnlyPaths')]

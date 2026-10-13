@@ -5,6 +5,7 @@ namespace Dgtlss\Capsule\Services;
 use Dgtlss\Capsule\Contracts\FileFilterInterface;
 use Dgtlss\Capsule\Models\BackupLog;
 use Dgtlss\Capsule\Models\BackupSnapshot;
+use Dgtlss\Capsule\Security\EncryptionPasswordVerifier;
 use Dgtlss\Capsule\Support\BackupContext;
 use Dgtlss\Capsule\Support\FileSelection;
 use Illuminate\Support\Facades\Log;
@@ -94,8 +95,9 @@ class IncrementalService
     /**
      * Find the latest full backup snapshot to use as a base.
      */
-    public function getLatestFullSnapshot(): ?BackupSnapshot
+    public function getLatestFullSnapshot(?bool $encrypted = null): ?BackupSnapshot
     {
+        $encrypted ??= (bool) config('capsule.security.encrypt_backups', false);
         // Historical indexes can each be large. Check bounded batches of metadata
         // first, and only load the index for the base that will actually be used.
         $snapshots = BackupSnapshot::select(['id', 'backup_log_id'])
@@ -108,10 +110,15 @@ class IncrementalService
                 ($metadata['storage']['disk'] ?? null) !== config('capsule.default_disk', 'local') ||
                 ($metadata['storage']['backup_path'] ?? null) !== config('capsule.backup_path', 'backups') ||
                 ($metadata['policy'] ?? null) !== config('capsule._policy_name') ||
-                empty($metadata['archive_sha256'])) {
+                empty($metadata['archive_sha256']) ||
+                !array_key_exists('encryption_password_hash', $metadata) ||
+                ($metadata['encryption_password_hash'] !== null) !== $encrypted) {
                 continue;
             }
             if (!\Illuminate\Support\Facades\Storage::disk($metadata['storage']['disk'])->exists($snapshot->backupLog->file_path)) {
+                continue;
+            }
+            if ($encrypted && !$this->matchesEncryptionPassword($metadata['encryption_password_hash'])) {
                 continue;
             }
             $base = BackupSnapshot::find($snapshot->id);
@@ -122,6 +129,15 @@ class IncrementalService
             return $base;
         }
         return null;
+    }
+
+    protected function matchesEncryptionPassword(mixed $hash): bool
+    {
+        $password = config('capsule.security.backup_password') ?? env('CAPSULE_BACKUP_PASSWORD');
+        if (!is_string($hash) || !is_string($password) || $password === '') {
+            return false;
+        }
+        return EncryptionPasswordVerifier::verify($hash, $password);
     }
 
     /**

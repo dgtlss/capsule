@@ -390,7 +390,7 @@ class RestoreCommand extends Command
         // preserves historical case distinctions, even though their leaves differ.
         foreach ($writes as $path => $legacy) {
             for ($current = $path; $current !== dirname($current); $current = dirname($current)) {
-                $key = strtolower($current);
+                $key = RestoreArchive::portablePathKey($current);
                 $portablePaths[$key][$current] = ($portablePaths[$key][$current] ?? true) && $legacy;
             }
         }
@@ -411,13 +411,17 @@ class RestoreCommand extends Command
         // directory components). Keep final-write collision checks above strict.
         foreach (array_keys($deletions) as $path) {
             for ($current = $path; $current !== dirname($current); $current = dirname($current)) {
-                $portablePaths[strtolower($current)][$current] = true;
+                $portablePaths[RestoreArchive::portablePathKey($current)][$current] = true;
             }
         }
         foreach ($portablePaths as $paths) {
             if (count($paths) > 1) {
+                $names = array_values(array_unique(array_map('basename', array_keys($paths))));
                 foreach (array_keys($paths) as $path) {
                     $this->assertCaseSensitiveFilesystem($path);
+                    if (count($names) > 1 && preg_match('/[^\x00-\x7f]/', implode('', $names))) {
+                        $this->assertDistinctUnicodeNames($path, $names);
+                    }
                 }
             }
         }
@@ -545,6 +549,36 @@ class RestoreCommand extends Command
             if ($probeCreated) {
                 @unlink($probe);
             }
+        }
+    }
+
+    /** Even a case-sensitive filesystem may alias composed/decomposed Unicode names. */
+    protected function assertDistinctUnicodeNames(string $path, array $names): void
+    {
+        $directory = dirname($path);
+        while (!is_dir($directory) && $directory !== dirname($directory)) {
+            $directory = dirname($directory);
+        }
+        $probe = $directory . '/.capsule_names_' . bin2hex(random_bytes(16));
+        if (!@mkdir($probe, 0700)) {
+            throw new RuntimeException('Cannot check Unicode filename compatibility on the target filesystem.');
+        }
+        $created = [];
+        try {
+            foreach ($names as $name) {
+                $candidate = $probe . '/' . $name;
+                $stream = @fopen($candidate, 'x+b');
+                if ($stream === false) {
+                    throw new RuntimeException('Unicode-distinct filenames require a target filesystem that preserves their spelling.');
+                }
+                $created[] = $candidate;
+                fclose($stream);
+            }
+        } finally {
+            foreach ($created as $candidate) {
+                @unlink($candidate);
+            }
+            @rmdir($probe);
         }
     }
 
